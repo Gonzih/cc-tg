@@ -112,7 +112,9 @@ export class CcTgBot {
   }
 
   private handleClaudeMessage(chatId: number, session: Session, msg: ClaudeMessage): void {
-    if (msg.type !== "assistant" && msg.type !== "result") return;
+    // Use only the final `result` message — it contains the complete response text.
+    // Ignore `assistant` streaming chunks to avoid duplicates.
+    if (msg.type !== "result") return;
 
     const text = extractText(msg);
     if (!text) return;
