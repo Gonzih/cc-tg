@@ -53,8 +53,9 @@ export class ClaudeProcess extends EventEmitter {
 
     const env: NodeJS.ProcessEnv = { ...process.env };
     if (opts.token) {
-      // Try as OAuth token first; Claude Code accepts both env vars
+      // Set both — Claude Code checks CLAUDE_CODE_OAUTH_TOKEN first, then ANTHROPIC_API_KEY
       env.CLAUDE_CODE_OAUTH_TOKEN = opts.token;
+      env.ANTHROPIC_API_KEY = opts.token;
     }
 
     this.proc = spawn("claude", args, {

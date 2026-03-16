@@ -38,14 +38,15 @@ Or add to your shell profile / .env file.
 
 const telegramToken = required("TELEGRAM_BOT_TOKEN");
 
-// Accept either CLAUDE_CODE_TOKEN or ANTHROPIC_API_KEY
+// Accept CLAUDE_CODE_TOKEN, CLAUDE_CODE_OAUTH_TOKEN, or ANTHROPIC_API_KEY
 const claudeToken =
   process.env.CLAUDE_CODE_TOKEN ??
+  process.env.CLAUDE_CODE_OAUTH_TOKEN ??
   process.env.ANTHROPIC_API_KEY;
 
 if (!claudeToken) {
   console.error(`
-ERROR: Neither CLAUDE_CODE_TOKEN nor ANTHROPIC_API_KEY is set.
+ERROR: No Claude token set. Set one of: CLAUDE_CODE_TOKEN, CLAUDE_CODE_OAUTH_TOKEN, or ANTHROPIC_API_KEY.
 
 Set one and run again:
   TELEGRAM_BOT_TOKEN=xxx CLAUDE_CODE_TOKEN=yyy npx @gonzih/cc-tg
