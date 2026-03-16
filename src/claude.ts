@@ -45,6 +45,7 @@ export class ClaudeProcess extends EventEmitter {
       "--input-format", "stream-json",
       "--print",
       "--verbose",
+      "--dangerously-skip-permissions",
     ];
 
     if (opts.systemPrompt) {
