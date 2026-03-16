@@ -17,10 +17,12 @@ interface Session {
   claude: ClaudeProcess;
   pendingText: string;
   flushTimer: ReturnType<typeof setTimeout> | null;
+  typingTimer: ReturnType<typeof setInterval> | null;
   lastMessageId?: number;
 }
 
 const FLUSH_DELAY_MS = 800; // debounce streaming chunks into one Telegram message
+const TYPING_INTERVAL_MS = 4000; // re-send typing action before Telegram's 5s expiry
 
 export class CcTgBot {
   private bot: TelegramBot;
@@ -69,6 +71,7 @@ export class CcTgBot {
     const session = this.getOrCreateSession(chatId);
     try {
       session.claude.sendPrompt(text);
+      this.startTyping(chatId, session);
     } catch (err) {
       await this.bot.sendMessage(chatId, `Error sending to Claude: ${(err as Error).message}`);
       this.killSession(chatId);
@@ -88,6 +91,7 @@ export class CcTgBot {
       claude,
       pendingText: "",
       flushTimer: null,
+      typingTimer: null,
     };
 
     claude.on("message", (msg) => this.handleClaudeMessage(chatId, session, msg));
@@ -116,6 +120,8 @@ export class CcTgBot {
     // Ignore `assistant` streaming chunks to avoid duplicates.
     if (msg.type !== "result") return;
 
+    this.stopTyping(session);
+
     const text = extractText(msg);
     if (!text) return;
 
@@ -124,6 +130,22 @@ export class CcTgBot {
 
     if (session.flushTimer) clearTimeout(session.flushTimer);
     session.flushTimer = setTimeout(() => this.flushPending(chatId, session), FLUSH_DELAY_MS);
+  }
+
+  private startTyping(chatId: number, session: Session): void {
+    this.stopTyping(session);
+    // Send immediately, then keep alive every 4s
+    this.bot.sendChatAction(chatId, "typing").catch(() => {});
+    session.typingTimer = setInterval(() => {
+      this.bot.sendChatAction(chatId, "typing").catch(() => {});
+    }, TYPING_INTERVAL_MS);
+  }
+
+  private stopTyping(session: Session): void {
+    if (session.typingTimer) {
+      clearInterval(session.typingTimer);
+      session.typingTimer = null;
+    }
   }
 
   private flushPending(chatId: number, session: Session): void {
@@ -147,6 +169,7 @@ export class CcTgBot {
   private killSession(chatId: number): void {
     const session = this.sessions.get(chatId);
     if (session) {
+      this.stopTyping(session);
       session.claude.kill();
       this.sessions.delete(chatId);
     }
