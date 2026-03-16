@@ -4,8 +4,9 @@
  * pipe prompts in, parse streaming JSON messages out.
  */
 
-import { spawn, ChildProcessWithoutNullStreams } from "child_process";
+import { spawn, ChildProcessWithoutNullStreams, execFileSync } from "child_process";
 import { EventEmitter } from "events";
+import { existsSync } from "fs";
 
 export type MessageType = "system" | "assistant" | "user" | "result";
 
@@ -67,7 +68,10 @@ export class ClaudeProcess extends EventEmitter {
       }
     }
 
-    this.proc = spawn("claude", args, {
+    // Resolve claude binary — check common install locations if not in PATH
+    const claudeBin = resolveClaude(env.PATH);
+
+    this.proc = spawn(claudeBin, args, {
       cwd: opts.cwd ?? process.cwd(),
       env,
       stdio: ["pipe", "pipe", "pipe"],
@@ -163,4 +167,31 @@ export function extractText(msg: ClaudeMessage): string {
       .join("");
   }
   return "";
+}
+
+/**
+ * Resolve the claude CLI binary path.
+ * Checks PATH entries + common npm global install locations.
+ */
+function resolveClaude(pathEnv?: string): string {
+  // Try PATH entries first
+  const dirs = (pathEnv ?? process.env.PATH ?? "").split(":");
+  for (const dir of dirs) {
+    const candidate = `${dir}/claude`;
+    if (existsSync(candidate)) return candidate;
+  }
+
+  // Common fallback locations
+  const fallbacks = [
+    `${process.env.HOME}/.npm-global/bin/claude`,
+    "/opt/homebrew/bin/claude",
+    "/usr/local/bin/claude",
+    "/usr/bin/claude",
+  ];
+  for (const p of fallbacks) {
+    if (existsSync(p)) return p;
+  }
+
+  // Last resort — let the OS resolve it (will throw ENOENT if missing)
+  return "claude";
 }
