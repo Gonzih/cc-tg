@@ -61,6 +61,14 @@ export class CcTgBot {
       return;
     }
 
+    // /stop — kill active session (interrupt running Claude task)
+    if (text === "/stop") {
+      const has = this.sessions.has(chatId);
+      this.killSession(chatId);
+      await this.bot.sendMessage(chatId, has ? "Stopped." : "No active session.");
+      return;
+    }
+
     // /status
     if (text === "/status") {
       const has = this.sessions.has(chatId);

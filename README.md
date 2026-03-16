@@ -36,6 +36,7 @@ Message [@userinfobot](https://t.me/userinfobot) on Telegram — it replies with
 |---|---|
 | `/start` | Reset session |
 | `/reset` | Reset session |
+| `/stop` | Interrupt current Claude task |
 | `/status` | Check if session is active |
 | Any text | Sent directly to Claude Code |
 
