@@ -26,6 +26,18 @@ That's it. Open your bot in Telegram and start chatting.
 
 *One of CLAUDE_CODE_TOKEN or ANTHROPIC_API_KEY is required.
 
+## How to get your Claude Code token
+
+Run this once to generate a long-lived OAuth token:
+
+```bash
+npx @anthropic-ai/claude-code setup-token
+```
+
+It opens a browser, logs you in with your Anthropic account, and prints a token starting with `sk-ant-oat`. Paste that as `CLAUDE_CODE_TOKEN`.
+
+Alternatively, use an `ANTHROPIC_API_KEY` from [console.anthropic.com](https://console.anthropic.com) (API key starts with `sk-ant-api`).
+
 ## How to get your Telegram user ID
 
 Message [@userinfobot](https://t.me/userinfobot) on Telegram — it replies with your ID.
