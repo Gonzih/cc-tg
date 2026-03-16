@@ -20,7 +20,7 @@ export interface ClaudeMessage {
 export interface ClaudeOptions {
   cwd?: string;
   systemPrompt?: string;
-  /** CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY value */
+  /** OAuth token (sk-ant-oat01-...) or API key (sk-ant-api03-...) */
   token?: string;
 }
 
@@ -53,9 +53,16 @@ export class ClaudeProcess extends EventEmitter {
 
     const env: NodeJS.ProcessEnv = { ...process.env };
     if (opts.token) {
-      // Set both — Claude Code checks CLAUDE_CODE_OAUTH_TOKEN first, then ANTHROPIC_API_KEY
-      env.CLAUDE_CODE_OAUTH_TOKEN = opts.token;
-      env.ANTHROPIC_API_KEY = opts.token;
+      // OAuth tokens start with sk-ant-oat — set CLAUDE_CODE_OAUTH_TOKEN only
+      // API keys start with sk-ant-api — set ANTHROPIC_API_KEY only
+      // Mixing them causes "Invalid API key" errors
+      if (opts.token.startsWith("sk-ant-oat")) {
+        env.CLAUDE_CODE_OAUTH_TOKEN = opts.token;
+        delete env.ANTHROPIC_API_KEY;
+      } else {
+        env.ANTHROPIC_API_KEY = opts.token;
+        delete env.CLAUDE_CODE_OAUTH_TOKEN;
+      }
     }
 
     this.proc = spawn("claude", args, {
