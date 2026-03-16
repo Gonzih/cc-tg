@@ -1,0 +1,35 @@
+{
+  "name": "@gonzih/cc-tg",
+  "version": "0.1.0",
+  "description": "Claude Code Telegram bot — chat with Claude Code via Telegram",
+  "type": "module",
+  "bin": {
+    "cc-tg": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "node --loader ts-node/esm src/index.ts"
+  },
+  "files": [
+    "dist/"
+  ],
+  "dependencies": {
+    "node-telegram-bot-api": "^0.66.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/node-telegram-bot-api": "^0.64.0",
+    "typescript": "^5.5.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Gonzih/cc-tg.git"
+  },
+  "homepage": "https://github.com/Gonzih/cc-tg",
+  "bugs": {
+    "url": "https://github.com/Gonzih/cc-tg/issues"
+  },
+  "keywords": ["claude", "claude-code", "telegram", "bot", "ai"],
+  "license": "MIT"
+}
