@@ -94,20 +94,39 @@ export class CcTgBot {
       typingTimer: null,
     };
 
-    claude.on("message", (msg) => this.handleClaudeMessage(chatId, session, msg));
-    claude.on("stderr", (data) => {
-      // Only surface non-noise stderr
-      if (data.includes("Error") || data.includes("error")) {
-        console.error(`[claude:${chatId}]`, data.trim());
+    claude.on("message", (msg) => {
+      // Verbose logging — log every message type and subtype
+      const subtype = (msg.payload.subtype as string) ?? "";
+      const toolName = this.extractToolName(msg);
+      const logParts = [`[claude:${chatId}] msg=${msg.type}`];
+      if (subtype) logParts.push(`subtype=${subtype}`);
+      if (toolName) logParts.push(`tool=${toolName}`);
+      console.log(logParts.join(" "));
+
+      // Surface tool activity to Telegram as a status line
+      if (msg.type === "assistant" && toolName) {
+        this.bot.sendMessage(chatId, `⚙️ ${toolName}...`).catch(() => {});
       }
+      if (msg.type === "system" && subtype === "task_progress") {
+        const desc = (msg.payload.description as string) ?? "";
+        if (desc) this.bot.sendMessage(chatId, `🔍 ${desc}`).catch(() => {});
+      }
+
+      this.handleClaudeMessage(chatId, session, msg);
+    });
+    claude.on("stderr", (data) => {
+      const line = data.trim();
+      if (line) console.error(`[claude:${chatId}:stderr]`, line);
     });
     claude.on("exit", (code) => {
-      console.log(`[claude:${chatId}] exited with code ${code}`);
+      console.log(`[claude:${chatId}] exited code=${code}`);
+      this.stopTyping(session);
       this.sessions.delete(chatId);
     });
     claude.on("error", (err) => {
-      console.error(`[claude:${chatId}] process error:`, err.message);
+      console.error(`[claude:${chatId}] process error: ${err.message}`);
       this.bot.sendMessage(chatId, `Claude process error: ${err.message}`).catch(() => {});
+      this.stopTyping(session);
       this.sessions.delete(chatId);
     });
 
@@ -164,6 +183,15 @@ export class CcTgBot {
         );
       });
     }
+  }
+
+  private extractToolName(msg: ClaudeMessage): string {
+    const message = msg.payload.message as Record<string, unknown> | undefined;
+    if (!message) return "";
+    const content = message.content;
+    if (!Array.isArray(content)) return "";
+    const toolUse = content.find((b: Record<string, unknown>) => b.type === "tool_use") as Record<string, unknown> | undefined;
+    return (toolUse?.name as string) ?? "";
   }
 
   private killSession(chatId: number): void {
