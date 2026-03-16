@@ -53,15 +53,16 @@ export class ClaudeProcess extends EventEmitter {
 
     const env: NodeJS.ProcessEnv = { ...process.env };
     if (opts.token) {
-      // OAuth tokens start with sk-ant-oat — set CLAUDE_CODE_OAUTH_TOKEN only
       // API keys start with sk-ant-api — set ANTHROPIC_API_KEY only
+      // Everything else (OAuth sk-ant-oat, setup-token format with #, etc.)
+      // goes into CLAUDE_CODE_OAUTH_TOKEN
       // Mixing them causes "Invalid API key" errors
-      if (opts.token.startsWith("sk-ant-oat")) {
-        env.CLAUDE_CODE_OAUTH_TOKEN = opts.token;
-        delete env.ANTHROPIC_API_KEY;
-      } else {
+      if (opts.token.startsWith("sk-ant-api")) {
         env.ANTHROPIC_API_KEY = opts.token;
         delete env.CLAUDE_CODE_OAUTH_TOKEN;
+      } else {
+        env.CLAUDE_CODE_OAUTH_TOKEN = opts.token;
+        delete env.ANTHROPIC_API_KEY;
       }
     }
 
