@@ -103,15 +103,6 @@ export class CcTgBot {
       if (toolName) logParts.push(`tool=${toolName}`);
       console.log(logParts.join(" "));
 
-      // Surface tool activity to Telegram as a status line
-      if (msg.type === "assistant" && toolName) {
-        this.bot.sendMessage(chatId, `⚙️ ${toolName}...`).catch(() => {});
-      }
-      if (msg.type === "system" && subtype === "task_progress") {
-        const desc = (msg.payload.description as string) ?? "";
-        if (desc) this.bot.sendMessage(chatId, `🔍 ${desc}`).catch(() => {});
-      }
-
       this.handleClaudeMessage(chatId, session, msg);
     });
     claude.on("stderr", (data) => {
