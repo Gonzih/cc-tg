@@ -6,6 +6,8 @@
 import TelegramBot from "node-telegram-bot-api";
 import { existsSync } from "fs";
 import { resolve, basename } from "path";
+import https from "https";
+import http from "http";
 import { ClaudeProcess, extractText, ClaudeMessage } from "./claude.js";
 import { transcribeVoice, isVoiceAvailable } from "./voice.js";
 import { CronManager } from "./cron.js";
@@ -80,6 +82,12 @@ export class CcTgBot {
       return;
     }
 
+    // Photo — send as base64 image content block to Claude
+    if (msg.photo?.length) {
+      await this.handlePhoto(chatId, msg);
+      return;
+    }
+
     const text = msg.text?.trim();
 
     if (!text) return;
@@ -151,6 +159,28 @@ export class CcTgBot {
     } catch (err) {
       console.error(`[voice:${chatId}] error:`, (err as Error).message);
       await this.bot.sendMessage(chatId, `Voice transcription failed: ${(err as Error).message}`);
+    }
+  }
+
+  private async handlePhoto(chatId: number, msg: TelegramBot.Message): Promise<void> {
+    // Pick highest resolution photo
+    const photos = msg.photo!;
+    const best = photos[photos.length - 1];
+    const caption = msg.caption?.trim();
+
+    console.log(`[photo:${chatId}] received image file_id=${best.file_id}`);
+    this.bot.sendChatAction(chatId, "typing").catch(() => {});
+
+    try {
+      const fileLink = await this.bot.getFileLink(best.file_id);
+      const imageData = await fetchAsBase64(fileLink);
+      // Telegram photos are always JPEG
+      const session = this.getOrCreateSession(chatId);
+      session.claude.sendImage(imageData, "image/jpeg", caption);
+      this.startTyping(chatId, session);
+    } catch (err) {
+      console.error(`[photo:${chatId}] error:`, (err as Error).message);
+      await this.bot.sendMessage(chatId, `Failed to process image: ${(err as Error).message}`);
     }
   }
 
@@ -414,6 +444,19 @@ export class CcTgBot {
       this.killSession(chatId);
     }
   }
+}
+
+/** Download a URL and return its contents as a base64 string */
+function fetchAsBase64(url: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const client = url.startsWith("https") ? https : http;
+    client.get(url, (res) => {
+      const chunks: Buffer[] = [];
+      res.on("data", (chunk: Buffer) => chunks.push(chunk));
+      res.on("end", () => resolve(Buffer.concat(chunks).toString("base64")));
+      res.on("error", reject);
+    }).on("error", reject);
+  });
 }
 
 function splitMessage(text: string, maxLen = 4096): string[] {

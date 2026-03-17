@@ -105,6 +105,31 @@ export class ClaudeProcess extends EventEmitter {
     this.proc.stdin.write(payload + "\n");
   }
 
+  /**
+   * Send an image (with optional text caption) to Claude via stream-json content blocks.
+   * mediaType: image/jpeg | image/png | image/gif | image/webp
+   */
+  sendImage(base64Data: string, mediaType: string, caption?: string): void {
+    if (this._exited) throw new Error("Claude process has exited");
+    const content: unknown[] = [];
+    if (caption) {
+      content.push({ type: "text", text: caption });
+    }
+    content.push({
+      type: "image",
+      source: {
+        type: "base64",
+        media_type: mediaType,
+        data: base64Data,
+      },
+    });
+    const payload = JSON.stringify({
+      type: "user",
+      message: { role: "user", content },
+    });
+    this.proc.stdin.write(payload + "\n");
+  }
+
   kill(): void {
     this.proc.kill();
   }
