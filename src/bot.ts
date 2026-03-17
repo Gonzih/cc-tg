@@ -8,6 +8,7 @@ import { existsSync } from "fs";
 import { resolve, basename } from "path";
 import { ClaudeProcess, extractText, ClaudeMessage } from "./claude.js";
 import { transcribeVoice, isVoiceAvailable } from "./voice.js";
+import { CronManager } from "./cron.js";
 
 export interface BotOptions {
   telegramToken: string;
@@ -19,6 +20,7 @@ export interface BotOptions {
 interface Session {
   claude: ClaudeProcess;
   pendingText: string;
+  pendingPrefix: string; // prepended to next flushed message (used by cron)
   flushTimer: ReturnType<typeof setTimeout> | null;
   typingTimer: ReturnType<typeof setInterval> | null;
   lastMessageId?: number;
@@ -33,12 +35,27 @@ export class CcTgBot {
   private bot: TelegramBot;
   private sessions = new Map<number, Session>();
   private opts: BotOptions;
+  private cron: CronManager;
 
   constructor(opts: BotOptions) {
     this.opts = opts;
     this.bot = new TelegramBot(opts.telegramToken, { polling: true });
     this.bot.on("message", (msg) => this.handleTelegram(msg));
     this.bot.on("polling_error", (err) => console.error("[tg]", err.message));
+
+    // Cron manager — fires prompts into user sessions on schedule
+    this.cron = new CronManager(opts.cwd ?? process.cwd(), (chatId, prompt) => {
+      const session = this.getOrCreateSession(chatId);
+      try {
+        session.claude.sendPrompt(`[CRON: ${prompt}]\n\n${prompt}`);
+        this.startTyping(chatId, session);
+        // Tag result with cron prefix
+        session.pendingPrefix = `CRON: ${prompt}\n\n`;
+      } catch (err) {
+        console.error(`[cron] failed to fire for chat=${chatId}:`, (err as Error).message);
+      }
+    });
+
     console.log("cc-tg bot started");
     console.log(`[voice] whisper available: ${isVoiceAvailable()}`);
   }
@@ -86,6 +103,12 @@ export class CcTgBot {
     if (text === "/status") {
       const has = this.sessions.has(chatId);
       await this.bot.sendMessage(chatId, has ? "Session active." : "No active session.");
+      return;
+    }
+
+    // /cron <schedule> <prompt> | /cron list | /cron clear | /cron remove <id>
+    if (text.startsWith("/cron")) {
+      await this.handleCron(chatId, text);
       return;
     }
 
@@ -143,6 +166,7 @@ export class CcTgBot {
     const session: Session = {
       claude,
       pendingText: "",
+      pendingPrefix: "",
       flushTimer: null,
       typingTimer: null,
       writtenFiles: new Set(),
@@ -216,10 +240,14 @@ export class CcTgBot {
   }
 
   private flushPending(chatId: number, session: Session): void {
-    const text = session.pendingText.trim();
+    const raw = session.pendingText.trim();
+    const prefix = session.pendingPrefix;
     session.pendingText = "";
+    session.pendingPrefix = "";
     session.flushTimer = null;
-    if (!text) return;
+    if (!raw) return;
+
+    const text = prefix ? `${prefix}${raw}` : raw;
 
     // Telegram max message length is 4096 chars — split if needed
     const chunks = splitMessage(text);
@@ -320,13 +348,64 @@ export class CcTgBot {
     return (toolUse?.name as string) ?? "";
   }
 
-  private killSession(chatId: number): void {
+  private async handleCron(chatId: number, text: string): Promise<void> {
+    const args = text.slice("/cron".length).trim();
+
+    // /cron list
+    if (args === "list" || args === "") {
+      const jobs = this.cron.list(chatId);
+      if (!jobs.length) {
+        await this.bot.sendMessage(chatId, "No cron jobs.");
+        return;
+      }
+      const lines = jobs.map((j) => `[${j.id}] ${j.schedule}: ${j.prompt}`);
+      await this.bot.sendMessage(chatId, lines.join("\n"));
+      return;
+    }
+
+    // /cron clear
+    if (args === "clear") {
+      const n = this.cron.clearAll(chatId);
+      await this.bot.sendMessage(chatId, `Cleared ${n} cron job(s).`);
+      return;
+    }
+
+    // /cron remove <id>
+    if (args.startsWith("remove ")) {
+      const id = args.slice("remove ".length).trim();
+      const ok = this.cron.remove(chatId, id);
+      await this.bot.sendMessage(chatId, ok ? `Removed ${id}.` : `Not found: ${id}`);
+      return;
+    }
+
+    // /cron every 1h <prompt>
+    const scheduleMatch = args.match(/^(every\s+\d+[mhd])\s+(.+)$/i);
+    if (!scheduleMatch) {
+      await this.bot.sendMessage(
+        chatId,
+        "Usage:\n/cron every 1h <prompt>\n/cron list\n/cron remove <id>\n/cron clear"
+      );
+      return;
+    }
+
+    const schedule = scheduleMatch[1];
+    const prompt = scheduleMatch[2];
+    const job = this.cron.add(chatId, schedule, prompt);
+    if (!job) {
+      await this.bot.sendMessage(chatId, "Invalid schedule. Use: every 30m / every 2h / every 1d");
+      return;
+    }
+    await this.bot.sendMessage(chatId, `Cron set [${job.id}]: ${schedule} — "${prompt}"`);
+  }
+
+  private killSession(chatId: number, keepCrons = true): void {
     const session = this.sessions.get(chatId);
     if (session) {
       this.stopTyping(session);
       session.claude.kill();
       this.sessions.delete(chatId);
     }
+    if (!keepCrons) this.cron.clearAll(chatId);
   }
 
   stop(): void {
