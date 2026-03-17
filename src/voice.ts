@@ -28,7 +28,9 @@ const WHISPER_MODELS = [
 ];
 
 const WHISPER_BIN_CANDIDATES = [
+  "/opt/homebrew/bin/whisper-cli",   // whisper-cpp brew formula installs as whisper-cli
   "/opt/homebrew/bin/whisper-cpp",
+  "/usr/local/bin/whisper-cli",
   "/usr/local/bin/whisper-cpp",
   "/opt/homebrew/bin/whisper",
 ];
