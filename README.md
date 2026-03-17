@@ -53,6 +53,8 @@ Message [@userinfobot](https://t.me/userinfobot) on Telegram — it replies with
 | `/cron clear` | Remove all cron jobs |
 | Any text | Sent directly to Claude Code |
 | Voice message | Transcribed via whisper.cpp and sent to Claude |
+| Photo | Sent as native image input to Claude (base64 content block) |
+| Document / file | Downloaded to `<CWD>/.cc-tg/uploads/`, path passed to Claude as `ATTACHMENTS: [name](path)` |
 
 ## Features
 
@@ -61,6 +63,12 @@ Each Telegram chat ID gets its own isolated Claude Code subprocess. Sessions sur
 
 ### Voice messages
 Send a voice message → automatically transcribed via whisper.cpp → fed into Claude as text. Requires `whisper-cpp` and `ffmpeg` installed on the host.
+
+### Images
+Send a photo → downloaded and base64-encoded → sent to Claude as a native image content block via the stream-JSON protocol. Claude sees the full image, no intermediate vision step. Caption (if any) is included as text alongside the image.
+
+### Documents
+Send any file as a document → downloaded to `<CWD>/.cc-tg/uploads/<filename>` → Claude receives the path as `ATTACHMENTS: [filename](path)` and can read/process it directly. Works for PDFs, CSVs, code files, etc.
 
 ### File delivery
 When Claude writes a file and mentions it in the response, the bot automatically uploads it to Telegram. Hybrid detection: tracks `Write`/`Edit` tool calls during the session, cross-references with filenames mentioned in the final response.
