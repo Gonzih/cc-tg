@@ -5,6 +5,7 @@
 
 import TelegramBot from "node-telegram-bot-api";
 import { ClaudeProcess, extractText, ClaudeMessage } from "./claude.js";
+import { transcribeVoice, isVoiceAvailable } from "./voice.js";
 
 export interface BotOptions {
   telegramToken: string;
@@ -35,6 +36,7 @@ export class CcTgBot {
     this.bot.on("message", (msg) => this.handleTelegram(msg));
     this.bot.on("polling_error", (err) => console.error("[tg]", err.message));
     console.log("cc-tg bot started");
+    console.log(`[voice] whisper available: ${isVoiceAvailable()}`);
   }
 
   private isAllowed(userId: number): boolean {
@@ -45,14 +47,21 @@ export class CcTgBot {
   private async handleTelegram(msg: TelegramBot.Message): Promise<void> {
     const chatId = msg.chat.id;
     const userId = msg.from?.id ?? chatId;
-    const text = msg.text?.trim();
-
-    if (!text) return;
 
     if (!this.isAllowed(userId)) {
       await this.bot.sendMessage(chatId, "Not authorized.");
       return;
     }
+
+    // Voice message — transcribe then feed as text
+    if (msg.voice || msg.audio) {
+      await this.handleVoice(chatId, msg);
+      return;
+    }
+
+    const text = msg.text?.trim();
+
+    if (!text) return;
 
     // /start or /reset — kill existing session and ack
     if (text === "/start" || text === "/reset") {
@@ -83,6 +92,38 @@ export class CcTgBot {
     } catch (err) {
       await this.bot.sendMessage(chatId, `Error sending to Claude: ${(err as Error).message}`);
       this.killSession(chatId);
+    }
+  }
+
+  private async handleVoice(chatId: number, msg: TelegramBot.Message): Promise<void> {
+    const fileId = msg.voice?.file_id ?? msg.audio?.file_id;
+    if (!fileId) return;
+
+    console.log(`[voice:${chatId}] received voice message, transcribing...`);
+    this.bot.sendChatAction(chatId, "typing").catch(() => {});
+
+    try {
+      const fileLink = await this.bot.getFileLink(fileId);
+      const transcript = await transcribeVoice(fileLink);
+      console.log(`[voice:${chatId}] transcribed: ${transcript}`);
+
+      if (!transcript || transcript === "[empty transcription]") {
+        await this.bot.sendMessage(chatId, "Could not transcribe voice message.");
+        return;
+      }
+
+      // Feed transcript into Claude as if user typed it
+      const session = this.getOrCreateSession(chatId);
+      try {
+        session.claude.sendPrompt(transcript);
+        this.startTyping(chatId, session);
+      } catch (err) {
+        await this.bot.sendMessage(chatId, `Error sending to Claude: ${(err as Error).message}`);
+        this.killSession(chatId);
+      }
+    } catch (err) {
+      console.error(`[voice:${chatId}] error:`, (err as Error).message);
+      await this.bot.sendMessage(chatId, `Voice transcription failed: ${(err as Error).message}`);
     }
   }
 
