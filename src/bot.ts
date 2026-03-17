@@ -4,6 +4,8 @@
  */
 
 import TelegramBot from "node-telegram-bot-api";
+import { existsSync } from "fs";
+import { resolve, basename } from "path";
 import { ClaudeProcess, extractText, ClaudeMessage } from "./claude.js";
 import { transcribeVoice, isVoiceAvailable } from "./voice.js";
 
@@ -20,6 +22,8 @@ interface Session {
   flushTimer: ReturnType<typeof setTimeout> | null;
   typingTimer: ReturnType<typeof setInterval> | null;
   lastMessageId?: number;
+  /** Files written by Claude tools during this turn — cleared after each result */
+  writtenFiles: Set<string>;
 }
 
 const FLUSH_DELAY_MS = 800; // debounce streaming chunks into one Telegram message
@@ -141,6 +145,7 @@ export class CcTgBot {
       pendingText: "",
       flushTimer: null,
       typingTimer: null,
+      writtenFiles: new Set(),
     };
 
     claude.on("message", (msg) => {
@@ -151,6 +156,9 @@ export class CcTgBot {
       if (subtype) logParts.push(`subtype=${subtype}`);
       if (toolName) logParts.push(`tool=${toolName}`);
       console.log(logParts.join(" "));
+
+      // Track files written by Write/Edit tool calls
+      this.trackWrittenFiles(msg, session, this.opts.cwd);
 
       this.handleClaudeMessage(chatId, session, msg);
     });
@@ -223,6 +231,84 @@ export class CcTgBot {
         );
       });
     }
+
+    // Hybrid file upload: find files mentioned in result text that Claude actually wrote
+    this.uploadMentionedFiles(chatId, text, session);
+  }
+
+  private trackWrittenFiles(msg: ClaudeMessage, session: Session, cwd?: string): void {
+    // Only look at assistant messages with tool_use blocks
+    if (msg.type !== "assistant") return;
+    const message = msg.payload.message as Record<string, unknown> | undefined;
+    if (!message) return;
+    const content = message.content;
+    if (!Array.isArray(content)) return;
+
+    for (const block of content as Record<string, unknown>[]) {
+      if (block.type !== "tool_use") continue;
+      const name = block.name as string;
+      if (!["Write", "Edit", "NotebookEdit"].includes(name)) continue;
+
+      const input = block.input as Record<string, unknown> | undefined;
+      if (!input) continue;
+
+      // Write tool uses file_path, Edit uses file_path
+      const filePath = (input.file_path as string) ?? (input.path as string);
+      if (!filePath) continue;
+
+      // Resolve relative paths against cwd
+      const resolved = filePath.startsWith("/")
+        ? filePath
+        : resolve(cwd ?? process.cwd(), filePath);
+
+      console.log(`[claude:files] tracked written file: ${resolved}`);
+      session.writtenFiles.add(resolved);
+    }
+  }
+
+  private uploadMentionedFiles(chatId: number, resultText: string, session: Session): void {
+    if (session.writtenFiles.size === 0) return;
+
+    // Extract file path candidates from result text
+    // Match: /absolute/path/file.ext or relative like ./foo/bar.csv or just foo.pdf
+    const pathPattern = /(?:^|[\s`'"(])(\/?[\w.\-/]+\.[\w]{1,10})(?:[\s`'")\n]|$)/gm;
+    const candidates = new Set<string>();
+    let match;
+    while ((match = pathPattern.exec(resultText)) !== null) {
+      candidates.add(match[1]);
+    }
+
+    const toUpload: string[] = [];
+    for (const candidate of candidates) {
+      // Try as-is (absolute), or resolve against cwd
+      const resolved = candidate.startsWith("/")
+        ? candidate
+        : resolve(this.opts.cwd ?? process.cwd(), candidate);
+
+      if (session.writtenFiles.has(resolved) && existsSync(resolved)) {
+        toUpload.push(resolved);
+      } else {
+        // Also check by basename — result might mention just the filename
+        for (const written of session.writtenFiles) {
+          if (basename(written) === basename(candidate) && existsSync(written)) {
+            toUpload.push(written);
+            break;
+          }
+        }
+      }
+    }
+
+    // Deduplicate
+    const unique = [...new Set(toUpload)];
+    for (const filePath of unique) {
+      console.log(`[claude:files] uploading to telegram: ${filePath}`);
+      this.bot.sendDocument(chatId, filePath).catch((err) =>
+        console.error(`[tg:${chatId}] sendDocument failed for ${filePath}:`, err.message)
+      );
+    }
+
+    // Clear written files for next turn
+    session.writtenFiles.clear();
   }
 
   private extractToolName(msg: ClaudeMessage): string {
