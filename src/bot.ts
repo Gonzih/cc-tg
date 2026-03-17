@@ -4,8 +4,8 @@
  */
 
 import TelegramBot from "node-telegram-bot-api";
-import { existsSync } from "fs";
-import { resolve, basename } from "path";
+import { existsSync, createWriteStream, mkdirSync } from "fs";
+import { resolve, basename, join } from "path";
 import https from "https";
 import http from "http";
 import { ClaudeProcess, extractText, ClaudeMessage } from "./claude.js";
@@ -85,6 +85,12 @@ export class CcTgBot {
     // Photo — send as base64 image content block to Claude
     if (msg.photo?.length) {
       await this.handlePhoto(chatId, msg);
+      return;
+    }
+
+    // Document — download to CWD/.cc-tg/uploads/, tell Claude the path
+    if (msg.document) {
+      await this.handleDocument(chatId, msg);
       return;
     }
 
@@ -181,6 +187,37 @@ export class CcTgBot {
     } catch (err) {
       console.error(`[photo:${chatId}] error:`, (err as Error).message);
       await this.bot.sendMessage(chatId, `Failed to process image: ${(err as Error).message}`);
+    }
+  }
+
+  private async handleDocument(chatId: number, msg: TelegramBot.Message): Promise<void> {
+    const doc = msg.document!;
+    const caption = msg.caption?.trim();
+    const fileName = doc.file_name ?? `file_${doc.file_id}`;
+
+    console.log(`[doc:${chatId}] received document file_name=${fileName} mime=${doc.mime_type}`);
+    this.bot.sendChatAction(chatId, "typing").catch(() => {});
+
+    try {
+      const uploadsDir = join(this.opts.cwd ?? process.cwd(), ".cc-tg", "uploads");
+      mkdirSync(uploadsDir, { recursive: true });
+      const destPath = join(uploadsDir, fileName);
+
+      const fileLink = await this.bot.getFileLink(doc.file_id);
+      await downloadToFile(fileLink, destPath);
+
+      console.log(`[doc:${chatId}] saved to ${destPath}`);
+
+      const prompt = caption
+        ? `${caption}\n\nATTACHMENTS: [${fileName}](${destPath})`
+        : `ATTACHMENTS: [${fileName}](${destPath})`;
+
+      const session = this.getOrCreateSession(chatId);
+      session.claude.sendPrompt(prompt);
+      this.startTyping(chatId, session);
+    } catch (err) {
+      console.error(`[doc:${chatId}] error:`, (err as Error).message);
+      await this.bot.sendMessage(chatId, `Failed to receive document: ${(err as Error).message}`);
     }
   }
 
@@ -455,6 +492,19 @@ function fetchAsBase64(url: string): Promise<string> {
       res.on("data", (chunk: Buffer) => chunks.push(chunk));
       res.on("end", () => resolve(Buffer.concat(chunks).toString("base64")));
       res.on("error", reject);
+    }).on("error", reject);
+  });
+}
+
+/** Download a URL to a local file path */
+function downloadToFile(url: string, destPath: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const client = url.startsWith("https") ? https : http;
+    const file = createWriteStream(destPath);
+    client.get(url, (res) => {
+      res.pipe(file);
+      file.on("finish", () => file.close(() => resolve()));
+      file.on("error", reject);
     }).on("error", reject);
   });
 }
