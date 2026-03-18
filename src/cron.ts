@@ -86,6 +86,33 @@ export class CronManager {
       .map(({ timer: _t, ...j }) => j);
   }
 
+  update(chatId: number, id: string, updates: { schedule?: string; prompt?: string }): CronJob | null | false {
+    const job = this.jobs.get(id);
+    if (!job || job.chatId !== chatId) return false;
+
+    if (updates.schedule !== undefined) {
+      const intervalMs = CronManager.parseSchedule(updates.schedule);
+      if (!intervalMs) return null;
+      job.intervalMs = intervalMs;
+      job.schedule = updates.schedule;
+    }
+
+    if (updates.prompt !== undefined) {
+      job.prompt = updates.prompt;
+    }
+
+    // Recreate timer so it uses updated intervalMs and always reads latest job.prompt
+    clearInterval(job.timer);
+    job.timer = setInterval(() => {
+      console.log(`[cron:${job.id}] firing for chat=${job.chatId} prompt="${job.prompt}"`);
+      this.fire(job.chatId, job.prompt);
+    }, job.intervalMs);
+
+    this.persist();
+    const { timer: _t, ...cronJob } = job;
+    return cronJob;
+  }
+
   private persist(): void {
     try {
       const dir = join(this.storePath, "..");

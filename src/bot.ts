@@ -12,6 +12,15 @@ import { ClaudeProcess, extractText, ClaudeMessage } from "./claude.js";
 import { transcribeVoice, isVoiceAvailable } from "./voice.js";
 import { CronManager } from "./cron.js";
 
+const BOT_COMMANDS: Array<{ command: string; description: string }> = [
+  { command: "start", description: "Reset session and start fresh" },
+  { command: "reset", description: "Reset Claude session" },
+  { command: "stop", description: "Stop the current Claude task" },
+  { command: "status", description: "Check if a session is active" },
+  { command: "help", description: "Show all available commands" },
+  { command: "cron", description: "Manage cron jobs — add/list/edit/remove/clear" },
+];
+
 export interface BotOptions {
   telegramToken: string;
   claudeToken?: string;
@@ -58,8 +67,16 @@ export class CcTgBot {
       }
     });
 
+    this.registerBotCommands();
+
     console.log("cc-tg bot started");
     console.log(`[voice] whisper available: ${isVoiceAvailable()}`);
+  }
+
+  private registerBotCommands(): void {
+    this.bot.setMyCommands(BOT_COMMANDS)
+      .then(() => console.log("[tg] bot commands registered"))
+      .catch((err: Error) => console.error("[tg] setMyCommands failed:", err.message));
   }
 
   private isAllowed(userId: number): boolean {
@@ -110,6 +127,13 @@ export class CcTgBot {
       const has = this.sessions.has(chatId);
       this.killSession(chatId);
       await this.bot.sendMessage(chatId, has ? "Stopped." : "No active session.");
+      return;
+    }
+
+    // /help — list all commands
+    if (text === "/help") {
+      const lines = BOT_COMMANDS.map((c) => `/${c.command} — ${c.description}`);
+      await this.bot.sendMessage(chatId, lines.join("\n"));
       return;
     }
 
@@ -440,8 +464,11 @@ export class CcTgBot {
         await this.bot.sendMessage(chatId, "No cron jobs.");
         return;
       }
-      const lines = jobs.map((j) => `[${j.id}] ${j.schedule}: ${j.prompt}`);
-      await this.bot.sendMessage(chatId, lines.join("\n"));
+      const lines = jobs.map((j, i) => {
+        const short = j.prompt.length > 50 ? j.prompt.slice(0, 50) + "…" : j.prompt;
+        return `#${i + 1} ${j.schedule} — "${short}"`;
+      });
+      await this.bot.sendMessage(chatId, `Cron jobs (${jobs.length}):\n${lines.join("\n")}`);
       return;
     }
 
@@ -460,12 +487,18 @@ export class CcTgBot {
       return;
     }
 
+    // /cron edit [<#> ...]
+    if (args === "edit" || args.startsWith("edit ")) {
+      await this.handleCronEdit(chatId, args.slice("edit".length).trim());
+      return;
+    }
+
     // /cron every 1h <prompt>
     const scheduleMatch = args.match(/^(every\s+\d+[mhd])\s+(.+)$/i);
     if (!scheduleMatch) {
       await this.bot.sendMessage(
         chatId,
-        "Usage:\n/cron every 1h <prompt>\n/cron list\n/cron remove <id>\n/cron clear"
+        "Usage:\n/cron every 1h <prompt>\n/cron list\n/cron edit\n/cron remove <id>\n/cron clear"
       );
       return;
     }
@@ -478,6 +511,97 @@ export class CcTgBot {
       return;
     }
     await this.bot.sendMessage(chatId, `Cron set [${job.id}]: ${schedule} — "${prompt}"`);
+  }
+
+  private async handleCronEdit(chatId: number, editArgs: string): Promise<void> {
+    const jobs = this.cron.list(chatId);
+
+    // No args — show numbered list with edit instructions
+    if (!editArgs) {
+      if (!jobs.length) {
+        await this.bot.sendMessage(chatId, "No cron jobs to edit.");
+        return;
+      }
+      const lines = jobs.map((j, i) => {
+        const short = j.prompt.length > 50 ? j.prompt.slice(0, 50) + "…" : j.prompt;
+        return `#${i + 1} ${j.schedule} — "${short}"`;
+      });
+      await this.bot.sendMessage(
+        chatId,
+        `Cron jobs:\n${lines.join("\n")}\n\n` +
+        "Edit options:\n" +
+        "/cron edit <#> every <N><unit> <new prompt>\n" +
+        "/cron edit <#> schedule every <N><unit>\n" +
+        "/cron edit <#> prompt <new prompt>"
+      );
+      return;
+    }
+
+    // Expect: <index> <rest>
+    const indexMatch = editArgs.match(/^(\d+)\s+(.+)$/);
+    if (!indexMatch) {
+      await this.bot.sendMessage(chatId, "Usage: /cron edit <#> every <N><unit> <new prompt>");
+      return;
+    }
+
+    const index = parseInt(indexMatch[1], 10) - 1;
+    if (index < 0 || index >= jobs.length) {
+      await this.bot.sendMessage(chatId, `Invalid job number. Use /cron edit to see the list.`);
+      return;
+    }
+
+    const job = jobs[index];
+    const editCmd = indexMatch[2];
+
+    // /cron edit <#> schedule every <N><unit>
+    if (editCmd.startsWith("schedule ")) {
+      const newSchedule = editCmd.slice("schedule ".length).trim();
+      const result = this.cron.update(chatId, job.id, { schedule: newSchedule });
+      if (result === null) {
+        await this.bot.sendMessage(chatId, "Invalid schedule. Use: every 30m / every 2h / every 1d");
+      } else if (result === false) {
+        await this.bot.sendMessage(chatId, "Job not found.");
+      } else {
+        await this.bot.sendMessage(chatId, `#${index + 1} schedule updated to ${newSchedule}.`);
+      }
+      return;
+    }
+
+    // /cron edit <#> prompt <new-prompt>
+    if (editCmd.startsWith("prompt ")) {
+      const newPrompt = editCmd.slice("prompt ".length).trim();
+      const result = this.cron.update(chatId, job.id, { prompt: newPrompt });
+      if (result === false) {
+        await this.bot.sendMessage(chatId, "Job not found.");
+      } else {
+        await this.bot.sendMessage(chatId, `#${index + 1} prompt updated to "${newPrompt}".`);
+      }
+      return;
+    }
+
+    // /cron edit <#> every <N><unit> <new-prompt>
+    const fullMatch = editCmd.match(/^(every\s+\d+[mhd])\s+(.+)$/i);
+    if (fullMatch) {
+      const newSchedule = fullMatch[1];
+      const newPrompt = fullMatch[2];
+      const result = this.cron.update(chatId, job.id, { schedule: newSchedule, prompt: newPrompt });
+      if (result === null) {
+        await this.bot.sendMessage(chatId, "Invalid schedule. Use: every 30m / every 2h / every 1d");
+      } else if (result === false) {
+        await this.bot.sendMessage(chatId, "Job not found.");
+      } else {
+        await this.bot.sendMessage(chatId, `#${index + 1} updated: ${newSchedule} — "${newPrompt}"`);
+      }
+      return;
+    }
+
+    await this.bot.sendMessage(
+      chatId,
+      "Edit options:\n" +
+      "/cron edit <#> every <N><unit> <new prompt>\n" +
+      "/cron edit <#> schedule every <N><unit>\n" +
+      "/cron edit <#> prompt <new prompt>"
+    );
   }
 
   private killSession(chatId: number, keepCrons = true): void {
