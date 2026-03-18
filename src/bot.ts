@@ -361,6 +361,17 @@ export class CcTgBot {
     }
   }
 
+  private isSensitiveFile(filePath: string): boolean {
+    const name = basename(filePath).toLowerCase();
+    const sensitivePatterns = [
+      /credential/i, /secret/i, /password/i, /passwd/i, /\.env/i,
+      /api[_-]?key/i, /token/i, /private[_-]?key/i, /id_rsa/i,
+      /\.pem$/i, /\.key$/i, /\.pfx$/i, /\.p12$/i,
+      /gmail/i, /oauth/i, /auth/i,
+    ];
+    return sensitivePatterns.some((p) => p.test(name));
+  }
+
   private uploadMentionedFiles(chatId: number, resultText: string, session: Session): void {
     if (session.writtenFiles.size === 0) return;
 
@@ -393,9 +404,13 @@ export class CcTgBot {
       }
     }
 
-    // Deduplicate
+    // Deduplicate and filter sensitive files
     const unique = [...new Set(toUpload)];
     for (const filePath of unique) {
+      if (this.isSensitiveFile(filePath)) {
+        console.log(`[claude:files] skipping sensitive file: ${filePath}`);
+        continue;
+      }
       console.log(`[claude:files] uploading to telegram: ${filePath}`);
       this.bot.sendDocument(chatId, filePath).catch((err) =>
         console.error(`[tg:${chatId}] sendDocument failed for ${filePath}:`, err.message)
