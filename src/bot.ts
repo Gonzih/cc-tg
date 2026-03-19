@@ -6,6 +6,7 @@
 import TelegramBot from "node-telegram-bot-api";
 import { existsSync, createWriteStream, mkdirSync } from "fs";
 import { resolve, basename, join } from "path";
+import { execSync } from "child_process";
 import https from "https";
 import http from "http";
 import { ClaudeProcess, extractText, ClaudeMessage } from "./claude.js";
@@ -19,6 +20,9 @@ const BOT_COMMANDS: Array<{ command: string; description: string }> = [
   { command: "status", description: "Check if a session is active" },
   { command: "help", description: "Show all available commands" },
   { command: "cron", description: "Manage cron jobs — add/list/edit/remove/clear" },
+  { command: "reload_mcp", description: "Restart the cc-agent MCP server process" },
+  { command: "mcp_version", description: "Show cc-agent npm version and npx cache info" },
+  { command: "clear_npx_cache", description: "Clear npx cache and restart MCP to pick up latest version" },
 ];
 
 export interface BotOptions {
@@ -147,6 +151,24 @@ export class CcTgBot {
     // /cron <schedule> <prompt> | /cron list | /cron clear | /cron remove <id>
     if (text.startsWith("/cron")) {
       await this.handleCron(chatId, text);
+      return;
+    }
+
+    // /reload_mcp — kill cc-agent process so Claude Code auto-restarts it
+    if (text === "/reload_mcp") {
+      await this.handleReloadMcp(chatId);
+      return;
+    }
+
+    // /mcp_version — show published npm version and cached npx entries
+    if (text === "/mcp_version") {
+      await this.handleMcpVersion(chatId);
+      return;
+    }
+
+    // /clear_npx_cache — wipe ~/.npm/_npx/ then restart cc-agent
+    if (text === "/clear_npx_cache") {
+      await this.handleClearNpxCache(chatId);
       return;
     }
 
@@ -601,6 +623,88 @@ export class CcTgBot {
       "/cron edit <#> every <N><unit> <new prompt>\n" +
       "/cron edit <#> schedule every <N><unit>\n" +
       "/cron edit <#> prompt <new prompt>"
+    );
+  }
+
+  /** Find cc-agent PIDs via pgrep. Returns array of numeric PIDs. */
+  private findCcAgentPids(): number[] {
+    try {
+      const out = execSync("pgrep -f cc-agent", { encoding: "utf8" }).trim();
+      return out.split("\n").map((s) => parseInt(s.trim(), 10)).filter((n) => !isNaN(n) && n > 0);
+    } catch {
+      // pgrep exits with code 1 when no match — that's fine
+      return [];
+    }
+  }
+
+  /** Kill cc-agent PIDs with SIGTERM. Returns the list of killed PIDs. */
+  private killCcAgent(): number[] {
+    const pids = this.findCcAgentPids();
+    for (const pid of pids) {
+      try {
+        process.kill(pid, "SIGTERM");
+        console.log(`[mcp] sent SIGTERM to cc-agent pid=${pid}`);
+      } catch (err) {
+        console.warn(`[mcp] failed to kill pid=${pid}:`, (err as Error).message);
+      }
+    }
+    return pids;
+  }
+
+  private async handleReloadMcp(chatId: number): Promise<void> {
+    const pids = this.killCcAgent();
+    if (pids.length === 0) {
+      await this.bot.sendMessage(chatId, "No cc-agent process found. MCP will start fresh on the next agent call.");
+      return;
+    }
+    await this.bot.sendMessage(
+      chatId,
+      `Sent SIGTERM to cc-agent (pid${pids.length > 1 ? "s" : ""}: ${pids.join(", ")}).\nMCP restarted. New process will load on next agent call.`
+    );
+  }
+
+  private async handleMcpVersion(chatId: number): Promise<void> {
+    let npmVersion = "unknown";
+    let cacheEntries = "(unavailable)";
+
+    try {
+      npmVersion = execSync("npm view @gonzih/cc-agent version", { encoding: "utf8" }).trim();
+    } catch (err) {
+      npmVersion = `error: ${(err as Error).message.split("\n")[0]}`;
+    }
+
+    try {
+      const home = process.env.HOME ?? "~";
+      const cacheOut = execSync(`ls "${home}/.npm/_npx/" 2>/dev/null | head -5`, { encoding: "utf8", shell: "/bin/sh" }).trim();
+      cacheEntries = cacheOut || "(empty)";
+    } catch {
+      cacheEntries = "(empty or not found)";
+    }
+
+    await this.bot.sendMessage(
+      chatId,
+      `cc-agent npm version: ${npmVersion}\n\nnpx cache (~/.npm/_npx/):\n${cacheEntries}`
+    );
+  }
+
+  private async handleClearNpxCache(chatId: number): Promise<void> {
+    try {
+      const home = process.env.HOME ?? "~";
+      execSync(`rm -rf "${home}/.npm/_npx/"`, { encoding: "utf8", shell: "/bin/sh" });
+      console.log("[mcp] cleared ~/.npm/_npx/");
+    } catch (err) {
+      await this.bot.sendMessage(chatId, `Failed to clear npx cache: ${(err as Error).message}`);
+      return;
+    }
+
+    const pids = this.killCcAgent();
+    const pidNote = pids.length > 0
+      ? ` Sent SIGTERM to pid${pids.length > 1 ? "s" : ""}: ${pids.join(", ")}.`
+      : " No cc-agent process found (will start fresh on next call).";
+
+    await this.bot.sendMessage(
+      chatId,
+      `NPX cache cleared and MCP restarted.${pidNote} Will pick up latest npm version on next call.`
     );
   }
 
