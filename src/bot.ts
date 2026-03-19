@@ -4,7 +4,7 @@
  */
 
 import TelegramBot from "node-telegram-bot-api";
-import { existsSync, createWriteStream, mkdirSync, statSync } from "fs";
+import { existsSync, createWriteStream, mkdirSync, statSync, readdirSync } from "fs";
 import { resolve, basename, join } from "path";
 import os from "os";
 import { execSync } from "child_process";
@@ -420,9 +420,38 @@ export class CcTgBot {
         session.writtenFiles.add(resolved);
       } else if (name === "Bash") {
         const cmd = (input.command as string) ?? "";
-        // yt-dlp / ffmpeg -o "path"
-        const oFlag = cmd.match(/-o\s+["']?([^\s"']+\.[\w]{1,10})["']?/);
-        if (oFlag) session.writtenFiles.add(resolve(cwd ?? process.cwd(), oFlag[1]));
+        if (/\byt-dlp\b|\bffmpeg\b/.test(cmd)) {
+          // Scan output dir for recently modified media files (template paths like /tmp/%(title)s.%(ext)s
+          // make the actual filename unknowable at tracking time)
+          const oFlagMatch = cmd.match(/-o\s+["']?([^\s"']+)/);
+          let scanDir = "/tmp/";
+          if (oFlagMatch) {
+            const oPath = oFlagMatch[1].replace(/["'].*$/, "");
+            const dirEnd = oPath.lastIndexOf("/");
+            if (dirEnd > 0) scanDir = oPath.slice(0, dirEnd + 1);
+          }
+          const MEDIA_EXTS = new Set([".mp3", ".mp4", ".wav", ".ogg", ".flac", ".webm", ".m4a", ".aac"]);
+          const nowMs = Date.now();
+          try {
+            for (const entry of readdirSync(scanDir)) {
+              const dotIdx = entry.lastIndexOf(".");
+              if (dotIdx < 0) continue;
+              const ext = entry.slice(dotIdx).toLowerCase();
+              if (!MEDIA_EXTS.has(ext)) continue;
+              const full = join(scanDir, entry);
+              try {
+                if (nowMs - statSync(full).mtimeMs <= 90_000) {
+                  console.log(`[claude:files] tracked yt-dlp/ffmpeg output: ${full}`);
+                  session.writtenFiles.add(full);
+                }
+              } catch { /* skip unreadable entries */ }
+            }
+          } catch { /* scanDir doesn't exist or unreadable */ }
+        } else {
+          // Other bash commands: try to extract output path from -o flag
+          const oFlag = cmd.match(/-o\s+["']?([^\s"']+\.[\w]{1,10})["']?/);
+          if (oFlag) session.writtenFiles.add(resolve(cwd ?? process.cwd(), oFlag[1]));
+        }
         // mv source dest — track dest
         const mvMatch = cmd.match(/\bmv\s+\S+\s+["']?([^\s"']+)["']?$/);
         if (mvMatch) session.writtenFiles.add(resolve(cwd ?? process.cwd(), mvMatch[1]));
@@ -445,7 +474,7 @@ export class CcTgBot {
       /credential/i, /secret/i, /password/i, /passwd/i, /\.env/i,
       /api[_-]?key/i, /token/i, /private[_-]?key/i, /id_rsa/i,
       /\.pem$/i, /\.key$/i, /\.pfx$/i, /\.p12$/i,
-      /gmail/i, /oauth/i, /auth/i,
+      /gmail/i, /oauth/i, /\bauth\b/i,
     ];
     return sensitivePatterns.some((p) => p.test(name));
   }
@@ -454,10 +483,14 @@ export class CcTgBot {
     // Extract file path candidates from result text
     // Match: /absolute/path/file.ext or relative like ./foo/bar.csv or just foo.pdf
     const pathPattern = /(?:^|[\s`'"(])(\/?[\w.\-/]+\.[\w]{1,10})(?:[\s`'")\n]|$)/gm;
+    const quotedPattern = /"([^"]+\.[a-zA-Z0-9]{1,10})"|'([^']+\.[a-zA-Z0-9]{1,10})'/g;
     const candidates = new Set<string>();
     let match;
     while ((match = pathPattern.exec(resultText)) !== null) {
       candidates.add(match[1]);
+    }
+    while ((match = quotedPattern.exec(resultText)) !== null) {
+      candidates.add(match[1] ?? match[2]);
     }
 
     const safeDirs = ["/tmp/", "/var/folders/", os.homedir() + "/Downloads/"];
