@@ -14,7 +14,32 @@
  *   CWD                  — working directory for Claude Code (default: process.cwd())
  */
 
+import { existsSync, writeFileSync, unlinkSync, readFileSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import { CcTgBot } from "./bot.js";
+
+const LOCK_FILE = join(tmpdir(), "cc-tg.lock");
+
+function acquireLock(): boolean {
+  if (existsSync(LOCK_FILE)) {
+    try {
+      const pid = parseInt(readFileSync(LOCK_FILE, "utf8").trim());
+      process.kill(pid, 0);
+      console.error(`[cc-tg] Another instance is already running (PID ${pid}). Exiting.`);
+      return false;
+    } catch {
+      // PID is dead — stale lock, take over
+    }
+  }
+  writeFileSync(LOCK_FILE, String(process.pid));
+  process.on("exit", () => { try { unlinkSync(LOCK_FILE); } catch {} });
+  return true;
+}
+
+if (!acquireLock()) {
+  process.exit(1);
+}
 
 function required(name: string): string {
   const val = process.env[name];

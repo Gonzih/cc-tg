@@ -719,12 +719,18 @@ export class CcTgBot {
     await this.bot.sendMessage(chatId, "Restarting bot... brb.");
     await new Promise(resolve => setTimeout(resolve, 1000));
     this.stop();
-    const child = spawn(process.execPath, process.argv.slice(1), {
-      detached: true,
-      stdio: "inherit",
-      env: process.env,
-    });
-    child.unref();
+
+    const isLaunchd = process.ppid === 1;
+    if (!isLaunchd) {
+      // Running manually — spawn a replacement process
+      const child = spawn(process.execPath, process.argv.slice(1), {
+        detached: true,
+        stdio: "ignore",
+        env: process.env,
+      });
+      child.unref();
+    }
+    // If launchd-managed, just exit — launchd will restart us
     process.exit(0);
   }
 
