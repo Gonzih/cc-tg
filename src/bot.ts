@@ -4,7 +4,7 @@
  */
 
 import TelegramBot from "node-telegram-bot-api";
-import { existsSync, createWriteStream, mkdirSync } from "fs";
+import { existsSync, createWriteStream, mkdirSync, statSync } from "fs";
 import { resolve, basename, join } from "path";
 import os from "os";
 import { execSync } from "child_process";
@@ -25,7 +25,7 @@ const BOT_COMMANDS: Array<{ command: string; description: string }> = [
   { command: "mcp_version", description: "Show cc-agent npm version and npx cache info" },
   { command: "clear_npx_cache", description: "Clear npx cache and restart MCP to pick up latest version" },
   { command: "restart", description: "Restart the bot process in-place" },
-  { command: "get_file", description: "Get a file from the server by path" },
+  { command: "get_file", description: "Send a file from the server to this chat" },
 ];
 
 export interface BotOptions {
@@ -505,6 +505,13 @@ export class CcTgBot {
         console.log(`[claude:files] skipping sensitive file: ${filePath}`);
         continue;
       }
+      const fileSize = statSync(filePath).size;
+      const MAX_TG_FILE_BYTES = 50 * 1024 * 1024;
+      if (fileSize > MAX_TG_FILE_BYTES) {
+        const mb = (fileSize / (1024 * 1024)).toFixed(1);
+        this.bot.sendMessage(chatId, `File too large for Telegram (${mb}mb). Find it at: ${filePath}`).catch(() => {});
+        continue;
+      }
       console.log(`[claude:files] uploading to telegram: ${filePath}`);
       this.bot.sendDocument(chatId, filePath).catch((err) =>
         console.error(`[tg:${chatId}] sendDocument failed for ${filePath}:`, err.message)
@@ -783,15 +790,21 @@ export class CcTgBot {
       return;
     }
 
-    const { statSync } = await import("fs");
-    const stat = statSync(filePath);
-    if (!stat.isFile()) {
+    if (!statSync(filePath).isFile()) {
       await this.bot.sendMessage(chatId, `Not a file: ${filePath}`);
       return;
     }
 
     if (this.isSensitiveFile(filePath)) {
       await this.bot.sendMessage(chatId, "Access denied: sensitive file");
+      return;
+    }
+
+    const MAX_TG_FILE_BYTES = 50 * 1024 * 1024;
+    const fileSize = statSync(filePath).size;
+    if (fileSize > MAX_TG_FILE_BYTES) {
+      const mb = (fileSize / (1024 * 1024)).toFixed(1);
+      await this.bot.sendMessage(chatId, `File too large for Telegram (${mb}mb). Find it at: ${filePath}`);
       return;
     }
 
