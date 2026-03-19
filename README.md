@@ -1,6 +1,8 @@
 # cc-tg
 
-Claude Code Telegram bot — chat with Claude Code from Telegram. Supports voice messages, images, file uploads, scheduled prompts, and automatic file delivery. v0.2.9.
+Claude Code Telegram bot. Chat with Claude Code from Telegram — text, voice, images, files, scheduled prompts, and bot management commands.
+
+Built by [@Gonzih](https://github.com/Gonzih).
 
 ## Quickstart
 
@@ -9,108 +11,107 @@ Claude Code Telegram bot — chat with Claude Code from Telegram. Supports voice
 **Step 2** — run:
 
 ```bash
-TELEGRAM_BOT_TOKEN=your_bot_token CLAUDE_CODE_TOKEN=your_claude_token npx @gonzih/cc-tg
+TELEGRAM_BOT_TOKEN=your_bot_token CLAUDE_CODE_OAUTH_TOKEN=your_claude_token npx @gonzih/cc-tg
 ```
 
-That's it. Open your bot in Telegram and start chatting.
+Open your bot in Telegram and start chatting.
 
 ## Environment variables
 
 | Variable | Required | Description |
-|---|---|---|
+|----------|----------|-------------|
 | `TELEGRAM_BOT_TOKEN` | yes | From @BotFather |
-| `CLAUDE_CODE_TOKEN` | yes* | Claude Code OAuth token (starts with `sk-ant-oat`) |
-| `CLAUDE_CODE_OAUTH_TOKEN` | yes* | Alias for `CLAUDE_CODE_TOKEN` |
+| `CLAUDE_CODE_OAUTH_TOKEN` | yes* | Claude Code OAuth token (starts with `sk-ant-oat`) |
 | `ANTHROPIC_API_KEY` | yes* | Alternative — API key from console.anthropic.com |
 | `ALLOWED_USER_IDS` | no | Comma-separated Telegram user IDs. Leave empty to allow anyone |
 | `CWD` | no | Working directory for Claude Code. Defaults to current directory |
 
-*One of `CLAUDE_CODE_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, or `ANTHROPIC_API_KEY` is required.
+*One of `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` required.
 
-## How to get your Claude Code token
-
-Run this once to generate a long-lived OAuth token:
+## Get your Claude Code token
 
 ```bash
 npx @anthropic-ai/claude-code setup-token
 ```
 
-It opens a browser, logs you in with your Anthropic account, and prints a token starting with `sk-ant-oat`. Paste that as `CLAUDE_CODE_TOKEN`.
+Opens a browser, logs in with your Anthropic account, prints a token starting with `sk-ant-oat`.
 
-## How to get your Telegram user ID
+## Get your Telegram user ID
 
-Message [@userinfobot](https://t.me/userinfobot) on Telegram — it replies with your numeric ID.
+Message [@userinfobot](https://t.me/userinfobot) — it replies with your numeric ID.
 
 ## Bot commands
 
 | Command | Action |
-|---|---|
+|---------|--------|
 | `/start` or `/reset` | Kill current Claude session and start fresh |
 | `/stop` | Interrupt the running Claude task |
 | `/status` | Check if a session is active |
 | `/help` | Show all available commands |
 | `/cron every 1h <prompt>` | Schedule a recurring prompt |
-| `/cron list` | Show active cron jobs |
-| `/cron edit` | Show numbered list with edit instructions |
-| `/cron edit <#> every <N><unit> <new prompt>` | Update schedule and prompt for a cron job |
-| `/cron edit <#> schedule every <N><unit>` | Update schedule only |
-| `/cron edit <#> prompt <new prompt>` | Update prompt only |
-| `/cron remove <id>` | Remove a specific cron job by ID |
+| `/cron list` | Show active cron jobs (numbered) |
+| `/cron edit <#> [schedule/prompt] <value>` | Edit a cron job in place |
+| `/cron remove <id>` | Remove a specific cron job |
 | `/cron clear` | Remove all cron jobs |
-| `/reload_mcp` | Send SIGTERM to the cc-agent MCP server process so it restarts fresh |
-| `/mcp_version` | Show the published cc-agent npm version and npx cache contents |
-| `/clear_npx_cache` | Wipe `~/.npm/_npx/` and restart the MCP process to pick up latest version |
-| `/restart` | Restart the cc-tg bot process in-place (useful for updates without SSH) |
+| `/reload_mcp` | Reload cc-agent MCP server without dropping your Claude session |
+| `/mcp_version` | Show latest published cc-agent npm version and current cache |
+| `/clear_npx_cache` | Clear npx cache and reload cc-agent (upgrades to latest version) |
+| `/restart` | Self-restart the cc-tg bot process (no SSH needed) |
 | Any text | Sent directly to Claude Code |
 | Voice message | Transcribed via whisper.cpp and sent to Claude |
-| Photo | Sent as native image input to Claude (base64 content block) |
-| Document / file | Downloaded to `<CWD>/.cc-tg/uploads/`, path passed to Claude as `ATTACHMENTS: [name](path)` |
+| Photo | Sent as native image input to Claude |
+| Document / file | Downloaded to `<CWD>/.cc-tg/uploads/`, path passed to Claude |
 
 ## Features
 
 ### Persistent sessions
-Each Telegram chat ID gets its own isolated Claude Code subprocess. Sessions survive between messages — Claude remembers context within a conversation. `/reset` starts a fresh session.
+Each Telegram chat ID gets its own isolated Claude Code subprocess. Sessions survive between messages — Claude remembers context. `/reset` starts fresh.
 
 ### Voice messages
-Send a voice message → automatically transcribed via whisper.cpp → fed into Claude as text. Requires `whisper-cpp` and `ffmpeg` installed on the host.
+Send a voice message → transcribed via whisper.cpp → fed to Claude as text. Requires `whisper-cpp` and `ffmpeg` on the host.
 
 ### Images
-Send a photo → downloaded and base64-encoded → sent to Claude as a native image content block via the stream-JSON protocol. Claude sees the full image, no intermediate vision step. Caption (if any) is included as text alongside the image.
+Send a photo → base64-encoded → sent to Claude as a native image content block. Claude sees the full image. Caption included as text.
 
 ### Documents
-Send any file as a document → downloaded to `<CWD>/.cc-tg/uploads/<filename>` → Claude receives the path as `ATTACHMENTS: [filename](path)` and can read/process it directly. Works for PDFs, CSVs, code files, etc.
+Send any file → downloaded to `<CWD>/.cc-tg/uploads/<filename>` → Claude receives the path as `ATTACHMENTS: [filename](path)` and can read/process it directly. Works for PDFs, CSVs, code files, etc.
 
 ### File delivery
-When Claude writes a file and mentions it in the response, the bot automatically uploads it to Telegram. Hybrid detection: tracks `Write`/`Edit`/`NotebookEdit` tool calls during the session, cross-references with filenames mentioned in the final response. Sensitive files (credentials, keys, `.env`, tokens) are silently skipped.
+When Claude writes a file and mentions it in the response, the bot automatically uploads it to Telegram. Tracks `Write`/`Edit` tool calls during the session, cross-references with filenames in the final response.
 
 ### Cron jobs
-Schedule recurring prompts that fire into your Claude session on a timer:
+Schedule recurring prompts on a timer:
 
 ```
-/cron every 1h check whale-watcher logs and summarize any new large trades
-/cron every 6h run the market scan and save results to daily-report.md
-/cron every 30m ping the API and alert me if anything looks off
+/cron every 1h check logs and summarize new alerts
+/cron every 6h run market scan and save to daily-report.md
+/cron every 30m ping the API and alert if anything looks off
 ```
 
-Supported units: `m` (minutes), `h` (hours), `d` (days).
+Edit without removing and re-adding:
+```
+/cron edit 1 every 2h updated task description
+/cron edit 1 schedule every 4h
+/cron edit 1 prompt new task text only
+```
 
-Cron jobs persist to `<CWD>/.cc-tg/crons.json` and are restored on bot restart. Output is prefixed with `CRON: <prompt>` so you know what triggered it. Files written by cron jobs are uploaded the same way as regular responses.
+Cron jobs persist to `<CWD>/.cc-tg/crons.json` and restore on restart. Output is prefixed with `CRON: <prompt>`. Files written by cron jobs are uploaded automatically.
 
-### MCP server management
-cc-tg can manage the lifecycle of the [cc-agent](https://github.com/Gonzih/cc-agent) MCP server that Claude Code uses as a tool. `/reload_mcp` sends SIGTERM to the running cc-agent process, causing Claude Code to restart it fresh on the next call. `/mcp_version` reports the currently published npm version alongside npx cache entries, and `/clear_npx_cache` wipes the npx cache so the next invocation pulls the latest published version.
+### MCP management commands
+Manage the cc-agent MCP server from Telegram without SSH:
 
-### In-place bot restart
-`/restart` respawns the cc-tg process without dropping the Telegram polling session — useful when you've published a new version and want to pick it up without SSH access.
+- `/reload_mcp` — sends SIGTERM to the cc-agent process; Claude Code auto-restarts it on next tool call. Useful after updating cc-agent config.
+- `/mcp_version` — shows the latest `@gonzih/cc-agent` version on npm and what's in your local npx cache.
+- `/clear_npx_cache` — deletes `~/.npm/_npx/` and kills cc-agent, forcing a fresh download of the latest version on next use.
+
+### Self-restart
+`/restart` — spawns a detached child process with the same Node binary and args, sends you a confirmation message, then exits. The new process inherits all environment variables. No SSH required to restart the bot after updates.
 
 ### Typing indicator
-While Claude is working, the bot sends a continuous typing indicator so you know it's active.
+While Claude is working, the bot sends a continuous typing indicator. Works for both regular messages and cron job execution.
 
-### Permissions
-Runs Claude Code with `--dangerously-skip-permissions` — no confirmation prompts blocking headless execution.
-
-## How it works
-
-Spawns a `claude` CLI subprocess per chat session using the stream-JSON protocol. Prompts pipe in via stdin, streaming JSON responses parse out. Only the final `result` message is forwarded to Telegram — no duplicate streaming chunks. Long responses are split into 4096-character chunks to stay within Telegram's message size limit, and Markdown parse failures automatically fall back to plain text.
+### Bot command menu
+All commands are registered with Telegram's `/` menu via `setMyCommands` on startup — no need to remember commands.
 
 ## Run persistently
 
@@ -133,7 +134,7 @@ Spawns a `claude` CLI subprocess per chat session using the stream-JSON protocol
     <dict>
         <key>TELEGRAM_BOT_TOKEN</key>
         <string>your_token</string>
-        <key>CLAUDE_CODE_TOKEN</key>
+        <key>CLAUDE_CODE_OAUTH_TOKEN</key>
         <string>your_claude_token</string>
         <key>ALLOWED_USER_IDS</key>
         <string>your_telegram_id</string>
@@ -170,7 +171,7 @@ Description=cc-tg Claude Code Telegram bot
 
 [Service]
 Environment=TELEGRAM_BOT_TOKEN=xxx
-Environment=CLAUDE_CODE_TOKEN=yyy
+Environment=CLAUDE_CODE_OAUTH_TOKEN=yyy
 Environment=ALLOWED_USER_IDS=123456789
 Environment=CWD=/home/you/your-project
 WorkingDirectory=/home/you/your-project
@@ -186,8 +187,7 @@ WantedBy=multi-user.target
 - Node.js 18+
 - `claude` CLI: `npm install -g @anthropic-ai/claude-code`
 - Voice transcription (optional): `whisper-cpp` + `ffmpeg`
-  - macOS: `brew install whisper-cpp ffmpeg && whisper-cpp-download-ggml-model small.en`
 
-## Credits
+## Related
 
-Built by [@Gonzih](https://github.com/Gonzih)
+- [cc-agent](https://github.com/Gonzih/cc-agent) — MCP server for spawning Claude Code subagents by [@Gonzih](https://github.com/Gonzih)
