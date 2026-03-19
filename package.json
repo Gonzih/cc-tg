@@ -1,6 +1,6 @@
 {
   "name": "@gonzih/cc-tg",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "description": "Claude Code Telegram bot — chat with Claude Code via Telegram",
   "type": "module",
   "bin": {
@@ -30,6 +30,12 @@
   "bugs": {
     "url": "https://github.com/Gonzih/cc-tg/issues"
   },
-  "keywords": ["claude", "claude-code", "telegram", "bot", "ai"],
+  "keywords": [
+    "claude",
+    "claude-code",
+    "telegram",
+    "bot",
+    "ai"
+  ],
   "license": "MIT"
 }
