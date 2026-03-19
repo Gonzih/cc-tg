@@ -6,7 +6,7 @@
 import TelegramBot from "node-telegram-bot-api";
 import { existsSync, createWriteStream, mkdirSync } from "fs";
 import { resolve, basename, join } from "path";
-import { execSync } from "child_process";
+import { execSync, spawn } from "child_process";
 import https from "https";
 import http from "http";
 import { ClaudeProcess, extractText, ClaudeMessage } from "./claude.js";
@@ -23,6 +23,7 @@ const BOT_COMMANDS: Array<{ command: string; description: string }> = [
   { command: "reload_mcp", description: "Restart the cc-agent MCP server process" },
   { command: "mcp_version", description: "Show cc-agent npm version and npx cache info" },
   { command: "clear_npx_cache", description: "Clear npx cache and restart MCP to pick up latest version" },
+  { command: "restart", description: "Restart the bot process in-place" },
 ];
 
 export interface BotOptions {
@@ -169,6 +170,12 @@ export class CcTgBot {
     // /clear_npx_cache — wipe ~/.npm/_npx/ then restart cc-agent
     if (text === "/clear_npx_cache") {
       await this.handleClearNpxCache(chatId);
+      return;
+    }
+
+    // /restart — restart the bot process in-place
+    if (text === "/restart") {
+      await this.handleRestart(chatId);
       return;
     }
 
@@ -706,6 +713,19 @@ export class CcTgBot {
       chatId,
       `NPX cache cleared and MCP restarted.${pidNote} Will pick up latest npm version on next call.`
     );
+  }
+
+  private async handleRestart(chatId: number): Promise<void> {
+    await this.bot.sendMessage(chatId, "Restarting bot... brb.");
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    this.stop();
+    const child = spawn(process.execPath, process.argv.slice(1), {
+      detached: true,
+      stdio: "inherit",
+      env: process.env,
+    });
+    child.unref();
+    process.exit(0);
   }
 
   private killSession(chatId: number, keepCrons = true): void {
