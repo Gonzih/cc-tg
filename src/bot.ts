@@ -7,7 +7,7 @@ import TelegramBot from "node-telegram-bot-api";
 import { existsSync, createWriteStream, mkdirSync } from "fs";
 import { resolve, basename, join } from "path";
 import os from "os";
-import { execSync, spawn } from "child_process";
+import { execSync } from "child_process";
 import https from "https";
 import http from "http";
 import { ClaudeProcess, extractText, ClaudeMessage } from "./claude.js";
@@ -25,6 +25,7 @@ const BOT_COMMANDS: Array<{ command: string; description: string }> = [
   { command: "mcp_version", description: "Show cc-agent npm version and npx cache info" },
   { command: "clear_npx_cache", description: "Clear npx cache and restart MCP to pick up latest version" },
   { command: "restart", description: "Restart the bot process in-place" },
+  { command: "get_file", description: "Get a file from the server by path" },
 ];
 
 export interface BotOptions {
@@ -177,6 +178,12 @@ export class CcTgBot {
     // /restart — restart the bot process in-place
     if (text === "/restart") {
       await this.handleRestart(chatId);
+      return;
+    }
+
+    // /get_file <path> — send a file from the server to the user
+    if (text.startsWith("/get_file")) {
+      await this.handleGetFile(chatId, text);
       return;
     }
 
@@ -750,22 +757,45 @@ export class CcTgBot {
   }
 
   private async handleRestart(chatId: number): Promise<void> {
-    await this.bot.sendMessage(chatId, "Restarting bot... brb.");
-    await new Promise(resolve => setTimeout(resolve, 1000));
-    this.stop();
-
-    const isLaunchd = process.ppid === 1;
-    if (!isLaunchd) {
-      // Running manually — spawn a replacement process
-      const child = spawn(process.execPath, process.argv.slice(1), {
-        detached: true,
-        stdio: "ignore",
-        env: process.env,
-      });
-      child.unref();
-    }
-    // If launchd-managed, just exit — launchd will restart us
+    await this.bot.sendMessage(chatId, "Restarting... brb.");
+    await new Promise(resolve => setTimeout(resolve, 500));
     process.exit(0);
+  }
+
+  private async handleGetFile(chatId: number, text: string): Promise<void> {
+    const arg = text.slice("/get_file".length).trim();
+    if (!arg) {
+      await this.bot.sendMessage(chatId, "Usage: /get_file <path>");
+      return;
+    }
+
+    const filePath = resolve(arg);
+
+    const safeDirs = ["/tmp/", "/var/folders/", os.homedir() + "/Downloads/", this.opts.cwd ?? process.cwd()];
+    const inSafeDir = safeDirs.some(d => filePath.startsWith(d));
+    if (!inSafeDir) {
+      await this.bot.sendMessage(chatId, "Access denied: path not in allowed directories");
+      return;
+    }
+
+    if (!existsSync(filePath)) {
+      await this.bot.sendMessage(chatId, `File not found: ${filePath}`);
+      return;
+    }
+
+    const { statSync } = await import("fs");
+    const stat = statSync(filePath);
+    if (!stat.isFile()) {
+      await this.bot.sendMessage(chatId, `Not a file: ${filePath}`);
+      return;
+    }
+
+    if (this.isSensitiveFile(filePath)) {
+      await this.bot.sendMessage(chatId, "Access denied: sensitive file");
+      return;
+    }
+
+    await this.bot.sendDocument(chatId, filePath);
   }
 
   private killSession(chatId: number, keepCrons = true): void {
