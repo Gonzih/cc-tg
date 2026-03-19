@@ -6,6 +6,7 @@
 import TelegramBot from "node-telegram-bot-api";
 import { existsSync, createWriteStream, mkdirSync } from "fs";
 import { resolve, basename, join } from "path";
+import os from "os";
 import { execSync, spawn } from "child_process";
 import https from "https";
 import http from "http";
@@ -395,22 +396,39 @@ export class CcTgBot {
     for (const block of content as Record<string, unknown>[]) {
       if (block.type !== "tool_use") continue;
       const name = block.name as string;
-      if (!["Write", "Edit", "NotebookEdit"].includes(name)) continue;
-
       const input = block.input as Record<string, unknown> | undefined;
       if (!input) continue;
 
-      // Write tool uses file_path, Edit uses file_path
-      const filePath = (input.file_path as string) ?? (input.path as string);
-      if (!filePath) continue;
+      if (["Write", "Edit", "NotebookEdit"].includes(name)) {
+        // Write tool uses file_path, Edit uses file_path
+        const filePath = (input.file_path as string) ?? (input.path as string);
+        if (!filePath) continue;
 
-      // Resolve relative paths against cwd
-      const resolved = filePath.startsWith("/")
-        ? filePath
-        : resolve(cwd ?? process.cwd(), filePath);
+        // Resolve relative paths against cwd
+        const resolved = filePath.startsWith("/")
+          ? filePath
+          : resolve(cwd ?? process.cwd(), filePath);
 
-      console.log(`[claude:files] tracked written file: ${resolved}`);
-      session.writtenFiles.add(resolved);
+        console.log(`[claude:files] tracked written file: ${resolved}`);
+        session.writtenFiles.add(resolved);
+      } else if (name === "Bash") {
+        const cmd = (input.command as string) ?? "";
+        // yt-dlp / ffmpeg -o "path"
+        const oFlag = cmd.match(/-o\s+["']?([^\s"']+\.[\w]{1,10})["']?/);
+        if (oFlag) session.writtenFiles.add(resolve(cwd ?? process.cwd(), oFlag[1]));
+        // mv source dest — track dest
+        const mvMatch = cmd.match(/\bmv\s+\S+\s+["']?([^\s"']+)["']?$/);
+        if (mvMatch) session.writtenFiles.add(resolve(cwd ?? process.cwd(), mvMatch[1]));
+        // cp source dest — track dest
+        const cpMatch = cmd.match(/\bcp\s+\S+\s+["']?([^\s"']+)["']?$/);
+        if (cpMatch) session.writtenFiles.add(resolve(cwd ?? process.cwd(), cpMatch[1]));
+        // curl -o path or wget -O path
+        const curlMatch = cmd.match(/curl\s+.*?-o\s+["']?([^\s"']+)["']?/);
+        if (curlMatch) session.writtenFiles.add(resolve(cwd ?? process.cwd(), curlMatch[1]));
+        // wget -O path
+        const wgetMatch = cmd.match(/wget\s+.*?-O\s+["']?([^\s"']+)["']?/);
+        if (wgetMatch) session.writtenFiles.add(resolve(cwd ?? process.cwd(), wgetMatch[1]));
+      }
     }
   }
 
@@ -426,8 +444,6 @@ export class CcTgBot {
   }
 
   private uploadMentionedFiles(chatId: number, resultText: string, session: Session): void {
-    if (session.writtenFiles.size === 0) return;
-
     // Extract file path candidates from result text
     // Match: /absolute/path/file.ext or relative like ./foo/bar.csv or just foo.pdf
     const pathPattern = /(?:^|[\s`'"(])(\/?[\w.\-/]+\.[\w]{1,10})(?:[\s`'")\n]|$)/gm;
@@ -437,23 +453,41 @@ export class CcTgBot {
       candidates.add(match[1]);
     }
 
+    const safeDirs = ["/tmp/", "/var/folders/", os.homedir() + "/Downloads/"];
+    const isSafeDir = (p: string) =>
+      safeDirs.some(d => p.startsWith(d)) || p.startsWith(this.opts.cwd ?? process.cwd());
+
     const toUpload: string[] = [];
+
+    if (session.writtenFiles.size > 0) {
+      for (const candidate of candidates) {
+        // Try as-is (absolute), or resolve against cwd
+        const resolved = candidate.startsWith("/")
+          ? candidate
+          : resolve(this.opts.cwd ?? process.cwd(), candidate);
+
+        if (session.writtenFiles.has(resolved) && existsSync(resolved)) {
+          toUpload.push(resolved);
+        } else {
+          // Also check by basename — result might mention just the filename
+          for (const written of session.writtenFiles) {
+            if (basename(written) === basename(candidate) && existsSync(written)) {
+              toUpload.push(written);
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    // Also upload files mentioned in result text that exist in safe dirs
+    // even if not tracked via Write tool
     for (const candidate of candidates) {
-      // Try as-is (absolute), or resolve against cwd
       const resolved = candidate.startsWith("/")
         ? candidate
         : resolve(this.opts.cwd ?? process.cwd(), candidate);
-
-      if (session.writtenFiles.has(resolved) && existsSync(resolved)) {
+      if (existsSync(resolved) && isSafeDir(resolved) && !toUpload.includes(resolved)) {
         toUpload.push(resolved);
-      } else {
-        // Also check by basename — result might mention just the filename
-        for (const written of session.writtenFiles) {
-          if (basename(written) === basename(candidate) && existsSync(written)) {
-            toUpload.push(written);
-            break;
-          }
-        }
       }
     }
 
