@@ -7,7 +7,7 @@ import TelegramBot from "node-telegram-bot-api";
 import { existsSync, createWriteStream, mkdirSync, statSync, readdirSync, readFileSync, writeFileSync } from "fs";
 import { resolve, basename, join } from "path";
 import os from "os";
-import { execSync } from "child_process";
+import { execSync, spawn } from "child_process";
 import https from "https";
 import http from "http";
 import { ClaudeProcess, extractText, ClaudeMessage, UsageEvent } from "./claude.js";
@@ -99,6 +99,28 @@ function formatCostReport(cost: SessionCost): string {
 function formatCronCostFooter(usage: UsageEvent): string {
   const cost = computeCostUsd(usage);
   return `\n💰 Cron cost: $${cost.toFixed(4)} (${formatTokens(usage.inputTokens)} in / ${formatTokens(usage.outputTokens)} out tokens)`;
+}
+
+function formatAgentCostSummary(text: string): string {
+  try {
+    const data = JSON.parse(text) as Record<string, unknown>;
+    const totalCost = ((data.total_cost_usd ?? data.total_cost ?? 0) as number);
+    const totalJobs = ((data.total_jobs ?? data.job_count ?? 0) as number);
+    const byRepo = (data.by_repo ?? []) as Array<Record<string, unknown>>;
+    const lines = [
+      "🤖 Agent jobs (all time)",
+      `Total: $${totalCost.toFixed(2)} across ${totalJobs} jobs`,
+    ];
+    for (const entry of byRepo) {
+      const repo = (entry.repo ?? entry.repository ?? "unknown") as string;
+      const cost = ((entry.cost_usd ?? entry.cost ?? 0) as number);
+      const jobs = ((entry.job_count ?? entry.jobs ?? 0) as number);
+      lines.push(`  ${repo}: $${cost.toFixed(2)} (${jobs} jobs)`);
+    }
+    return lines.join("\n");
+  } catch {
+    return `🤖 Agent jobs (all time)\n${text}`;
+  }
 }
 
 class CostStore {
@@ -299,7 +321,16 @@ export class CcTgBot {
     // /cost — show session token usage and cost
     if (text === "/cost") {
       const cost = this.costStore.get(chatId);
-      await this.bot.sendMessage(chatId, formatCostReport(cost));
+      let reply = formatCostReport(cost);
+      try {
+        const rawSummary = await this.callCcAgentTool("cost_summary");
+        if (rawSummary) {
+          reply += "\n\n" + formatAgentCostSummary(rawSummary);
+        }
+      } catch (err) {
+        console.error("[cost] cc-agent cost_summary failed:", (err as Error).message);
+      }
+      await this.bot.sendMessage(chatId, reply);
       return;
     }
 
@@ -1022,6 +1053,78 @@ export class CcTgBot {
     }
 
     await this.bot.sendDocument(chatId, filePath);
+  }
+
+  private callCcAgentTool(toolName: string, args: Record<string, unknown> = {}): Promise<string | null> {
+    return new Promise((resolve) => {
+      let settled = false;
+      const done = (val: string | null) => {
+        if (!settled) { settled = true; resolve(val); }
+      };
+
+      let proc: ReturnType<typeof spawn>;
+      try {
+        proc = spawn("npx", ["-y", "@gonzih/cc-agent@latest"], {
+          env: { ...process.env },
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+      } catch (err) {
+        console.error("[mcp] failed to spawn cc-agent:", (err as Error).message);
+        done(null);
+        return;
+      }
+
+      const timeout = setTimeout(() => {
+        console.warn("[mcp] cc-agent tool call timed out");
+        proc.kill();
+        done(null);
+      }, 30_000);
+
+      let buffer = "";
+      const sendMsg = (msg: unknown) => { proc.stdin!.write(JSON.stringify(msg) + "\n"); };
+
+      sendMsg({
+        jsonrpc: "2.0", id: 1, method: "initialize",
+        params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "cc-tg", version: "1.0.0" } },
+      });
+
+      proc.stdout!.on("data", (chunk: Buffer) => {
+        buffer += chunk.toString();
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try {
+            const msg = JSON.parse(line) as Record<string, unknown>;
+            if (msg.id === 1 && "result" in msg) {
+              sendMsg({ jsonrpc: "2.0", method: "notifications/initialized" });
+              sendMsg({ jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: toolName, arguments: args } });
+            } else if (msg.id === 2) {
+              clearTimeout(timeout);
+              if (msg.error) {
+                console.error("[mcp] cost_summary error:", JSON.stringify(msg.error));
+                proc.kill();
+                done(null);
+                return;
+              }
+              const result = msg.result as Record<string, unknown> | undefined;
+              const content = result?.content as Array<Record<string, unknown>> | undefined;
+              const text = (content ?? []).filter((b) => b.type === "text").map((b) => b.text as string).join("");
+              proc.kill();
+              done(text || null);
+            }
+          } catch { /* ignore non-JSON lines */ }
+        }
+      });
+
+      proc.on("error", (err) => {
+        console.error("[mcp] cc-agent spawn error:", err.message);
+        clearTimeout(timeout);
+        done(null);
+      });
+
+      proc.on("exit", () => { clearTimeout(timeout); done(null); });
+    });
   }
 
   private killSession(chatId: number, keepCrons = true): void {
