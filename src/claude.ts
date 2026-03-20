@@ -25,8 +25,16 @@ export interface ClaudeOptions {
   token?: string;
 }
 
+export interface UsageEvent {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+}
+
 export declare interface ClaudeProcess {
   on(event: "message", listener: (msg: ClaudeMessage) => void): this;
+  on(event: "usage", listener: (usage: UsageEvent) => void): this;
   on(event: "error", listener: (err: Error) => void): this;
   on(event: "exit", listener: (code: number | null) => void): this;
   on(event: "stderr", listener: (data: string) => void): this;
@@ -147,6 +155,30 @@ export class ClaudeProcess extends EventEmitter {
       if (!line.trim()) continue;
       try {
         const raw = JSON.parse(line) as Record<string, unknown>;
+
+        // Emit usage events from Anthropic API stream events passed through by Claude CLI
+        if (raw.type === "message_start") {
+          const usage = ((raw.message as Record<string, unknown> | undefined)?.usage) as Record<string, number> | undefined;
+          if (usage) {
+            this.emit("usage", {
+              inputTokens: usage.input_tokens ?? 0,
+              outputTokens: 0, // output_tokens at message_start is always 0
+              cacheReadTokens: usage.cache_read_input_tokens ?? 0,
+              cacheWriteTokens: usage.cache_creation_input_tokens ?? 0,
+            } satisfies UsageEvent);
+          }
+        } else if (raw.type === "message_delta") {
+          const usage = raw.usage as Record<string, number> | undefined;
+          if (usage?.output_tokens) {
+            this.emit("usage", {
+              inputTokens: 0,
+              outputTokens: usage.output_tokens,
+              cacheReadTokens: 0,
+              cacheWriteTokens: 0,
+            } satisfies UsageEvent);
+          }
+        }
+
         const msg = this.parseMessage(raw);
         if (msg) this.emit("message", msg);
       } catch {
