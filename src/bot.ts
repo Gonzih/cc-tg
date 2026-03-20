@@ -4,13 +4,13 @@
  */
 
 import TelegramBot from "node-telegram-bot-api";
-import { existsSync, createWriteStream, mkdirSync, statSync, readdirSync } from "fs";
+import { existsSync, createWriteStream, mkdirSync, statSync, readdirSync, readFileSync, writeFileSync } from "fs";
 import { resolve, basename, join } from "path";
 import os from "os";
 import { execSync } from "child_process";
 import https from "https";
 import http from "http";
-import { ClaudeProcess, extractText, ClaudeMessage } from "./claude.js";
+import { ClaudeProcess, extractText, ClaudeMessage, UsageEvent } from "./claude.js";
 import { transcribeVoice, isVoiceAvailable } from "./voice.js";
 import { CronManager } from "./cron.js";
 
@@ -26,6 +26,7 @@ const BOT_COMMANDS: Array<{ command: string; description: string }> = [
   { command: "clear_npx_cache", description: "Clear npx cache and restart MCP to pick up latest version" },
   { command: "restart", description: "Restart the bot process in-place" },
   { command: "get_file", description: "Send a file from the server to this chat" },
+  { command: "cost", description: "Show session token usage and cost" },
 ];
 
 export interface BotOptions {
@@ -48,11 +49,126 @@ interface Session {
 const FLUSH_DELAY_MS = 800; // debounce streaming chunks into one Telegram message
 const TYPING_INTERVAL_MS = 4000; // re-send typing action before Telegram's 5s expiry
 
+// Claude Sonnet 4.6 pricing (per 1M tokens)
+const PRICING = {
+  inputPerM: 3.00,
+  outputPerM: 15.00,
+  cacheReadPerM: 0.30,
+  cacheWritePerM: 3.75,
+};
+
+interface SessionCost {
+  totalInputTokens: number;
+  totalOutputTokens: number;
+  totalCacheReadTokens: number;
+  totalCacheWriteTokens: number;
+  totalCostUsd: number;
+  messageCount: number;
+}
+
+function computeCostUsd(usage: UsageEvent): number {
+  return (
+    usage.inputTokens * PRICING.inputPerM / 1_000_000 +
+    usage.outputTokens * PRICING.outputPerM / 1_000_000 +
+    usage.cacheReadTokens * PRICING.cacheReadPerM / 1_000_000 +
+    usage.cacheWriteTokens * PRICING.cacheWritePerM / 1_000_000
+  );
+}
+
+function formatTokens(n: number): string {
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+  return String(n);
+}
+
+function formatCostReport(cost: SessionCost): string {
+  const inputCost = cost.totalInputTokens * PRICING.inputPerM / 1_000_000;
+  const outputCost = cost.totalOutputTokens * PRICING.outputPerM / 1_000_000;
+  const cacheReadCost = cost.totalCacheReadTokens * PRICING.cacheReadPerM / 1_000_000;
+  const cacheWriteCost = cost.totalCacheWriteTokens * PRICING.cacheWritePerM / 1_000_000;
+  return [
+    "📊 Session cost",
+    `Messages: ${cost.messageCount}`,
+    `Total: $${cost.totalCostUsd.toFixed(3)}`,
+    `  Input: ${formatTokens(cost.totalInputTokens)} tokens ($${inputCost.toFixed(3)})`,
+    `  Output: ${formatTokens(cost.totalOutputTokens)} tokens ($${outputCost.toFixed(3)})`,
+    `  Cache read: ${formatTokens(cost.totalCacheReadTokens)} tokens ($${cacheReadCost.toFixed(3)})`,
+    `  Cache write: ${formatTokens(cost.totalCacheWriteTokens)} tokens ($${cacheWriteCost.toFixed(3)})`,
+  ].join("\n");
+}
+
+function formatCronCostFooter(usage: UsageEvent): string {
+  const cost = computeCostUsd(usage);
+  return `\n💰 Cron cost: $${cost.toFixed(4)} (${formatTokens(usage.inputTokens)} in / ${formatTokens(usage.outputTokens)} out tokens)`;
+}
+
+class CostStore {
+  private costs = new Map<number, SessionCost>();
+  private storePath: string;
+
+  constructor(cwd: string) {
+    this.storePath = join(cwd, ".cc-tg", "costs.json");
+    this.load();
+  }
+
+  get(chatId: number): SessionCost {
+    let cost = this.costs.get(chatId);
+    if (!cost) {
+      cost = { totalInputTokens: 0, totalOutputTokens: 0, totalCacheReadTokens: 0, totalCacheWriteTokens: 0, totalCostUsd: 0, messageCount: 0 };
+      this.costs.set(chatId, cost);
+    }
+    return cost;
+  }
+
+  addUsage(chatId: number, usage: UsageEvent): void {
+    const cost = this.get(chatId);
+    cost.totalInputTokens += usage.inputTokens;
+    cost.totalOutputTokens += usage.outputTokens;
+    cost.totalCacheReadTokens += usage.cacheReadTokens;
+    cost.totalCacheWriteTokens += usage.cacheWriteTokens;
+    cost.totalCostUsd += computeCostUsd(usage);
+    this.persist();
+  }
+
+  incrementMessages(chatId: number): void {
+    const cost = this.get(chatId);
+    cost.messageCount++;
+    this.persist();
+  }
+
+  private persist(): void {
+    try {
+      const dir = join(this.storePath, "..");
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+      const data: Record<string, SessionCost> = {};
+      for (const [chatId, cost] of this.costs) {
+        data[String(chatId)] = cost;
+      }
+      writeFileSync(this.storePath, JSON.stringify(data, null, 2));
+    } catch (err) {
+      console.error("[costs] persist error:", (err as Error).message);
+    }
+  }
+
+  private load(): void {
+    if (!existsSync(this.storePath)) return;
+    try {
+      const data = JSON.parse(readFileSync(this.storePath, "utf8")) as Record<string, SessionCost>;
+      for (const [key, cost] of Object.entries(data)) {
+        this.costs.set(Number(key), cost);
+      }
+      console.log(`[costs] loaded ${this.costs.size} session costs from disk`);
+    } catch (err) {
+      console.error("[costs] load error:", (err as Error).message);
+    }
+  }
+}
+
 export class CcTgBot {
   private bot: TelegramBot;
   private sessions = new Map<number, Session>();
   private opts: BotOptions;
   private cron: CronManager;
+  private costStore: CostStore;
 
   constructor(opts: BotOptions) {
     this.opts = opts;
@@ -64,6 +180,8 @@ export class CcTgBot {
     this.cron = new CronManager(opts.cwd ?? process.cwd(), (chatId, prompt) => {
       this.runCronTask(chatId, prompt);
     });
+
+    this.costStore = new CostStore(opts.cwd ?? process.cwd());
 
     this.registerBotCommands();
 
@@ -175,6 +293,13 @@ export class CcTgBot {
     // /get_file <path> — send a file from the server to the user
     if (text.startsWith("/get_file")) {
       await this.handleGetFile(chatId, text);
+      return;
+    }
+
+    // /cost — show session token usage and cost
+    if (text === "/cost") {
+      const cost = this.costStore.get(chatId);
+      await this.bot.sendMessage(chatId, formatCostReport(cost));
       return;
     }
 
@@ -290,6 +415,10 @@ export class CcTgBot {
       writtenFiles: new Set(),
     };
 
+    claude.on("usage", (usage: UsageEvent) => {
+      this.costStore.addUsage(chatId, usage);
+    });
+
     claude.on("message", (msg) => {
       // Verbose logging — log every message type and subtype
       const subtype = (msg.payload.subtype as string) ?? "";
@@ -330,6 +459,7 @@ export class CcTgBot {
     if (msg.type !== "result") return;
 
     this.stopTyping(session);
+    this.costStore.incrementMessages(chatId);
 
     const text = extractText(msg);
     if (!text) return;
@@ -569,6 +699,14 @@ export class CcTgBot {
     ].join("\n");
 
     let output = "";
+    const cronUsage: UsageEvent = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+
+    cronProcess.on("usage", (usage: UsageEvent) => {
+      cronUsage.inputTokens += usage.inputTokens;
+      cronUsage.outputTokens += usage.outputTokens;
+      cronUsage.cacheReadTokens += usage.cacheReadTokens;
+      cronUsage.cacheWriteTokens += usage.cacheWriteTokens;
+    });
 
     cronProcess.on("message", (msg: ClaudeMessage) => {
       if (msg.type === "result") {
@@ -577,7 +715,8 @@ export class CcTgBot {
 
         const result = output.trim();
         if (result) {
-          const chunks = splitMessage(`🕐 ${result}`);
+          const footer = formatCronCostFooter(cronUsage);
+          const chunks = splitMessage(`🕐 ${result}${footer}`);
           (async () => {
             for (const chunk of chunks) {
               try {
