@@ -22,6 +22,7 @@ const BOT_COMMANDS: Array<{ command: string; description: string }> = [
   { command: "help", description: "Show all available commands" },
   { command: "cron", description: "Manage cron jobs — add/list/edit/remove/clear" },
   { command: "reload_mcp", description: "Restart the cc-agent MCP server process" },
+  { command: "mcp_status", description: "Check MCP server connection status" },
   { command: "mcp_version", description: "Show cc-agent npm version and npx cache info" },
   { command: "clear_npx_cache", description: "Clear npx cache and restart MCP to pick up latest version" },
   { command: "restart", description: "Restart the bot process in-place" },
@@ -291,6 +292,12 @@ export class CcTgBot {
     // /reload_mcp — kill cc-agent process so Claude Code auto-restarts it
     if (text === "/reload_mcp") {
       await this.handleReloadMcp(chatId);
+      return;
+    }
+
+    // /mcp_status — run `claude mcp list` and show connection status
+    if (text === "/mcp_status") {
+      await this.handleMcpStatus(chatId);
       return;
     }
 
@@ -951,15 +958,34 @@ export class CcTgBot {
   }
 
   private async handleReloadMcp(chatId: number): Promise<void> {
+    await this.bot.sendMessage(chatId, "Clearing npx cache and reloading MCP...");
+
+    try {
+      const home = process.env.HOME ?? "~";
+      execSync(`rm -rf "${home}/.npm/_npx/"`, { encoding: "utf8", shell: "/bin/sh" });
+      console.log("[mcp] cleared ~/.npm/_npx/");
+    } catch (err) {
+      await this.bot.sendMessage(chatId, `Warning: failed to clear npx cache: ${(err as Error).message}`);
+    }
+
     const pids = this.killCcAgent();
     if (pids.length === 0) {
-      await this.bot.sendMessage(chatId, "No cc-agent process found. MCP will start fresh on the next agent call.");
+      await this.bot.sendMessage(chatId, "NPX cache cleared. No cc-agent process found — MCP will start fresh on the next agent call.");
       return;
     }
     await this.bot.sendMessage(
       chatId,
-      `Sent SIGTERM to cc-agent (pid${pids.length > 1 ? "s" : ""}: ${pids.join(", ")}).\nMCP restarted. New process will load on next agent call.`
+      `NPX cache cleared. Sent SIGTERM to cc-agent (pid${pids.length > 1 ? "s" : ""}: ${pids.join(", ")}).\nMCP restarted. New process will load on next agent call.`
     );
+  }
+
+  private async handleMcpStatus(chatId: number): Promise<void> {
+    try {
+      const output = execSync("claude mcp list", { encoding: "utf8", shell: "/bin/sh" }).trim();
+      await this.bot.sendMessage(chatId, `MCP server status:\n\n${output || "(no output)"}`);
+    } catch (err) {
+      await this.bot.sendMessage(chatId, `Failed to run claude mcp list: ${(err as Error).message}`);
+    }
   }
 
   private async handleMcpVersion(chatId: number): Promise<void> {
