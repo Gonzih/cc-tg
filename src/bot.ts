@@ -38,7 +38,6 @@ export interface BotOptions {
 interface Session {
   claude: ClaudeProcess;
   pendingText: string;
-  pendingPrefix: string; // prepended to next flushed message (used by cron)
   flushTimer: ReturnType<typeof setTimeout> | null;
   typingTimer: ReturnType<typeof setInterval> | null;
   lastMessageId?: number;
@@ -61,17 +60,9 @@ export class CcTgBot {
     this.bot.on("message", (msg) => this.handleTelegram(msg));
     this.bot.on("polling_error", (err) => console.error("[tg]", err.message));
 
-    // Cron manager — fires prompts into user sessions on schedule
+    // Cron manager — fires each task into an isolated ClaudeProcess
     this.cron = new CronManager(opts.cwd ?? process.cwd(), (chatId, prompt) => {
-      const session = this.getOrCreateSession(chatId);
-      try {
-        session.claude.sendPrompt(`[CRON: ${prompt}]\n\n${prompt}`);
-        this.startTyping(chatId, session);
-        // Tag result with cron prefix
-        session.pendingPrefix = `CRON: ${prompt}\n\n`;
-      } catch (err) {
-        console.error(`[cron] failed to fire for chat=${chatId}:`, (err as Error).message);
-      }
+      this.runCronTask(chatId, prompt);
     });
 
     this.registerBotCommands();
@@ -294,7 +285,6 @@ export class CcTgBot {
     const session: Session = {
       claude,
       pendingText: "",
-      pendingPrefix: "",
       flushTimer: null,
       typingTimer: null,
       writtenFiles: new Set(),
@@ -369,13 +359,11 @@ export class CcTgBot {
 
   private flushPending(chatId: number, session: Session): void {
     const raw = session.pendingText.trim();
-    const prefix = session.pendingPrefix;
     session.pendingText = "";
-    session.pendingPrefix = "";
     session.flushTimer = null;
     if (!raw) return;
 
-    const text = prefix ? `${prefix}${raw}` : raw;
+    const text = raw;
 
     // Telegram max message length is 4096 chars — split if needed
     const chunks = splitMessage(text);
@@ -562,6 +550,59 @@ export class CcTgBot {
     if (!Array.isArray(content)) return "";
     const toolUse = content.find((b: Record<string, unknown>) => b.type === "tool_use") as Record<string, unknown> | undefined;
     return (toolUse?.name as string) ?? "";
+  }
+
+  private runCronTask(chatId: number, prompt: string): void {
+    // Fresh isolated Claude session — never touches main conversation
+    const cronProcess = new ClaudeProcess({
+      cwd: this.opts.cwd,
+      token: this.opts.claudeToken,
+    });
+
+    const taskPrompt = [
+      "You are handling a scheduled background task.",
+      "This is NOT part of the user's ongoing conversation.",
+      "Be concise. Report results only. No greetings or pleasantries.",
+      "If there is nothing to report, say so in one sentence.",
+      "",
+      `SCHEDULED TASK: ${prompt}`,
+    ].join("\n");
+
+    let output = "";
+
+    cronProcess.on("message", (msg: ClaudeMessage) => {
+      if (msg.type === "result") {
+        const text = extractText(msg);
+        if (text) output += text;
+
+        const result = output.trim();
+        if (result) {
+          const chunks = splitMessage(`🕐 ${result}`);
+          (async () => {
+            for (const chunk of chunks) {
+              try {
+                await this.bot.sendMessage(chatId, chunk);
+              } catch (err) {
+                console.error(`[cron] failed to send result to chat=${chatId}:`, (err as Error).message);
+              }
+            }
+          })();
+        }
+
+        cronProcess.kill();
+      }
+    });
+
+    cronProcess.on("error", (err: Error) => {
+      console.error(`[cron] task error for chat=${chatId}:`, err.message);
+      cronProcess.kill();
+    });
+
+    cronProcess.on("exit", () => {
+      console.log(`[cron] task complete for chat=${chatId}`);
+    });
+
+    cronProcess.sendPrompt(taskPrompt);
   }
 
   private async handleCron(chatId: number, text: string): Promise<void> {
