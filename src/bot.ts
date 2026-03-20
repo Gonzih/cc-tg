@@ -888,7 +888,7 @@ function downloadToFile(url: string, destPath: string): Promise<void> {
   });
 }
 
-function splitMessage(text: string, maxLen = 4096): string[] {
+export function splitMessage(text: string, maxLen = 4096): string[] {
   if (text.length <= maxLen) return [text];
   const chunks: string[] = [];
   let i = 0;
