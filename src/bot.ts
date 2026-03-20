@@ -189,7 +189,7 @@ export class CcTgBot {
 
     const session = this.getOrCreateSession(chatId);
     try {
-      session.claude.sendPrompt(text);
+      session.claude.sendPrompt(buildPromptWithReplyContext(text, msg));
       this.startTyping(chatId, session);
     } catch (err) {
       await this.bot.sendMessage(chatId, `Error sending to Claude: ${(err as Error).message}`);
@@ -217,7 +217,7 @@ export class CcTgBot {
       // Feed transcript into Claude as if user typed it
       const session = this.getOrCreateSession(chatId);
       try {
-        session.claude.sendPrompt(transcript);
+        session.claude.sendPrompt(buildPromptWithReplyContext(transcript, msg));
         this.startTyping(chatId, session);
       } catch (err) {
         await this.bot.sendMessage(chatId, `Error sending to Claude: ${(err as Error).message}`);
@@ -860,6 +860,20 @@ export class CcTgBot {
       this.killSession(chatId);
     }
   }
+}
+
+function buildPromptWithReplyContext(text: string, msg: TelegramBot.Message): string {
+  const reply = msg.reply_to_message;
+  if (!reply) return text;
+
+  const quotedText = reply.text || reply.caption || null;
+  if (!quotedText) return text;
+
+  const truncated = quotedText.length > 500
+    ? quotedText.slice(0, 500) + "... [truncated]"
+    : quotedText;
+
+  return `[Replying to: "${truncated}"]\n\n${text}`;
 }
 
 /** Download a URL and return its contents as a base64 string */
