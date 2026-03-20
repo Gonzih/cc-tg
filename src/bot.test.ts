@@ -1,0 +1,541 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+
+const mocks = vi.hoisted(() => ({
+  tgSendMessage: vi.fn().mockResolvedValue({}),
+  tgSendDocument: vi.fn().mockResolvedValue({}),
+  tgSendChatAction: vi.fn().mockResolvedValue({}),
+  tgSetMyCommands: vi.fn().mockResolvedValue({}),
+  tgOn: vi.fn(),
+  tgStopPolling: vi.fn(),
+  tgGetFileLink: vi.fn().mockResolvedValue('https://example.com/file'),
+  claudeOn: vi.fn(),
+  claudeSendPrompt: vi.fn(),
+  claudeKill: vi.fn(),
+  cronList: vi.fn().mockReturnValue([]),
+  cronAdd: vi.fn().mockReturnValue({
+    id: 'job-1',
+    schedule: 'every 1h',
+    prompt: 'test',
+    chatId: 42,
+    intervalMs: 3_600_000,
+    createdAt: '',
+  }),
+  cronRemove: vi.fn().mockReturnValue(true),
+  cronClearAll: vi.fn().mockReturnValue(0),
+  cronUpdate: vi.fn(),
+  existsSyncMock: vi.fn().mockReturnValue(false),
+  statSyncMock: vi.fn().mockReturnValue({ size: 1024, isFile: () => true }),
+  execSyncMock: vi.fn().mockReturnValue(''),
+}));
+
+vi.mock('node-telegram-bot-api', () => ({
+  default: vi.fn(function MockTelegramBot() {
+    return {
+      on: mocks.tgOn,
+      sendMessage: mocks.tgSendMessage,
+      sendDocument: mocks.tgSendDocument,
+      sendChatAction: mocks.tgSendChatAction,
+      setMyCommands: mocks.tgSetMyCommands,
+      stopPolling: mocks.tgStopPolling,
+      getFileLink: mocks.tgGetFileLink,
+    };
+  }),
+}));
+
+vi.mock('./claude.js', () => ({
+  ClaudeProcess: vi.fn(function MockClaudeProcess() {
+    return {
+      sendPrompt: mocks.claudeSendPrompt,
+      sendImage: vi.fn(),
+      kill: mocks.claudeKill,
+      exited: false,
+      on: mocks.claudeOn,
+    };
+  }),
+  extractText: vi.fn(function extractText(msg: Record<string, unknown>) {
+    const payload = msg.payload as Record<string, unknown>;
+    return (payload?.result as string) ?? '';
+  }),
+}));
+
+vi.mock('./cron.js', () => ({
+  CronManager: vi.fn(function MockCronManager() {
+    return {
+      list: mocks.cronList,
+      add: mocks.cronAdd,
+      remove: mocks.cronRemove,
+      clearAll: mocks.cronClearAll,
+      update: mocks.cronUpdate,
+    };
+  }),
+}));
+
+vi.mock('./voice.js', () => ({
+  isVoiceAvailable: vi.fn().mockReturnValue(false),
+  transcribeVoice: vi.fn().mockResolvedValue('transcribed text'),
+}));
+
+vi.mock('fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('fs')>();
+  return {
+    ...actual,
+    existsSync: mocks.existsSyncMock,
+    statSync: mocks.statSyncMock,
+  };
+});
+
+vi.mock('child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('child_process')>();
+  return {
+    ...actual,
+    execSync: mocks.execSyncMock,
+  };
+});
+
+import { CcTgBot, splitMessage } from './bot.js';
+
+function makeMsg(overrides: Record<string, unknown> = {}) {
+  return {
+    chat: { id: 42 },
+    from: { id: 100 },
+    text: '/help',
+    ...overrides,
+  };
+}
+
+describe('splitMessage', () => {
+  it('returns single chunk for short text', () => {
+    expect(splitMessage('Hello')).toEqual(['Hello']);
+  });
+
+  it('returns single chunk for exactly 4096 chars', () => {
+    const text = 'a'.repeat(4096);
+    const chunks = splitMessage(text);
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0]).toHaveLength(4096);
+  });
+
+  it('splits text longer than 4096 chars into two chunks', () => {
+    const text = 'a'.repeat(5000);
+    const chunks = splitMessage(text);
+    expect(chunks).toHaveLength(2);
+    expect(chunks[0]).toHaveLength(4096);
+    expect(chunks[1]).toHaveLength(904);
+  });
+
+  it('splits very long text into multiple chunks each ≤4096', () => {
+    const text = 'x'.repeat(4096 * 3);
+    const chunks = splitMessage(text);
+    expect(chunks).toHaveLength(3);
+    for (const chunk of chunks) {
+      expect(chunk.length).toBeLessThanOrEqual(4096);
+    }
+  });
+
+  it('preserves full content when chunks are reassembled', () => {
+    const text = 'abc'.repeat(2000);
+    const chunks = splitMessage(text);
+    expect(chunks.join('')).toBe(text);
+  });
+
+  it('respects custom maxLen', () => {
+    const chunks = splitMessage('hello world', 5);
+    expect(chunks).toEqual(['hello', ' worl', 'd']);
+  });
+});
+
+describe('CcTgBot', () => {
+  let bot: CcTgBot;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({});
+    mocks.tgSendDocument.mockResolvedValue({});
+    mocks.tgSetMyCommands.mockResolvedValue({});
+    mocks.cronList.mockReturnValue([]);
+    mocks.cronAdd.mockReturnValue({
+      id: 'job-1',
+      schedule: 'every 1h',
+      prompt: 'test',
+      chatId: 42,
+      intervalMs: 3_600_000,
+      createdAt: '',
+    });
+    mocks.cronClearAll.mockReturnValue(0);
+    mocks.cronRemove.mockReturnValue(true);
+    mocks.existsSyncMock.mockReturnValue(false);
+    mocks.statSyncMock.mockReturnValue({ size: 1024, isFile: () => true });
+    mocks.execSyncMock.mockReturnValue('');
+
+    bot = new CcTgBot({ telegramToken: 'test-token' });
+  });
+
+  afterEach(() => {
+    bot.stop();
+  });
+
+  describe('isSensitiveFile', () => {
+    it('blocks .env files', () => {
+      expect((bot as any).isSensitiveFile('/path/.env')).toBe(true);
+    });
+
+    it('blocks token files', () => {
+      expect((bot as any).isSensitiveFile('/path/token.json')).toBe(true);
+    });
+
+    it('blocks credential files', () => {
+      expect((bot as any).isSensitiveFile('/path/credentials.json')).toBe(true);
+    });
+
+    it('blocks private key files', () => {
+      expect((bot as any).isSensitiveFile('/path/id_rsa')).toBe(true);
+      expect((bot as any).isSensitiveFile('/path/private_key.pem')).toBe(true);
+    });
+
+    it('blocks .pem, .key, .pfx, .p12 extensions', () => {
+      expect((bot as any).isSensitiveFile('/path/cert.pem')).toBe(true);
+      expect((bot as any).isSensitiveFile('/path/server.key')).toBe(true);
+      expect((bot as any).isSensitiveFile('/path/store.pfx')).toBe(true);
+      expect((bot as any).isSensitiveFile('/path/store.p12')).toBe(true);
+    });
+
+    it('allows PDF reports', () => {
+      expect((bot as any).isSensitiveFile('/path/report.pdf')).toBe(false);
+    });
+
+    it('allows photo files', () => {
+      expect((bot as any).isSensitiveFile('/path/photo.jpg')).toBe(false);
+      expect((bot as any).isSensitiveFile('/path/image.png')).toBe(false);
+    });
+
+    it('allows audio files', () => {
+      expect((bot as any).isSensitiveFile('/path/song.mp3')).toBe(false);
+    });
+
+    it('allows text files', () => {
+      expect((bot as any).isSensitiveFile('/path/notes.txt')).toBe(false);
+    });
+
+    it('blocks api_key files', () => {
+      expect((bot as any).isSensitiveFile('/path/api_key.txt')).toBe(true);
+    });
+  });
+
+  describe('isAllowed', () => {
+    it('allows all users when no allowedUserIds configured', () => {
+      expect((bot as any).isAllowed(999)).toBe(true);
+    });
+
+    it('allows configured user ids', () => {
+      const restrictedBot = new CcTgBot({ telegramToken: 'test', allowedUserIds: [100, 200] });
+      expect((restrictedBot as any).isAllowed(100)).toBe(true);
+      expect((restrictedBot as any).isAllowed(200)).toBe(true);
+      restrictedBot.stop();
+    });
+
+    it('blocks unconfigured user ids', () => {
+      const restrictedBot = new CcTgBot({ telegramToken: 'test', allowedUserIds: [100] });
+      expect((restrictedBot as any).isAllowed(999)).toBe(false);
+      restrictedBot.stop();
+    });
+  });
+
+  describe('command handlers', () => {
+    async function sendCommand(text: string, userId = 100) {
+      await (bot as any).handleTelegram(makeMsg({ text, from: { id: userId } }));
+    }
+
+    it('/help sends a message listing all commands', async () => {
+      await sendCommand('/help');
+      expect(mocks.tgSendMessage).toHaveBeenCalledOnce();
+      const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+      expect(msg).toContain('/start');
+      expect(msg).toContain('/help');
+      expect(msg).toContain('/cron');
+      expect(msg).toContain('/get_file');
+    });
+
+    it('/start kills session and confirms reset', async () => {
+      await sendCommand('/start');
+      expect(mocks.tgSendMessage).toHaveBeenCalledWith(42, 'Session reset. Send a message to start.');
+    });
+
+    it('/reset kills session and confirms reset', async () => {
+      await sendCommand('/reset');
+      expect(mocks.tgSendMessage).toHaveBeenCalledWith(42, 'Session reset. Send a message to start.');
+    });
+
+    it('/stop with no active session', async () => {
+      await sendCommand('/stop');
+      expect(mocks.tgSendMessage).toHaveBeenCalledWith(42, 'No active session.');
+    });
+
+    it('/stop with active session', async () => {
+      // Create a session by sending a text message
+      await sendCommand('Hello Claude');
+      vi.clearAllMocks();
+      await sendCommand('/stop');
+      expect(mocks.tgSendMessage).toHaveBeenCalledWith(42, 'Stopped.');
+    });
+
+    it('/status with no active session', async () => {
+      await sendCommand('/status');
+      expect(mocks.tgSendMessage).toHaveBeenCalledWith(42, 'No active session.');
+    });
+
+    it('/status with active session', async () => {
+      await sendCommand('Hello Claude');
+      vi.clearAllMocks();
+      await sendCommand('/status');
+      expect(mocks.tgSendMessage).toHaveBeenCalledWith(42, 'Session active.');
+    });
+
+    it('rejects unauthorized users', async () => {
+      const restrictedBot = new CcTgBot({ telegramToken: 'test', allowedUserIds: [100] });
+      vi.clearAllMocks();
+      await (restrictedBot as any).handleTelegram(makeMsg({ text: '/help', from: { id: 999 } }));
+      expect(mocks.tgSendMessage).toHaveBeenCalledWith(42, 'Not authorized.');
+      restrictedBot.stop();
+    });
+
+    it('ignores empty messages', async () => {
+      await (bot as any).handleTelegram(makeMsg({ text: '', from: { id: 100 } }));
+      expect(mocks.tgSendMessage).not.toHaveBeenCalled();
+    });
+
+    it('sends text message to Claude', async () => {
+      await sendCommand('Hello Claude');
+      expect(mocks.claudeSendPrompt).toHaveBeenCalledWith('Hello Claude');
+    });
+
+    describe('/get_file', () => {
+      it('sends usage when no path given', async () => {
+        await sendCommand('/get_file');
+        expect(mocks.tgSendMessage).toHaveBeenCalledWith(42, 'Usage: /get_file <path>');
+      });
+
+      it('blocks paths outside safe directories', async () => {
+        await sendCommand('/get_file /etc/passwd');
+        const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+        expect(msg).toContain('Access denied');
+      });
+
+      it('reports file not found', async () => {
+        mocks.existsSyncMock.mockReturnValue(false);
+        await sendCommand('/get_file /tmp/test.txt');
+        const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+        expect(msg).toContain('File not found');
+      });
+
+      it('blocks sensitive files in safe dirs', async () => {
+        mocks.existsSyncMock.mockReturnValue(true);
+        mocks.statSyncMock.mockReturnValue({ size: 1024, isFile: () => true });
+        await sendCommand('/get_file /tmp/token.json');
+        const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+        expect(msg).toContain('Access denied: sensitive file');
+      });
+
+      it('blocks oversized files', async () => {
+        mocks.existsSyncMock.mockReturnValue(true);
+        mocks.statSyncMock.mockReturnValue({ size: 60 * 1024 * 1024, isFile: () => true });
+        await sendCommand('/get_file /tmp/bigfile.zip');
+        const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+        expect(msg).toContain('File too large');
+      });
+
+      it('sends document for valid safe file', async () => {
+        mocks.existsSyncMock.mockReturnValue(true);
+        mocks.statSyncMock.mockReturnValue({ size: 1024, isFile: () => true });
+        await sendCommand('/get_file /tmp/report.pdf');
+        expect(mocks.tgSendDocument).toHaveBeenCalled();
+      });
+    });
+
+    describe('/cron commands', () => {
+      it('/cron list with no jobs', async () => {
+        mocks.cronList.mockReturnValue([]);
+        await sendCommand('/cron list');
+        expect(mocks.tgSendMessage).toHaveBeenCalledWith(42, 'No cron jobs.');
+      });
+
+      it('/cron with no args shows no jobs', async () => {
+        mocks.cronList.mockReturnValue([]);
+        await sendCommand('/cron');
+        expect(mocks.tgSendMessage).toHaveBeenCalledWith(42, 'No cron jobs.');
+      });
+
+      it('/cron list with jobs shows them', async () => {
+        mocks.cronList.mockReturnValue([
+          { id: 'abc', chatId: 42, schedule: 'every 1h', prompt: 'check status', intervalMs: 3_600_000, createdAt: '' },
+        ]);
+        await sendCommand('/cron list');
+        const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+        expect(msg).toContain('every 1h');
+        expect(msg).toContain('check status');
+      });
+
+      it('/cron every 1h <prompt> adds a job', async () => {
+        mocks.cronAdd.mockReturnValue({
+          id: 'new-job',
+          schedule: 'every 1h',
+          prompt: 'run check',
+          chatId: 42,
+          intervalMs: 3_600_000,
+          createdAt: '',
+        });
+        await sendCommand('/cron every 1h run check');
+        const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+        expect(msg).toContain('Cron set');
+        expect(msg).toContain('every 1h');
+        expect(msg).toContain('run check');
+      });
+
+      it('/cron with invalid schedule format sends usage', async () => {
+        await sendCommand('/cron bogus schedule here');
+        const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+        expect(msg).toContain('Usage');
+      });
+
+      it('/cron add returns null for bad schedule', async () => {
+        mocks.cronAdd.mockReturnValue(null);
+        await sendCommand('/cron every 5s test');
+        const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+        // "every 5s test" doesn't match /^(every\s+\d+[mhd])\s+(.+)$/ so usage is shown
+        expect(msg).toContain('Usage');
+      });
+
+      it('/cron clear clears all jobs', async () => {
+        mocks.cronClearAll.mockReturnValue(3);
+        await sendCommand('/cron clear');
+        expect(mocks.tgSendMessage).toHaveBeenCalledWith(42, 'Cleared 3 cron job(s).');
+      });
+
+      it('/cron remove <id> removes a job', async () => {
+        mocks.cronRemove.mockReturnValue(true);
+        await sendCommand('/cron remove abc-123');
+        expect(mocks.tgSendMessage).toHaveBeenCalledWith(42, 'Removed abc-123.');
+      });
+
+      it('/cron remove <id> not found', async () => {
+        mocks.cronRemove.mockReturnValue(false);
+        await sendCommand('/cron remove nonexistent');
+        expect(mocks.tgSendMessage).toHaveBeenCalledWith(42, 'Not found: nonexistent');
+      });
+    });
+  });
+
+  describe('trackWrittenFiles', () => {
+    it('tracks Write tool calls', () => {
+      const session = { writtenFiles: new Set<string>() };
+      const msg = {
+        type: 'assistant' as const,
+        payload: {
+          message: {
+            content: [
+              { type: 'tool_use', name: 'Write', input: { file_path: '/tmp/test.txt' } },
+            ],
+          },
+        },
+        raw: {},
+      };
+      (bot as any).trackWrittenFiles(msg, session, '/tmp');
+      expect(session.writtenFiles.has('/tmp/test.txt')).toBe(true);
+    });
+
+    it('tracks Edit tool calls', () => {
+      const session = { writtenFiles: new Set<string>() };
+      const msg = {
+        type: 'assistant' as const,
+        payload: {
+          message: {
+            content: [
+              { type: 'tool_use', name: 'Edit', input: { file_path: '/tmp/edited.ts' } },
+            ],
+          },
+        },
+        raw: {},
+      };
+      (bot as any).trackWrittenFiles(msg, session, '/tmp');
+      expect(session.writtenFiles.has('/tmp/edited.ts')).toBe(true);
+    });
+
+    it('ignores non-assistant messages', () => {
+      const session = { writtenFiles: new Set<string>() };
+      const msg = {
+        type: 'result' as const,
+        payload: { result: 'done' },
+        raw: {},
+      };
+      (bot as any).trackWrittenFiles(msg, session, '/tmp');
+      expect(session.writtenFiles.size).toBe(0);
+    });
+
+    it('tracks mv command destination', () => {
+      const session = { writtenFiles: new Set<string>() };
+      const msg = {
+        type: 'assistant' as const,
+        payload: {
+          message: {
+            content: [
+              { type: 'tool_use', name: 'Bash', input: { command: 'mv /tmp/source.txt /tmp/dest.txt' } },
+            ],
+          },
+        },
+        raw: {},
+      };
+      (bot as any).trackWrittenFiles(msg, session, '/tmp');
+      expect(session.writtenFiles.has('/tmp/dest.txt')).toBe(true);
+    });
+
+    it('tracks cp command destination', () => {
+      const session = { writtenFiles: new Set<string>() };
+      const msg = {
+        type: 'assistant' as const,
+        payload: {
+          message: {
+            content: [
+              { type: 'tool_use', name: 'Bash', input: { command: 'cp /tmp/source.txt /tmp/copy.txt' } },
+            ],
+          },
+        },
+        raw: {},
+      };
+      (bot as any).trackWrittenFiles(msg, session, '/tmp');
+      expect(session.writtenFiles.has('/tmp/copy.txt')).toBe(true);
+    });
+
+    it('tracks -o flag output path in non-yt-dlp bash commands', () => {
+      const session = { writtenFiles: new Set<string>() };
+      const msg = {
+        type: 'assistant' as const,
+        payload: {
+          message: {
+            content: [
+              { type: 'tool_use', name: 'Bash', input: { command: 'some-tool -o /tmp/output.csv' } },
+            ],
+          },
+        },
+        raw: {},
+      };
+      (bot as any).trackWrittenFiles(msg, session, '/tmp');
+      expect(session.writtenFiles.has('/tmp/output.csv')).toBe(true);
+    });
+
+    it('tracks relative Write paths resolved against cwd', () => {
+      const session = { writtenFiles: new Set<string>() };
+      const msg = {
+        type: 'assistant' as const,
+        payload: {
+          message: {
+            content: [
+              { type: 'tool_use', name: 'Write', input: { file_path: 'output/report.txt' } },
+            ],
+          },
+        },
+        raw: {},
+      };
+      (bot as any).trackWrittenFiles(msg, session, '/home/user/project');
+      expect(session.writtenFiles.has('/home/user/project/output/report.txt')).toBe(true);
+    });
+  });
+});
