@@ -153,37 +153,40 @@ export class ClaudeProcess extends EventEmitter {
 
     for (const line of lines) {
       if (!line.trim()) continue;
+
+      let raw: Record<string, unknown>;
       try {
-        const raw = JSON.parse(line) as Record<string, unknown>;
-
-        // Emit usage events from Anthropic API stream events passed through by Claude CLI
-        if (raw.type === "message_start") {
-          const usage = ((raw.message as Record<string, unknown> | undefined)?.usage) as Record<string, number> | undefined;
-          if (usage) {
-            this.emit("usage", {
-              inputTokens: usage.input_tokens ?? 0,
-              outputTokens: 0, // output_tokens at message_start is always 0
-              cacheReadTokens: usage.cache_read_input_tokens ?? 0,
-              cacheWriteTokens: usage.cache_creation_input_tokens ?? 0,
-            } satisfies UsageEvent);
-          }
-        } else if (raw.type === "message_delta") {
-          const usage = raw.usage as Record<string, number> | undefined;
-          if (usage?.output_tokens) {
-            this.emit("usage", {
-              inputTokens: 0,
-              outputTokens: usage.output_tokens,
-              cacheReadTokens: 0,
-              cacheWriteTokens: 0,
-            } satisfies UsageEvent);
-          }
-        }
-
-        const msg = this.parseMessage(raw);
-        if (msg) this.emit("message", msg);
+        raw = JSON.parse(line) as Record<string, unknown>;
       } catch {
         // Non-JSON line (startup noise etc.) — ignore
+        continue;
       }
+
+      // Emit usage events from Anthropic API stream events passed through by Claude CLI
+      if (raw.type === "message_start") {
+        const usage = ((raw.message as Record<string, unknown> | undefined)?.usage) as Record<string, number> | undefined;
+        if (usage) {
+          this.emit("usage", {
+            inputTokens: usage.input_tokens ?? 0,
+            outputTokens: 0, // output_tokens at message_start is always 0
+            cacheReadTokens: usage.cache_read_input_tokens ?? 0,
+            cacheWriteTokens: usage.cache_creation_input_tokens ?? 0,
+          } satisfies UsageEvent);
+        }
+      } else if (raw.type === "message_delta") {
+        const usage = raw.usage as Record<string, number> | undefined;
+        if (usage?.output_tokens) {
+          this.emit("usage", {
+            inputTokens: 0,
+            outputTokens: usage.output_tokens,
+            cacheReadTokens: 0,
+            cacheWriteTokens: 0,
+          } satisfies UsageEvent);
+        }
+      }
+
+      const msg = this.parseMessage(raw);
+      if (msg) this.emit("message", msg);
     }
   }
 

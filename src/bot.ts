@@ -545,7 +545,11 @@ export class CcTgBot {
     }
 
     // Hybrid file upload: find files mentioned in result text that Claude actually wrote
-    this.uploadMentionedFiles(chatId, text, session);
+    try {
+      this.uploadMentionedFiles(chatId, text, session);
+    } catch (err) {
+      console.error(`[tg:${chatId}] uploadMentionedFiles error:`, (err as Error).message);
+    }
   }
 
   private trackWrittenFiles(msg: ClaudeMessage, session: Session, cwd?: string): void {
@@ -694,7 +698,12 @@ export class CcTgBot {
         console.log(`[claude:files] skipping sensitive file: ${filePath}`);
         continue;
       }
-      const fileSize = statSync(filePath).size;
+      let fileSize: number;
+      try {
+        fileSize = statSync(filePath).size;
+      } catch {
+        continue; // file disappeared between existsSync and statSync
+      }
       const MAX_TG_FILE_BYTES = 50 * 1024 * 1024;
       if (fileSize > MAX_TG_FILE_BYTES) {
         const mb = (fileSize / (1024 * 1024)).toFixed(1);
@@ -753,7 +762,12 @@ export class CcTgBot {
 
         const result = output.trim();
         if (result) {
-          const footer = formatCronCostFooter(cronUsage);
+          let footer = "";
+          try {
+            footer = formatCronCostFooter(cronUsage);
+          } catch (err) {
+            console.error(`[cron] cost footer error:`, (err as Error).message);
+          }
           const chunks = splitMessage(`🕐 ${result}${footer}`);
           (async () => {
             for (const chunk of chunks) {
