@@ -13,6 +13,7 @@ import http from "http";
 import { ClaudeProcess, extractText, ClaudeMessage, UsageEvent } from "./claude.js";
 import { transcribeVoice, isVoiceAvailable } from "./voice.js";
 import { CronManager } from "./cron.js";
+import { detectUsageLimit } from "./usage-limit.js";
 
 const BOT_COMMANDS: Array<{ command: string; description: string }> = [
   { command: "start", description: "Reset session and start fresh" },
@@ -45,6 +46,16 @@ interface Session {
   lastMessageId?: number;
   /** Files written by Claude tools during this turn — cleared after each result */
   writtenFiles: Set<string>;
+  /** The last prompt sent to this session — used for usage-limit retries */
+  currentPrompt: string;
+  /** When true, prepend "✅ Claude is back!" to the next flushed response */
+  isRetry: boolean;
+}
+
+interface PendingRetry {
+  text: string;
+  attempt: number;
+  timer: ReturnType<typeof setTimeout>;
 }
 
 const FLUSH_DELAY_MS = 800; // debounce streaming chunks into one Telegram message
@@ -189,6 +200,7 @@ class CostStore {
 export class CcTgBot {
   private bot: TelegramBot;
   private sessions = new Map<number, Session>();
+  private pendingRetries = new Map<number, PendingRetry>();
   private opts: BotOptions;
   private cron: CronManager;
   private costStore: CostStore;
@@ -279,7 +291,10 @@ export class CcTgBot {
     // /status
     if (text === "/status") {
       const has = this.sessions.has(chatId);
-      await this.bot.sendMessage(chatId, has ? "Session active." : "No active session.");
+      let status = has ? "Session active." : "No active session.";
+      const sleeping = this.pendingRetries.size;
+      if (sleeping > 0) status += `\n⏸ ${sleeping} request(s) sleeping (usage limit).`;
+      await this.bot.sendMessage(chatId, status);
       return;
     }
 
@@ -343,7 +358,9 @@ export class CcTgBot {
 
     const session = this.getOrCreateSession(chatId);
     try {
-      session.claude.sendPrompt(buildPromptWithReplyContext(text, msg));
+      const prompt = buildPromptWithReplyContext(text, msg);
+      session.currentPrompt = prompt;
+      session.claude.sendPrompt(prompt);
       this.startTyping(chatId, session);
     } catch (err) {
       await this.bot.sendMessage(chatId, `Error sending to Claude: ${(err as Error).message}`);
@@ -371,7 +388,9 @@ export class CcTgBot {
       // Feed transcript into Claude as if user typed it
       const session = this.getOrCreateSession(chatId);
       try {
-        session.claude.sendPrompt(buildPromptWithReplyContext(transcript, msg));
+        const prompt = buildPromptWithReplyContext(transcript, msg);
+        session.currentPrompt = prompt;
+        session.claude.sendPrompt(prompt);
         this.startTyping(chatId, session);
       } catch (err) {
         await this.bot.sendMessage(chatId, `Error sending to Claude: ${(err as Error).message}`);
@@ -451,6 +470,8 @@ export class CcTgBot {
       flushTimer: null,
       typingTimer: null,
       writtenFiles: new Set(),
+      currentPrompt: "",
+      isRetry: false,
     };
 
     claude.on("usage", (usage: UsageEvent) => {
@@ -502,6 +523,42 @@ export class CcTgBot {
     const text = extractText(msg);
     if (!text) return;
 
+    // Check for usage/rate limit signals before forwarding to Telegram
+    const sig = detectUsageLimit(text);
+    if (sig.detected) {
+      const lastPrompt = session.currentPrompt;
+      const prevRetry = this.pendingRetries.get(chatId);
+      const attempt = (prevRetry?.attempt ?? 0) + 1;
+
+      if (prevRetry) clearTimeout(prevRetry.timer);
+
+      this.bot.sendMessage(chatId, sig.humanMessage).catch(() => {});
+      this.killSession(chatId);
+
+      if (attempt > 3) {
+        this.bot.sendMessage(chatId, "❌ Claude usage limit persists after 3 retries. Please try again later.").catch(() => {});
+        this.pendingRetries.delete(chatId);
+        return;
+      }
+
+      console.log(`[usage-limit:${chatId}] ${sig.reason} — scheduling retry attempt=${attempt} in ${sig.retryAfterMs}ms`);
+      const timer = setTimeout(() => {
+        this.pendingRetries.delete(chatId);
+        try {
+          const retrySession = this.getOrCreateSession(chatId);
+          retrySession.currentPrompt = lastPrompt;
+          retrySession.isRetry = true;
+          retrySession.claude.sendPrompt(lastPrompt);
+          this.startTyping(chatId, retrySession);
+        } catch (err) {
+          this.bot.sendMessage(chatId, `❌ Failed to retry: ${(err as Error).message}`).catch(() => {});
+        }
+      }, sig.retryAfterMs);
+
+      this.pendingRetries.set(chatId, { text: lastPrompt, attempt, timer });
+      return;
+    }
+
     // Accumulate text and debounce — Claude streams chunks rapidly
     session.pendingText += text;
 
@@ -531,7 +588,8 @@ export class CcTgBot {
     session.flushTimer = null;
     if (!raw) return;
 
-    const text = raw;
+    const text = session.isRetry ? `✅ Claude is back!\n\n${raw}` : raw;
+    session.isRetry = false;
 
     // Telegram max message length is 4096 chars — split if needed
     const chunks = splitMessage(text);
