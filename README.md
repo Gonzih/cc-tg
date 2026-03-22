@@ -1,5 +1,7 @@
 # cc-tg
 
+[![npm version](https://img.shields.io/npm/v/@gonzih/cc-tg)](https://www.npmjs.com/package/@gonzih/cc-tg)
+
 Claude Code Telegram bot. Chat with Claude Code from Telegram — text, voice, images, files, scheduled prompts, and bot management commands.
 
 Built by [@Gonzih](https://github.com/Gonzih).
@@ -11,7 +13,7 @@ Built by [@Gonzih](https://github.com/Gonzih).
 **Step 2** — run:
 
 ```bash
-TELEGRAM_BOT_TOKEN=your_bot_token CLAUDE_CODE_OAUTH_TOKEN=your_claude_token npx @gonzih/cc-tg
+TELEGRAM_BOT_TOKEN=your_bot_token CLAUDE_CODE_TOKEN=your_claude_token npx @gonzih/cc-tg
 ```
 
 Open your bot in Telegram and start chatting.
@@ -21,12 +23,13 @@ Open your bot in Telegram and start chatting.
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `TELEGRAM_BOT_TOKEN` | yes | From @BotFather |
-| `CLAUDE_CODE_OAUTH_TOKEN` | yes* | Claude Code OAuth token (starts with `sk-ant-oat`) |
+| `CLAUDE_CODE_TOKEN` | yes* | Claude Code OAuth token (starts with `sk-ant-oat`) |
+| `CLAUDE_CODE_OAUTH_TOKEN` | yes* | Alias for `CLAUDE_CODE_TOKEN` |
 | `ANTHROPIC_API_KEY` | yes* | Alternative — API key from console.anthropic.com |
 | `ALLOWED_USER_IDS` | no | Comma-separated Telegram user IDs. Leave empty to allow anyone |
 | `CWD` | no | Working directory for Claude Code. Defaults to current directory |
 
-*One of `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` required.
+*One of `CLAUDE_CODE_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, or `ANTHROPIC_API_KEY` required.
 
 ## Get your Claude Code token
 
@@ -47,15 +50,18 @@ Message [@userinfobot](https://t.me/userinfobot) — it replies with your numeri
 | `/start` or `/reset` | Kill current Claude session and start fresh |
 | `/stop` | Interrupt the running Claude task |
 | `/status` | Check if a session is active |
+| `/cost` | Show session token usage and cost |
 | `/help` | Show all available commands |
 | `/cron every 1h <prompt>` | Schedule a recurring prompt |
 | `/cron list` | Show active cron jobs (numbered) |
 | `/cron edit <#> [schedule/prompt] <value>` | Edit a cron job in place |
 | `/cron remove <id>` | Remove a specific cron job |
 | `/cron clear` | Remove all cron jobs |
-| `/reload_mcp` | Reload cc-agent MCP server without dropping your Claude session |
+| `/reload_mcp` | Restart the cc-agent MCP server process |
+| `/mcp_status` | Check MCP server connection status |
 | `/mcp_version` | Show latest published cc-agent npm version and current cache |
 | `/clear_npx_cache` | Clear npx cache and reload cc-agent (upgrades to latest version) |
+| `/get_file <path>` | Send a file from the server to this chat |
 | `/restart` | Self-restart the cc-tg bot process (no SSH needed) |
 | Any text | Sent directly to Claude Code |
 | Voice message | Transcribed via whisper.cpp and sent to Claude |
@@ -79,6 +85,9 @@ Send any file → downloaded to `<CWD>/.cc-tg/uploads/<filename>` → Claude rec
 ### File delivery
 When Claude writes a file and mentions it in the response, the bot automatically uploads it to Telegram. Tracks `Write`/`Edit` tool calls during the session, cross-references with filenames in the final response.
 
+### Cost tracking
+`/cost` shows total input/output tokens and estimated USD cost for the current session.
+
 ### Cron jobs
 Schedule recurring prompts on a timer:
 
@@ -101,6 +110,7 @@ Cron jobs persist to `<CWD>/.cc-tg/crons.json` and restore on restart. Output is
 Manage the cc-agent MCP server from Telegram without SSH:
 
 - `/reload_mcp` — sends SIGTERM to the cc-agent process; Claude Code auto-restarts it on next tool call. Useful after updating cc-agent config.
+- `/mcp_status` — runs `claude mcp list` and shows the current connection status of all MCP servers.
 - `/mcp_version` — shows the latest `@gonzih/cc-agent` version on npm and what's in your local npx cache.
 - `/clear_npx_cache` — deletes `~/.npm/_npx/` and kills cc-agent, forcing a fresh download of the latest version on next use.
 
@@ -112,6 +122,17 @@ While Claude is working, the bot sends a continuous typing indicator. Works for 
 
 ### Bot command menu
 All commands are registered with Telegram's `/` menu via `setMyCommands` on startup — no need to remember commands.
+
+## Architecture
+
+cc-tg is a thin Telegram adapter over Claude Code:
+
+1. **Bot layer** (`src/bot.ts`) — handles Telegram updates, routes commands, manages per-chat Claude subprocesses.
+2. **Claude runner** (`src/claude.ts`) — spawns `claude` CLI as a subprocess per chat, streams output back, tracks token costs.
+3. **Cron manager** (`src/cron.ts`) — persistent cron scheduler that fires prompts at configured intervals and delivers results to Telegram.
+4. **Voice handler** (`src/voice.ts`) — downloads Telegram voice messages, converts via ffmpeg, transcribes with whisper.cpp.
+
+cc-tg works with the [cc-agent](https://github.com/Gonzih/cc-agent) MCP server to enable Claude Code subagent spawning. When cc-agent is configured as an MCP server in your Claude Code setup, `/reload_mcp` and `/mcp_status` let you manage it remotely without SSH.
 
 ## Run persistently
 
@@ -134,7 +155,7 @@ All commands are registered with Telegram's `/` menu via `setMyCommands` on star
     <dict>
         <key>TELEGRAM_BOT_TOKEN</key>
         <string>your_token</string>
-        <key>CLAUDE_CODE_OAUTH_TOKEN</key>
+        <key>CLAUDE_CODE_TOKEN</key>
         <string>your_claude_token</string>
         <key>ALLOWED_USER_IDS</key>
         <string>your_telegram_id</string>
@@ -171,7 +192,7 @@ Description=cc-tg Claude Code Telegram bot
 
 [Service]
 Environment=TELEGRAM_BOT_TOKEN=xxx
-Environment=CLAUDE_CODE_OAUTH_TOKEN=yyy
+Environment=CLAUDE_CODE_TOKEN=yyy
 Environment=ALLOWED_USER_IDS=123456789
 Environment=CWD=/home/you/your-project
 WorkingDirectory=/home/you/your-project
