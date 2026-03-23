@@ -49,7 +49,7 @@ export class ClaudeProcess extends EventEmitter {
     super();
 
     const args = [
-      "--no-session-persistence",
+      "--continue",
       "--output-format", "stream-json",
       "--input-format", "stream-json",
       "--print",
