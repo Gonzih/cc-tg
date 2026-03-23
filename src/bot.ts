@@ -13,6 +13,7 @@ import http from "http";
 import { ClaudeProcess, extractText, ClaudeMessage, UsageEvent } from "./claude.js";
 import { transcribeVoice, isVoiceAvailable } from "./voice.js";
 import { CronManager } from "./cron.js";
+import { formatForTelegram, splitLongMessage } from "./formatter.js";
 import { detectUsageLimit } from "./usage-limit.js";
 
 const BOT_COMMANDS: Array<{ command: string; description: string }> = [
@@ -591,11 +592,12 @@ export class CcTgBot {
     const text = session.isRetry ? `✅ Claude is back!\n\n${raw}` : raw;
     session.isRetry = false;
 
-    // Telegram max message length is 4096 chars — split if needed
-    const chunks = splitMessage(text);
+    // Format for Telegram MarkdownV2 and split if needed (max 4096 chars)
+    const formatted = formatForTelegram(text);
+    const chunks = splitLongMessage(formatted);
     for (const chunk of chunks) {
-      this.bot.sendMessage(chatId, chunk, { parse_mode: "Markdown" }).catch(() => {
-        // Markdown parse failed — retry as plain text
+      this.bot.sendMessage(chatId, chunk, { parse_mode: "MarkdownV2" }).catch(() => {
+        // MarkdownV2 parse failed — retry as plain text
         this.bot.sendMessage(chatId, chunk).catch((err) =>
           console.error(`[tg:${chatId}] send failed:`, err.message)
         );
@@ -826,13 +828,19 @@ export class CcTgBot {
           } catch (err) {
             console.error(`[cron] cost footer error:`, (err as Error).message);
           }
-          const chunks = splitMessage(`🕐 ${result}${footer}`);
+          const cronFormatted = formatForTelegram(`🕐 ${result}${footer}`);
+          const chunks = splitLongMessage(cronFormatted);
           (async () => {
             for (const chunk of chunks) {
               try {
-                await this.bot.sendMessage(chatId, chunk);
-              } catch (err) {
-                console.error(`[cron] failed to send result to chat=${chatId}:`, (err as Error).message);
+                await this.bot.sendMessage(chatId, chunk, { parse_mode: "MarkdownV2" });
+              } catch {
+                // MarkdownV2 parse failed — retry as plain text
+                try {
+                  await this.bot.sendMessage(chatId, chunk);
+                } catch (err) {
+                  console.error(`[cron] failed to send result to chat=${chatId}:`, (err as Error).message);
+                }
               }
             }
           })();
