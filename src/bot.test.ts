@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
   tgOn: vi.fn(),
   tgStopPolling: vi.fn(),
   tgGetFileLink: vi.fn().mockResolvedValue('https://example.com/file'),
+  tgGetMe: vi.fn().mockResolvedValue({ id: 999, username: 'testbot' }),
   claudeOn: vi.fn(),
   claudeSendPrompt: vi.fn(),
   claudeKill: vi.fn(),
@@ -38,6 +39,7 @@ vi.mock('node-telegram-bot-api', () => ({
       setMyCommands: mocks.tgSetMyCommands,
       stopPolling: mocks.tgStopPolling,
       getFileLink: mocks.tgGetFileLink,
+      getMe: mocks.tgGetMe,
     };
   }),
 }));
@@ -536,6 +538,72 @@ describe('CcTgBot', () => {
       };
       (bot as any).trackWrittenFiles(msg, session, '/home/user/project');
       expect(session.writtenFiles.has('/home/user/project/output/report.txt')).toBe(true);
+    });
+  });
+
+  describe('group chat support', () => {
+    async function sendGroupMsg(overrides: Record<string, unknown> = {}) {
+      await (bot as any).handleTelegram({
+        chat: { id: 42, type: 'group' },
+        from: { id: 100 },
+        text: 'hello',
+        ...overrides,
+      });
+    }
+
+    it('ignores group messages that are not @mentions, replies to bot, or commands', async () => {
+      (bot as any).botUsername = 'testbot';
+      (bot as any).botId = 999;
+      await sendGroupMsg({ text: 'just talking' });
+      expect(mocks.claudeSendPrompt).not.toHaveBeenCalled();
+    });
+
+    it('processes group message with @mention', async () => {
+      (bot as any).botUsername = 'testbot';
+      (bot as any).botId = 999;
+      await sendGroupMsg({ text: '@testbot do something' });
+      expect(mocks.claudeSendPrompt).toHaveBeenCalled();
+    });
+
+    it('strips @botname from text before sending to Claude', async () => {
+      (bot as any).botUsername = 'testbot';
+      (bot as any).botId = 999;
+      await sendGroupMsg({ text: '@testbot do something' });
+      const prompt = mocks.claudeSendPrompt.mock.calls[0][0] as string;
+      expect(prompt).not.toContain('@testbot');
+      expect(prompt).toContain('do something');
+    });
+
+    it('processes group message that is a reply to bot', async () => {
+      (bot as any).botUsername = 'testbot';
+      (bot as any).botId = 999;
+      await sendGroupMsg({ text: 'sure go ahead', reply_to_message: { from: { id: 999 } } });
+      expect(mocks.claudeSendPrompt).toHaveBeenCalled();
+    });
+
+    it('processes group commands (/ prefix)', async () => {
+      (bot as any).botUsername = 'testbot';
+      (bot as any).botId = 999;
+      await sendGroupMsg({ text: '/status' });
+      expect(mocks.tgSendMessage).toHaveBeenCalled();
+    });
+
+    it('ignores group messages when GROUP_CHAT_IDS is set and chat is not listed', async () => {
+      (bot as any).botUsername = 'testbot';
+      (bot as any).botId = 999;
+      (bot as any).opts.groupChatIds = [99999];
+      await sendGroupMsg({ text: '@testbot hello' });
+      expect(mocks.claudeSendPrompt).not.toHaveBeenCalled();
+      (bot as any).opts.groupChatIds = [];
+    });
+
+    it('processes group message when GROUP_CHAT_IDS includes the chat', async () => {
+      (bot as any).botUsername = 'testbot';
+      (bot as any).botId = 999;
+      (bot as any).opts.groupChatIds = [42];
+      await sendGroupMsg({ text: '@testbot hello' });
+      expect(mocks.claudeSendPrompt).toHaveBeenCalled();
+      (bot as any).opts.groupChatIds = [];
     });
   });
 });

@@ -37,6 +37,7 @@ export interface BotOptions {
   claudeToken?: string;
   cwd?: string;
   allowedUserIds?: number[];
+  groupChatIds?: number[];
 }
 
 interface Session {
@@ -205,12 +206,20 @@ export class CcTgBot {
   private opts: BotOptions;
   private cron: CronManager;
   private costStore: CostStore;
+  private botUsername = "";
+  private botId = 0;
 
   constructor(opts: BotOptions) {
     this.opts = opts;
     this.bot = new TelegramBot(opts.telegramToken, { polling: true });
     this.bot.on("message", (msg) => this.handleTelegram(msg));
     this.bot.on("polling_error", (err) => console.error("[tg]", err.message));
+
+    this.bot.getMe().then((me) => {
+      this.botUsername = me.username ?? "";
+      this.botId = me.id;
+      console.log(`[tg] bot identity: @${this.botUsername} (id=${this.botId})`);
+    }).catch((err: Error) => console.error("[tg] getMe failed:", err.message));
 
     // Cron manager — fires each task into an isolated ClaudeProcess
     this.cron = new CronManager(opts.cwd ?? process.cwd(), (chatId, prompt) => {
@@ -245,6 +254,23 @@ export class CcTgBot {
       return;
     }
 
+    // Group chat handling
+    const isGroup = msg.chat.type === "group" || msg.chat.type === "supergroup";
+    if (isGroup) {
+      // If GROUP_CHAT_IDS allowlist is set, only respond in those chats
+      if (this.opts.groupChatIds?.length && !this.opts.groupChatIds.includes(chatId)) {
+        return;
+      }
+      // Only respond if: bot is @mentioned, message is a reply to the bot, or text starts with /
+      const text = msg.text?.trim() ?? "";
+      const isMentioned = this.botUsername && text.includes(`@${this.botUsername}`);
+      const isReplyToBot = msg.reply_to_message?.from?.id === this.botId;
+      const isCommand = text.startsWith("/");
+      if (!isMentioned && !isReplyToBot && !isCommand) {
+        return;
+      }
+    }
+
     // Voice message — transcribe then feed as text
     if (msg.voice || msg.audio) {
       await this.handleVoice(chatId, msg);
@@ -263,9 +289,14 @@ export class CcTgBot {
       return;
     }
 
-    const text = msg.text?.trim();
+    let text = msg.text?.trim();
 
     if (!text) return;
+
+    // Strip @botname mention prefix in group chats
+    if (this.botUsername) {
+      text = text.replace(new RegExp(`@${this.botUsername}\\s*`, "g"), "").trim();
+    }
 
     // /start or /reset — kill existing session and ack
     if (text === "/start" || text === "/reset") {
