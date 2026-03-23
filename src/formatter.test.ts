@@ -3,42 +3,59 @@ import { formatForTelegram, splitLongMessage } from "./formatter.js";
 
 describe("formatForTelegram", () => {
   describe("headings → bold", () => {
-    it("converts ## heading to *bold*", () => {
-      expect(formatForTelegram("## Hello World")).toBe("*Hello World*");
+    it("converts ## heading to <b>bold</b>", () => {
+      expect(formatForTelegram("## Hello World")).toBe("<b>Hello World</b>");
     });
 
-    it("converts # h1 to *bold*", () => {
-      expect(formatForTelegram("# Title")).toBe("*Title*");
+    it("converts # h1 to <b>bold</b>", () => {
+      expect(formatForTelegram("# Title")).toBe("<b>Title</b>");
     });
 
-    it("converts ### h3 to *bold*", () => {
-      expect(formatForTelegram("### Section")).toBe("*Section*");
+    it("converts ### h3 to <b>bold</b>", () => {
+      expect(formatForTelegram("### Section")).toBe("<b>Section</b>");
     });
 
-    it("converts h6 to *bold*", () => {
-      expect(formatForTelegram("###### Deep")).toBe("*Deep*");
+    it("converts h6 to <b>bold</b>", () => {
+      expect(formatForTelegram("###### Deep")).toBe("<b>Deep</b>");
     });
 
     it("only converts headings at start of line", () => {
       const input = "text ## not a heading";
-      // ## not at line start — should not be converted, # gets escaped
       const result = formatForTelegram(input);
-      expect(result).not.toContain("*not a heading*");
+      expect(result).not.toContain("<b>not a heading</b>");
     });
   });
 
   describe("bold conversion", () => {
-    it("converts **bold** to *bold*", () => {
-      expect(formatForTelegram("**bold text**")).toBe("*bold text*");
+    it("converts **bold** to <b>bold</b>", () => {
+      expect(formatForTelegram("**bold text**")).toBe("<b>bold text</b>");
     });
 
     it("converts multiple bold spans", () => {
       const result = formatForTelegram("**foo** and **bar**");
-      expect(result).toBe("*foo* and *bar*");
+      expect(result).toBe("<b>foo</b> and <b>bar</b>");
     });
 
     it("converts bold spanning multiple words", () => {
-      expect(formatForTelegram("**hello world**")).toBe("*hello world*");
+      expect(formatForTelegram("**hello world**")).toBe("<b>hello world</b>");
+    });
+
+    it("converts *single asterisk bold*", () => {
+      expect(formatForTelegram("*bold text*")).toBe("<b>bold text</b>");
+    });
+  });
+
+  describe("italic conversion", () => {
+    it("converts _italic_ to <i>italic</i>", () => {
+      expect(formatForTelegram("_italic_")).toBe("<i>italic</i>");
+    });
+
+    it("converts _italic_ surrounded by spaces", () => {
+      expect(formatForTelegram("some _italic_ text")).toBe("some <i>italic</i> text");
+    });
+
+    it("does not convert underscores in snake_case identifiers", () => {
+      expect(formatForTelegram("my_var_name")).toBe("my_var_name");
     });
   });
 
@@ -62,102 +79,122 @@ describe("formatForTelegram", () => {
     });
   });
 
-  describe("special char escaping", () => {
-    it("escapes periods", () => {
-      expect(formatForTelegram("Hello.")).toBe("Hello\\.");
+  describe("HTML escaping (no MarkdownV2 backslash escaping)", () => {
+    it("does not escape periods", () => {
+      expect(formatForTelegram("Hello.")).toBe("Hello.");
     });
 
-    it("escapes exclamation marks", () => {
-      expect(formatForTelegram("Hello!")).toBe("Hello\\!");
+    it("does not escape exclamation marks", () => {
+      expect(formatForTelegram("Hello!")).toBe("Hello!");
     });
 
-    it("escapes parentheses", () => {
-      expect(formatForTelegram("(test)")).toBe("\\(test\\)");
+    it("does not escape parentheses", () => {
+      expect(formatForTelegram("(test)")).toBe("(test)");
     });
 
-    it("escapes hyphens in text", () => {
-      expect(formatForTelegram("well-known")).toBe("well\\-known");
+    it("does not escape hyphens in text", () => {
+      expect(formatForTelegram("well-known")).toBe("well-known");
     });
 
-    it("escapes equals signs", () => {
-      expect(formatForTelegram("a = b")).toBe("a \\= b");
+    it("does not escape equals signs", () => {
+      expect(formatForTelegram("a = b")).toBe("a = b");
     });
 
-    it("escapes plus signs", () => {
-      expect(formatForTelegram("a + b")).toBe("a \\+ b");
+    it("does not escape plus signs", () => {
+      expect(formatForTelegram("a + b")).toBe("a + b");
     });
 
-    it("escapes curly braces", () => {
-      expect(formatForTelegram("{key}")).toBe("\\{key\\}");
+    it("does not escape curly braces", () => {
+      expect(formatForTelegram("{key}")).toBe("{key}");
+    });
+
+    it("does not escape hash outside headings", () => {
+      expect(formatForTelegram("color #fff")).toBe("color #fff");
+    });
+
+    it("does not escape pipe", () => {
+      expect(formatForTelegram("a | b")).toBe("a | b");
+    });
+
+    it("does not escape tilde", () => {
+      expect(formatForTelegram("~approx")).toBe("~approx");
+    });
+
+    it("does not escape square brackets", () => {
+      expect(formatForTelegram("[link]")).toBe("[link]");
+    });
+
+    it("does not escape underscore in plain text", () => {
+      expect(formatForTelegram("my_var")).toBe("my_var");
+    });
+
+    it("does not escape backslash", () => {
+      expect(formatForTelegram("C:\\path")).toBe("C:\\path");
+    });
+
+    it("escapes ampersand", () => {
+      expect(formatForTelegram("a & b")).toBe("a &amp; b");
+    });
+
+    it("escapes less-than", () => {
+      expect(formatForTelegram("a < b")).toBe("a &lt; b");
     });
 
     it("escapes greater-than", () => {
-      expect(formatForTelegram("> quote")).toBe("\\> quote");
+      expect(formatForTelegram("> quote")).toBe("&gt; quote");
     });
 
-    it("escapes hash outside headings", () => {
-      expect(formatForTelegram("color #fff")).toBe("color \\#fff");
-    });
-
-    it("escapes pipe", () => {
-      expect(formatForTelegram("a | b")).toBe("a \\| b");
-    });
-
-    it("escapes tilde", () => {
-      expect(formatForTelegram("~approx")).toBe("\\~approx");
-    });
-
-    it("escapes square brackets", () => {
-      expect(formatForTelegram("[link]")).toBe("\\[link\\]");
-    });
-
-    it("escapes underscore", () => {
-      expect(formatForTelegram("my_var")).toBe("my\\_var");
-    });
-
-    it("escapes backslash", () => {
-      expect(formatForTelegram("C:\\path")).toBe("C:\\\\path");
+    it("real-world billing example has no backslashes", () => {
+      const input = "fly.io $9.39 (Visa ending 1728) cc-tg@0.3.7";
+      expect(formatForTelegram(input)).toBe("fly.io $9.39 (Visa ending 1728) cc-tg@0.3.7");
     });
   });
 
   describe("code block preservation", () => {
-    it("does not escape chars inside fenced code blocks", () => {
+    it("wraps fenced code blocks in <pre>", () => {
       const input = "```\nhello.world (test) + more!\n```";
       const result = formatForTelegram(input);
-      expect(result).toBe("```\nhello.world (test) + more!\n```");
+      expect(result).toBe("<pre>hello.world (test) + more!\n</pre>");
     });
 
-    it("does not escape chars inside inline code", () => {
+    it("wraps inline code in <code>", () => {
       const input = "`my_var.method()`";
       const result = formatForTelegram(input);
-      expect(result).toBe("`my_var.method()`");
+      expect(result).toBe("<code>my_var.method()</code>");
     });
 
-    it("escapes outside code but not inside", () => {
+    it("escapes HTML inside code but does not convert markdown", () => {
       const input = "before (code) `my_var.x` after (end)";
       const result = formatForTelegram(input);
-      expect(result).toBe("before \\(code\\) `my_var.x` after \\(end\\)");
+      expect(result).toBe("before (code) <code>my_var.x</code> after (end)");
     });
 
-    it("preserves code block with language tag", () => {
+    it("wraps code block with language tag in <pre>", () => {
       const input = "```typescript\nconst x: Foo = bar();\n```";
       const result = formatForTelegram(input);
-      expect(result).toBe("```typescript\nconst x: Foo = bar();\n```");
+      expect(result).toBe("<pre>const x: Foo = bar();\n</pre>");
     });
 
     it("does not convert - bullets inside code blocks", () => {
       const input = "```\n- not a bullet\n```";
-      expect(formatForTelegram(input)).toBe("```\n- not a bullet\n```");
+      expect(formatForTelegram(input)).toBe("<pre>- not a bullet\n</pre>");
+    });
+
+    it("escapes HTML special chars inside code blocks", () => {
+      const input = "```\n<div>foo & bar</div>\n```";
+      expect(formatForTelegram(input)).toBe("<pre>&lt;div&gt;foo &amp; bar&lt;/div&gt;\n</pre>");
     });
   });
 
-  describe("html stripping", () => {
-    it("strips HTML tags", () => {
-      expect(formatForTelegram("<b>bold</b>")).toBe("bold");
+  describe("HTML input escaping", () => {
+    it("escapes HTML tags to prevent injection", () => {
+      expect(formatForTelegram("<b>bold</b>")).toBe("&lt;b&gt;bold&lt;/b&gt;");
     });
 
-    it("strips multiple tags", () => {
-      expect(formatForTelegram("<p>Hello <em>world</em></p>")).toBe("Hello world");
+    it("escapes multiple tags", () => {
+      expect(formatForTelegram("<p>Hello <em>world</em></p>")).toBe(
+        "&lt;p&gt;Hello &lt;em&gt;world&lt;/em&gt;&lt;/p&gt;"
+      );
     });
   });
 
@@ -172,12 +209,12 @@ describe("formatForTelegram", () => {
   describe("combined", () => {
     it("handles heading with special chars", () => {
       const result = formatForTelegram("## My Heading - With Dash");
-      expect(result).toBe("*My Heading \\- With Dash*");
+      expect(result).toBe("<b>My Heading - With Dash</b>");
     });
 
     it("handles bold with special chars", () => {
       const result = formatForTelegram("**hello.world**");
-      expect(result).toBe("*hello\\.world*");
+      expect(result).toBe("<b>hello.world</b>");
     });
   });
 });
@@ -250,9 +287,22 @@ describe("splitLongMessage", () => {
     const text = "First paragraph here.\n\nSecond paragraph here.\n\nThird paragraph here.";
     const chunks = splitLongMessage(text, 30);
     const rejoined = chunks.join("\n\n");
-    // All content should be present (whitespace may differ due to trimming)
     expect(rejoined).toContain("First paragraph here");
     expect(rejoined).toContain("Second paragraph here");
     expect(rejoined).toContain("Third paragraph here");
+  });
+
+  it("does not split inside <pre> blocks", () => {
+    // Build a message where the only split point falls inside a <pre> block
+    const preContent = "x".repeat(3000);
+    const text = `<pre>${preContent}</pre>\n\nafter`;
+    // maxLen=3500 — the natural split at 3500 would land inside the <pre>
+    const chunks = splitLongMessage(text, 3500);
+    // Every chunk must not contain an unclosed <pre>
+    for (const chunk of chunks) {
+      const opens = (chunk.match(/<pre>/g) || []).length;
+      const closes = (chunk.match(/<\/pre>/g) || []).length;
+      expect(opens).toBe(closes);
+    }
   });
 });

@@ -623,12 +623,12 @@ export class CcTgBot {
     const text = session.isRetry ? `✅ Claude is back!\n\n${raw}` : raw;
     session.isRetry = false;
 
-    // Format for Telegram MarkdownV2 and split if needed (max 4096 chars)
+    // Format for Telegram HTML and split if needed (max 4096 chars)
     const formatted = formatForTelegram(text);
     const chunks = splitLongMessage(formatted);
     for (const chunk of chunks) {
-      this.bot.sendMessage(chatId, chunk, { parse_mode: "MarkdownV2" }).catch(() => {
-        // MarkdownV2 parse failed — retry as plain text
+      this.bot.sendMessage(chatId, chunk, { parse_mode: "HTML" }).catch(() => {
+        // HTML parse failed — retry as plain text
         this.bot.sendMessage(chatId, chunk).catch((err) =>
           console.error(`[tg:${chatId}] send failed:`, err.message)
         );
@@ -864,9 +864,9 @@ export class CcTgBot {
           (async () => {
             for (const chunk of chunks) {
               try {
-                await this.bot.sendMessage(chatId, chunk, { parse_mode: "MarkdownV2" });
+                await this.bot.sendMessage(chatId, chunk, { parse_mode: "HTML" });
               } catch {
-                // MarkdownV2 parse failed — retry as plain text
+                // HTML parse failed — retry as plain text
                 try {
                   await this.bot.sendMessage(chatId, chunk);
                 } catch (err) {
