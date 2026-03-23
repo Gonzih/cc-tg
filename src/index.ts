@@ -16,10 +16,18 @@
  */
 
 import { createServer, createConnection } from "net";
-import { unlinkSync } from "fs";
+import { unlinkSync, readFileSync } from "fs";
 import { tmpdir } from "os";
-import { join } from "path";
+import os from "os";
+import { join, dirname } from "path";
+import { fileURLToPath } from "url";
 import { CcTgBot } from "./bot.js";
+import { Registry, startControlServer } from "@gonzih/agent-ops";
+import { Redis } from "ioredis";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const pkg = JSON.parse(readFileSync(join(__dirname, "../package.json"), "utf-8")) as { version: string };
 
 // Make lock socket unique per bot token so multiple users on the same machine don't collide
 const _tokenHash = Buffer.from(process.env.TELEGRAM_BOT_TOKEN ?? "default").toString("base64").replace(/[^a-z0-9]/gi, "").slice(0, 16);
@@ -117,6 +125,32 @@ const bot = new CcTgBot({
   allowedUserIds,
   groupChatIds,
 });
+
+// agent-ops: optional self-registration + HTTP control endpoint
+if (process.env.CC_AGENT_OPS_PORT) {
+  const botInfo = await bot.getMe();
+  const redis = new Redis(process.env.REDIS_URL || "redis://localhost:6379");
+  const registry = new Registry(redis);
+  const namespace = process.env.CC_AGENT_NAMESPACE || "default";
+  await registry.register({
+    namespace,
+    hostname: os.hostname(),
+    user: os.userInfo().username,
+    pid: String(process.pid),
+    version: pkg.version,
+    cwd: process.env.CWD || process.cwd(),
+    control_port: process.env.CC_AGENT_OPS_PORT,
+    bot_username: botInfo.username ?? "",
+    started_at: new Date().toISOString(),
+  });
+  setInterval(() => registry.heartbeat(namespace), 60_000);
+  startControlServer(Number(process.env.CC_AGENT_OPS_PORT), {
+    namespace,
+    version: pkg.version,
+    logFile: process.env.CC_AGENT_LOG_FILE || process.env.LOG_FILE,
+  });
+  console.log(`[ops] control server on port ${process.env.CC_AGENT_OPS_PORT}`);
+}
 
 process.on("SIGINT", () => {
   console.log("\nShutting down...");
