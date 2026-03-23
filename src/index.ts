@@ -15,30 +15,48 @@
  *   CWD                  — working directory for Claude Code (default: process.cwd())
  */
 
-import { existsSync, writeFileSync, unlinkSync, readFileSync } from "fs";
+import { createServer, createConnection } from "net";
+import { unlinkSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { CcTgBot } from "./bot.js";
 
-const LOCK_FILE = join(tmpdir(), "cc-tg.lock");
+const LOCK_SOCKET = join(tmpdir(), "cc-tg.sock");
 
-function acquireLock(): boolean {
-  if (existsSync(LOCK_FILE)) {
-    try {
-      const pid = parseInt(readFileSync(LOCK_FILE, "utf8").trim());
-      process.kill(pid, 0);
-      console.error(`[cc-tg] Another instance is already running (PID ${pid}). Exiting.`);
-      return false;
-    } catch {
-      // PID is dead — stale lock, take over
-    }
-  }
-  writeFileSync(LOCK_FILE, String(process.pid));
-  process.on("exit", () => { try { unlinkSync(LOCK_FILE); } catch {} });
-  return true;
+function acquireLock(): Promise<boolean> {
+  return new Promise((resolve) => {
+    const server = createServer();
+
+    server.listen(LOCK_SOCKET, () => {
+      // Bound successfully — we own the lock. Socket auto-released on any exit incl. SIGKILL.
+      resolve(true);
+    });
+
+    server.on("error", (err: NodeJS.ErrnoException) => {
+      if (err.code !== "EADDRINUSE") {
+        resolve(true); // unrelated error, proceed
+        return;
+      }
+      // Socket path exists — probe if anything is actually listening
+      const probe = createConnection(LOCK_SOCKET);
+      probe.on("connect", () => {
+        probe.destroy();
+        console.error("[cc-tg] Another instance is already running. Exiting.");
+        resolve(false);
+      });
+      probe.on("error", () => {
+        // Nothing listening — stale socket, remove and retry
+        try { unlinkSync(LOCK_SOCKET); } catch {}
+        const retry = createServer();
+        retry.listen(LOCK_SOCKET, () => resolve(true));
+        retry.on("error", () => resolve(true)); // give up on lock, just start
+      });
+    });
+  });
 }
 
-if (!acquireLock()) {
+const lockAcquired = await acquireLock();
+if (!lockAcquired) {
   process.exit(1);
 }
 
