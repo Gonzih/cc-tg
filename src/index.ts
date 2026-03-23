@@ -21,7 +21,9 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { CcTgBot } from "./bot.js";
 
-const LOCK_SOCKET = join(tmpdir(), "cc-tg.sock");
+// Make lock socket unique per bot token so multiple users on the same machine don't collide
+const _tokenHash = Buffer.from(process.env.TELEGRAM_BOT_TOKEN ?? "default").toString("base64").replace(/[^a-z0-9]/gi, "").slice(0, 16);
+const LOCK_SOCKET = join(tmpdir(), `cc-tg-${_tokenHash}.sock`);
 
 function acquireLock(): Promise<boolean> {
   return new Promise((resolve) => {
