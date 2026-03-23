@@ -1124,29 +1124,50 @@ export class CcTgBot {
   }
 
   private async handleClearNpxCache(chatId: number): Promise<void> {
-    try {
-      const home = process.env.HOME ?? "~";
-      execSync(`rm -rf "${home}/.npm/_npx/"`, { encoding: "utf8", shell: "/bin/sh" });
-      console.log("[mcp] cleared ~/.npm/_npx/");
-    } catch (err) {
-      await this.bot.sendMessage(chatId, `Failed to clear npx cache: ${(err as Error).message}`);
-      return;
+    const home = process.env.HOME ?? "/tmp";
+    const cleared: string[] = [];
+    const failed: string[] = [];
+
+    // Clear both npx execution cache and full npm package cache
+    for (const dir of [`${home}/.npm/_npx`, `${home}/.npm/cache`]) {
+      try {
+        execSync(`rm -rf "${dir}"`, { encoding: "utf8", shell: "/bin/sh" });
+        cleared.push(dir.replace(home, "~"));
+        console.log(`[cache] cleared ${dir}`);
+      } catch (err) {
+        failed.push(dir.replace(home, "~"));
+        console.warn(`[cache] failed to clear ${dir}:`, (err as Error).message);
+      }
     }
 
     const pids = this.killCcAgent();
     const pidNote = pids.length > 0
-      ? ` Sent SIGTERM to pid${pids.length > 1 ? "s" : ""}: ${pids.join(", ")}.`
-      : " No cc-agent process found (will start fresh on next call).";
+      ? ` Sent SIGTERM to cc-agent pid${pids.length > 1 ? "s" : ""}: ${pids.join(", ")}.`
+      : " No cc-agent running.";
 
-    await this.bot.sendMessage(
-      chatId,
-      `NPX cache cleared and MCP restarted.${pidNote} Will pick up latest npm version on next call.`
-    );
+    const clearNote = failed.length
+      ? `Cleared: ${cleared.join(", ")}. Failed: ${failed.join(", ")}.`
+      : `Cleared: ${cleared.join(", ")}.`;
+
+    await this.bot.sendMessage(chatId, `${clearNote}${pidNote} Next call picks up latest npm version.`);
   }
 
   private async handleRestart(chatId: number): Promise<void> {
-    await this.bot.sendMessage(chatId, "Restarting... brb.");
-    await new Promise(resolve => setTimeout(resolve, 500));
+    await this.bot.sendMessage(chatId, "Clearing cache and restarting... brb.");
+    await new Promise(resolve => setTimeout(resolve, 300));
+
+    // Clear npm caches before restart so launchd brings up fresh version
+    const home = process.env.HOME ?? "/tmp";
+    for (const dir of [`${home}/.npm/_npx`, `${home}/.npm/cache`]) {
+      try { execSync(`rm -rf "${dir}"`, { shell: "/bin/sh" }); } catch {}
+    }
+
+    // Kill all active Claude sessions cleanly
+    for (const [cid] of this.sessions) {
+      this.killSession(cid);
+    }
+
+    await new Promise(resolve => setTimeout(resolve, 200));
     process.exit(0);
   }
 
