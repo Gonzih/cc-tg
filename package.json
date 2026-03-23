@@ -18,6 +18,7 @@
     "dist/"
   ],
   "dependencies": {
+    "@gonzih/agent-ops": "^0.1.0",
     "node-telegram-bot-api": "^0.66.0"
   },
   "devDependencies": {

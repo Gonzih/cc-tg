@@ -1295,6 +1295,10 @@ export class CcTgBot {
     if (!keepCrons) this.cron.clearAll(chatId);
   }
 
+  getMe(): Promise<TelegramBot.User> {
+    return this.bot.getMe();
+  }
+
   stop(): void {
     this.bot.stopPolling();
     for (const [chatId] of this.sessions) {
