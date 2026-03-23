@@ -11,6 +11,7 @@
  *
  * Optional env:
  *   ALLOWED_USER_IDS     — comma-separated Telegram user IDs (leave empty to allow all)
+ *   GROUP_CHAT_IDS       — comma-separated Telegram group/supergroup chat IDs (leave empty to allow all groups)
  *   CWD                  — working directory for Claude Code (default: process.cwd())
  */
 
@@ -83,6 +84,10 @@ const allowedUserIds = process.env.ALLOWED_USER_IDS
   ? process.env.ALLOWED_USER_IDS.split(",").map((s) => parseInt(s.trim(), 10)).filter(Boolean)
   : [];
 
+const groupChatIds = process.env.GROUP_CHAT_IDS
+  ? process.env.GROUP_CHAT_IDS.split(",").map((s) => parseInt(s.trim(), 10)).filter(Boolean)
+  : [];
+
 const cwd = process.env.CWD ?? process.cwd();
 
 const bot = new CcTgBot({
@@ -90,6 +95,7 @@ const bot = new CcTgBot({
   claudeToken,
   cwd,
   allowedUserIds,
+  groupChatIds,
 });
 
 process.on("SIGINT", () => {
