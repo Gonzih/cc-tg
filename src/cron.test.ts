@@ -77,16 +77,48 @@ describe('CronManager operations', () => {
     });
 
     it('fires callback at the specified interval', () => {
+      fireCallback.mockImplementation((_chatId, _prompt, _jobId, done) => done());
       manager.add(42, 'every 1m', 'ping');
       expect(fireCallback).not.toHaveBeenCalled();
       vi.advanceTimersByTime(60_000);
-      expect(fireCallback).toHaveBeenCalledWith(42, 'ping');
+      expect(fireCallback).toHaveBeenCalledWith(42, 'ping', expect.any(String), expect.any(Function));
     });
 
-    it('fires callback multiple times', () => {
+    it('fires callback multiple times when each task completes before the next tick', () => {
+      fireCallback.mockImplementation((_chatId, _prompt, _jobId, done) => done());
       manager.add(42, 'every 1m', 'check');
       vi.advanceTimersByTime(180_000);
       expect(fireCallback).toHaveBeenCalledTimes(3);
+    });
+
+    it('skips concurrent ticks while the previous task is still running', () => {
+      // Don't call done() — simulate a long-running task
+      manager.add(42, 'every 1m', 'slow-task');
+      // First tick fires the task (done not called yet)
+      vi.advanceTimersByTime(60_000);
+      expect(fireCallback).toHaveBeenCalledTimes(1);
+      // Second and third ticks should be skipped because done() was never called
+      vi.advanceTimersByTime(120_000);
+      expect(fireCallback).toHaveBeenCalledTimes(1);
+    });
+
+    it('resumes firing after done() is called', () => {
+      let capturedDone: (() => void) | null = null;
+      fireCallback.mockImplementation((_chatId, _prompt, _jobId, done) => {
+        capturedDone = done;
+      });
+      manager.add(42, 'every 1m', 'task');
+      // First tick: task starts, done not called
+      vi.advanceTimersByTime(60_000);
+      expect(fireCallback).toHaveBeenCalledTimes(1);
+      // Second tick: still running, skipped
+      vi.advanceTimersByTime(60_000);
+      expect(fireCallback).toHaveBeenCalledTimes(1);
+      // Task finishes
+      capturedDone!();
+      // Third tick: now allowed
+      vi.advanceTimersByTime(60_000);
+      expect(fireCallback).toHaveBeenCalledTimes(2);
     });
   });
 
@@ -193,10 +225,11 @@ describe('CronManager operations', () => {
     });
 
     it('fires updated prompt after schedule update', () => {
+      fireCallback.mockImplementation((_chatId, _prompt, _jobId, done) => done());
       const job = manager.add(42, 'every 1m', 'old prompt')!;
       manager.update(42, job.id, { prompt: 'new prompt', schedule: 'every 2m' });
       vi.advanceTimersByTime(120_000);
-      expect(fireCallback).toHaveBeenCalledWith(42, 'new prompt');
+      expect(fireCallback).toHaveBeenCalledWith(42, 'new prompt', expect.any(String), expect.any(Function));
     });
   });
 });
