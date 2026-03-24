@@ -16,10 +16,16 @@ export interface CronJob {
   schedule: string; // human-readable, e.g. "every 1h"
 }
 
-type FireCallback = (chatId: number, prompt: string) => void;
+/** Called when a job fires. `done` must be called when the task completes so
+ *  the next scheduled tick is allowed to run. Until `done` is called, concurrent
+ *  ticks for the same job are silently skipped (prevents the resume-loop explosion
+ *  where each tick spawns more agents than the last). */
+type FireCallback = (chatId: number, prompt: string, jobId: string, done: () => void) => void;
 
 export class CronManager {
   private jobs = new Map<string, CronJob & { timer: ReturnType<typeof setInterval> }>();
+  /** Job IDs whose fire callback has been invoked but whose `done` hasn't fired yet. */
+  private activeJobs = new Set<string>();
   private storePath: string;
   private fire: FireCallback;
 
@@ -49,8 +55,13 @@ export class CronManager {
     const job: CronJob = { id, chatId, intervalMs, prompt, schedule, createdAt: new Date().toISOString() };
 
     const timer = setInterval(() => {
+      if (this.activeJobs.has(id)) {
+        console.log(`[cron:${id}] skipping tick — previous task still running`);
+        return;
+      }
+      this.activeJobs.add(id);
       console.log(`[cron:${id}] firing for chat=${chatId} prompt="${prompt}"`);
-      this.fire(chatId, prompt);
+      this.fire(chatId, prompt, id, () => { this.activeJobs.delete(id); });
     }, intervalMs);
 
     this.jobs.set(id, { ...job, timer });
@@ -62,6 +73,7 @@ export class CronManager {
     const job = this.jobs.get(id);
     if (!job || job.chatId !== chatId) return false;
     clearInterval(job.timer);
+    this.activeJobs.delete(id);
     this.jobs.delete(id);
     this.persist();
     return true;
@@ -72,6 +84,7 @@ export class CronManager {
     for (const [id, job] of this.jobs) {
       if (job.chatId === chatId) {
         clearInterval(job.timer);
+        this.activeJobs.delete(id);
         this.jobs.delete(id);
         count++;
       }
@@ -103,9 +116,16 @@ export class CronManager {
 
     // Recreate timer so it uses updated intervalMs and always reads latest job.prompt
     clearInterval(job.timer);
+    // Also clear any active-job lock so the updated timer can fire immediately next tick
+    this.activeJobs.delete(job.id);
     job.timer = setInterval(() => {
+      if (this.activeJobs.has(job.id)) {
+        console.log(`[cron:${job.id}] skipping tick — previous task still running`);
+        return;
+      }
+      this.activeJobs.add(job.id);
       console.log(`[cron:${job.id}] firing for chat=${job.chatId} prompt="${job.prompt}"`);
-      this.fire(job.chatId, job.prompt);
+      this.fire(job.chatId, job.prompt, job.id, () => { this.activeJobs.delete(job.id); });
     }, job.intervalMs);
 
     this.persist();
@@ -130,8 +150,13 @@ export class CronManager {
       const data = JSON.parse(readFileSync(this.storePath, "utf8")) as CronJob[];
       for (const job of data) {
         const timer = setInterval(() => {
+          if (this.activeJobs.has(job.id)) {
+            console.log(`[cron:${job.id}] skipping tick — previous task still running`);
+            return;
+          }
+          this.activeJobs.add(job.id);
           console.log(`[cron:${job.id}] firing for chat=${job.chatId} prompt="${job.prompt}"`);
-          this.fire(job.chatId, job.prompt);
+          this.fire(job.chatId, job.prompt, job.id, () => { this.activeJobs.delete(job.id); });
         }, job.intervalMs);
         this.jobs.set(job.id, { ...job, timer });
       }

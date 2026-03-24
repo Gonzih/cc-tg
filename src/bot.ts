@@ -221,9 +221,11 @@ export class CcTgBot {
       console.log(`[tg] bot identity: @${this.botUsername} (id=${this.botId})`);
     }).catch((err: Error) => console.error("[tg] getMe failed:", err.message));
 
-    // Cron manager — fires each task into an isolated ClaudeProcess
-    this.cron = new CronManager(opts.cwd ?? process.cwd(), (chatId, prompt) => {
-      this.runCronTask(chatId, prompt);
+    // Cron manager — fires each task into an isolated ClaudeProcess.
+    // The `done` callback is passed through to runCronTask so the cron manager
+    // knows when a task finishes and can allow the next tick to run.
+    this.cron = new CronManager(opts.cwd ?? process.cwd(), (chatId, prompt, jobId, done) => {
+      this.runCronTask(chatId, prompt, done);
     });
 
     this.costStore = new CostStore(opts.cwd ?? process.cwd());
@@ -820,7 +822,7 @@ export class CcTgBot {
     return (toolUse?.name as string) ?? "";
   }
 
-  private runCronTask(chatId: number, prompt: string): void {
+  private runCronTask(chatId: number, prompt: string, done: () => void = () => {}): void {
     // Fresh isolated Claude session — never touches main conversation
     const cronProcess = new ClaudeProcess({
       cwd: this.opts.cwd,
@@ -884,10 +886,12 @@ export class CcTgBot {
     cronProcess.on("error", (err: Error) => {
       console.error(`[cron] task error for chat=${chatId}:`, err.message);
       cronProcess.kill();
+      done();
     });
 
     cronProcess.on("exit", () => {
       console.log(`[cron] task complete for chat=${chatId}`);
+      done();
     });
 
     cronProcess.sendPrompt(taskPrompt);
