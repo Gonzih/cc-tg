@@ -25,6 +25,7 @@ Open your bot in Telegram and start chatting.
 | `TELEGRAM_BOT_TOKEN` | yes | From @BotFather |
 | `CLAUDE_CODE_TOKEN` | yes* | Claude Code OAuth token (starts with `sk-ant-oat`) |
 | `CLAUDE_CODE_OAUTH_TOKEN` | yes* | Alias for `CLAUDE_CODE_TOKEN` |
+| `CLAUDE_CODE_OAUTH_TOKENS` | no | Comma-separated OAuth tokens for rotation — e.g. `token1,token2,token3`. When one account hits its usage limit, automatically switches to the next token instead of sleeping. |
 | `ANTHROPIC_API_KEY` | yes* | Alternative — API key from console.anthropic.com |
 | `ALLOWED_USER_IDS` | no | Comma-separated Telegram user IDs. Leave empty to allow anyone |
 | `CWD` | no | Working directory for Claude Code. Defaults to current directory |
@@ -157,6 +158,9 @@ cc-tg works with the [cc-agent](https://github.com/Gonzih/cc-agent) MCP server t
         <string>your_token</string>
         <key>CLAUDE_CODE_TOKEN</key>
         <string>your_claude_token</string>
+        <!-- Optional: comma-separated OAuth tokens for automatic rotation on usage limit -->
+        <!-- <key>CLAUDE_CODE_OAUTH_TOKENS</key> -->
+        <!-- <string>token1,token2,token3</string> -->
         <key>ALLOWED_USER_IDS</key>
         <string>your_telegram_id</string>
         <key>CWD</key>

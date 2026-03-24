@@ -15,6 +15,7 @@ import { transcribeVoice, isVoiceAvailable } from "./voice.js";
 import { CronManager } from "./cron.js";
 import { formatForTelegram, splitLongMessage } from "./formatter.js";
 import { detectUsageLimit } from "./usage-limit.js";
+import { getCurrentToken, rotateToken, getTokenIndex, getTokenCount } from "./tokens.js";
 
 const BOT_COMMANDS: Array<{ command: string; description: string }> = [
   { command: "start", description: "Reset session and start fresh" },
@@ -495,7 +496,7 @@ export class CcTgBot {
 
     const claude = new ClaudeProcess({
       cwd: this.opts.cwd,
-      token: this.opts.claudeToken,
+      token: getCurrentToken() || this.opts.claudeToken,
     });
 
     const session: Session = {
@@ -568,6 +569,30 @@ export class CcTgBot {
 
       this.bot.sendMessage(chatId, sig.humanMessage).catch(() => {});
       this.killSession(chatId);
+
+      // Token rotation: if this is a usage_exhausted signal and we have multiple
+      // tokens, rotate to the next one and retry immediately instead of sleeping.
+      // Only rotate if we haven't yet cycled through all tokens (attempt <= count-1).
+      if (sig.reason === "usage_exhausted" && getTokenCount() > 1 && attempt <= getTokenCount() - 1) {
+        const prevIdx = getTokenIndex();
+        rotateToken();
+        const newIdx = getTokenIndex();
+        const total = getTokenCount();
+        console.log(`[cc-tg] Token ${prevIdx + 1}/${total} exhausted, rotating to token ${newIdx + 1}/${total}`);
+        this.bot.sendMessage(chatId, `🔄 Token ${prevIdx + 1}/${total} exhausted, switching to token ${newIdx + 1}/${total}...`).catch(() => {});
+
+        this.pendingRetries.set(chatId, { text: lastPrompt, attempt, timer: setTimeout(() => {}, 0) });
+        try {
+          const retrySession = this.getOrCreateSession(chatId);
+          retrySession.currentPrompt = lastPrompt;
+          retrySession.isRetry = true;
+          retrySession.claude.sendPrompt(lastPrompt);
+          this.startTyping(chatId, retrySession);
+        } catch (err) {
+          this.bot.sendMessage(chatId, `❌ Failed to retry with rotated token: ${(err as Error).message}`).catch(() => {});
+        }
+        return;
+      }
 
       if (attempt > 3) {
         this.bot.sendMessage(chatId, "❌ Claude usage limit persists after 3 retries. Please try again later.").catch(() => {});
