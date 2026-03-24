@@ -834,6 +834,11 @@ export class CcTgBot {
       "This is NOT part of the user's ongoing conversation.",
       "Be concise. Report results only. No greetings or pleasantries.",
       "If there is nothing to report, say so in one sentence.",
+      "DEDUP RULE: If this task involves resuming or restarting interrupted agents/jobs,",
+      "  skip any job whose task description already starts with 'RESUMING' (it is already",
+      "  a resume attempt). Also skip any job that has a non-empty 'resumed_by' field.",
+      "  Only spawn a resume agent for a job if resume_count < 2 (when that field exists).",
+      "  This prevents exponential job growth when a cron re-discovers its own spawned agents.",
       "",
       `SCHEDULED TASK: ${prompt}`,
     ].join("\n");
