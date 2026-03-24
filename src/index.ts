@@ -22,6 +22,7 @@ import os from "os";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { CcTgBot } from "./bot.js";
+import { loadTokens, getTokenCount } from "./tokens.js";
 import { Registry, startControlServer } from "@gonzih/agent-ops";
 import { Redis } from "ioredis";
 
@@ -106,6 +107,12 @@ Set one and run again:
   TELEGRAM_BOT_TOKEN=xxx CLAUDE_CODE_TOKEN=yyy npx @gonzih/cc-tg
 `);
   process.exit(1);
+}
+
+// Load OAuth token pool (supports CLAUDE_CODE_OAUTH_TOKENS for multi-account rotation)
+const tokenPool = loadTokens();
+if (tokenPool.length > 1) {
+  console.log(`[cc-tg] Token pool loaded: ${tokenPool.length} tokens — will rotate on usage limit`);
 }
 
 const allowedUserIds = process.env.ALLOWED_USER_IDS
