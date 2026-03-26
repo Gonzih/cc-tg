@@ -29,6 +29,7 @@ Open your bot in Telegram and start chatting.
 | `ANTHROPIC_API_KEY` | yes* | Alternative — API key from console.anthropic.com |
 | `ALLOWED_USER_IDS` | no | Comma-separated Telegram user IDs. Leave empty to allow anyone |
 | `CWD` | no | Working directory for Claude Code. Defaults to current directory |
+| `THREAD_CWD_MAP` | no | JSON mapping of forum topic names or IDs to CWD paths (see [Multi-topic sessions](#multi-topic-sessions)) |
 
 *One of `CLAUDE_CODE_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, or `ANTHROPIC_API_KEY` required.
 
@@ -117,6 +118,37 @@ Manage the cc-agent MCP server from Telegram without SSH:
 
 ### Self-restart
 `/restart` — spawns a detached child process with the same Node binary and args, sends you a confirmation message, then exits. The new process inherits all environment variables. No SSH required to restart the bot after updates.
+
+### Multi-topic sessions
+
+When you use cc-tg in a **Telegram group with Topics enabled** (a "Forum" group), each topic gets its own **isolated Claude Code session**. One bot token, one daemon, unlimited isolated project contexts.
+
+**How it works:**
+- Session key = `chatId:threadId` for forum topics
+- Session key = `chatId:main` for direct messages and non-topic groups (backward compatible)
+- Commands like `/reset`, `/stop`, `/status` are scoped to the current topic
+
+**Setup:**
+1. Create a Telegram group → Settings → Topics → Enable
+2. Create topics for each project (e.g. "Simorgh", "LeWM", "EcoClaw")
+3. Each topic now has its own isolated Claude context
+
+**Optional: route topics to different working directories**
+
+Set `THREAD_CWD_MAP` to a JSON string mapping topic names (or thread IDs) to absolute paths:
+
+```bash
+THREAD_CWD_MAP='{"Simorgh":"/Users/you/simorgh-app","LeWM":"/Users/you/le-wm","EcoClaw":"/Users/you/ecoclaw"}'
+```
+
+When cc-tg creates a new session for a topic, it looks up the topic name in this map and starts Claude in the corresponding directory. If no match is found, falls back to `CWD`.
+
+You can also map by numeric thread ID:
+```bash
+THREAD_CWD_MAP='{"12345":"/Users/you/project-a","67890":"/Users/you/project-b"}'
+```
+
+If `THREAD_CWD_MAP` is not set, all topics share the same CWD — context isolation still works, just without directory routing.
 
 ### Typing indicator
 While Claude is working, the bot sends a continuous typing indicator. Works for both regular messages and cron job execution.

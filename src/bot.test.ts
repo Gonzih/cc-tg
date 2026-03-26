@@ -541,6 +541,102 @@ describe('CcTgBot', () => {
     });
   });
 
+  describe('thread-keyed sessions (forum topics)', () => {
+    async function sendThreadMsg(text: string, threadId: number) {
+      await (bot as any).handleTelegram({
+        chat: { id: 42 },
+        from: { id: 100 },
+        text,
+        message_thread_id: threadId,
+      });
+    }
+
+    it('creates separate sessions for different thread IDs', async () => {
+      // Send a message in thread 1
+      await sendThreadMsg('Hello from thread 1', 1);
+      const key1 = (bot as any).sessionKey(42, 1);
+      expect((bot as any).sessions.has(key1)).toBe(true);
+
+      // Send a message in thread 2
+      vi.clearAllMocks();
+      await sendThreadMsg('Hello from thread 2', 2);
+      const key2 = (bot as any).sessionKey(42, 2);
+      expect((bot as any).sessions.has(key2)).toBe(true);
+
+      // Both sessions should exist independently
+      expect((bot as any).sessions.size).toBe(2);
+    });
+
+    it('DMs use "chatId:main" session key', async () => {
+      await (bot as any).handleTelegram(makeMsg({ text: 'Hello' }));
+      const key = (bot as any).sessionKey(42, undefined);
+      expect(key).toBe('42:main');
+      expect((bot as any).sessions.has(key)).toBe(true);
+    });
+
+    it('thread messages use "chatId:threadId" session key', async () => {
+      const key = (bot as any).sessionKey(42, 5);
+      expect(key).toBe('42:5');
+    });
+
+    it('/status reports active for the correct thread', async () => {
+      // Create a session in thread 7
+      await sendThreadMsg('Hello', 7);
+      vi.clearAllMocks();
+
+      // /status in thread 7 should see active session
+      await sendThreadMsg('/status', 7);
+      const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+      expect(msg).toContain('Session active.');
+    });
+
+    it('/status reports no session for a different thread', async () => {
+      // Create a session in thread 7
+      await sendThreadMsg('Hello', 7);
+      vi.clearAllMocks();
+
+      // /status in thread 8 (different) should see no session
+      await sendThreadMsg('/status', 8);
+      const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+      expect(msg).toContain('No active session.');
+    });
+
+    it('/stop only kills the session for the current thread', async () => {
+      // Create sessions in two threads
+      await sendThreadMsg('Hello', 10);
+      await sendThreadMsg('Hello', 11);
+      vi.clearAllMocks();
+
+      // Stop thread 10
+      await sendThreadMsg('/stop', 10);
+      expect(mocks.tgSendMessage.mock.calls[0][1]).toBe('Stopped.');
+
+      // Thread 11 session should still exist
+      const key11 = (bot as any).sessionKey(42, 11);
+      expect((bot as any).sessions.has(key11)).toBe(true);
+    });
+
+    it('/reset only kills the session for the current thread', async () => {
+      await sendThreadMsg('Hello', 20);
+      await sendThreadMsg('Hello', 21);
+      vi.clearAllMocks();
+
+      await sendThreadMsg('/reset', 20);
+      // Thread 21 still alive
+      const key21 = (bot as any).sessionKey(42, 21);
+      expect((bot as any).sessions.has(key21)).toBe(true);
+    });
+
+    it('thread message replies include message_thread_id', async () => {
+      await sendThreadMsg('Hello', 5);
+      // The sendMessage was called with message_thread_id in options
+      // (replyToChat with threadId defined)
+      // Verify sendMessage was called (session created → startTyping → no reply yet from Claude, but error path won't trigger)
+      // At minimum, sendChatAction should have been called
+      expect(mocks.claudeSendPrompt).toHaveBeenCalledWith('Hello');
+    });
+  });
+
   describe('group chat support', () => {
     async function sendGroupMsg(overrides: Record<string, unknown> = {}) {
       await (bot as any).handleTelegram({

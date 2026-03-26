@@ -53,6 +53,8 @@ interface Session {
   currentPrompt: string;
   /** When true, prepend "✅ Claude is back!" to the next flushed response */
   isRetry: boolean;
+  /** Forum topic thread_id (undefined for DMs and non-topic groups) */
+  threadId?: number;
 }
 
 interface PendingRetry {
@@ -202,8 +204,8 @@ class CostStore {
 
 export class CcTgBot {
   private bot: TelegramBot;
-  private sessions = new Map<number, Session>();
-  private pendingRetries = new Map<number, PendingRetry>();
+  private sessions = new Map<string, Session>();
+  private pendingRetries = new Map<string, PendingRetry>();
   private opts: BotOptions;
   private cron: CronManager;
   private costStore: CostStore;
@@ -243,6 +245,38 @@ export class CcTgBot {
       .catch((err: Error) => console.error("[tg] setMyCommands failed:", err.message));
   }
 
+  /** Session key: "chatId:threadId" for topics, "chatId:main" for DMs/non-topic groups */
+  private sessionKey(chatId: number, threadId?: number): string {
+    return `${chatId}:${threadId ?? 'main'}`;
+  }
+
+  /**
+   * Send a message back to the correct thread (or plain chat if no thread).
+   * When threadId is undefined, calls sendMessage with exactly 2 args to preserve
+   * backward-compatible call signatures (no extra options object).
+   */
+  private replyToChat(chatId: number, text: string, threadId?: number, opts?: TelegramBot.SendMessageOptions): Promise<TelegramBot.Message> {
+    if (threadId !== undefined) {
+      return this.bot.sendMessage(chatId, text, { ...opts, message_thread_id: threadId } as TelegramBot.SendMessageOptions);
+    }
+    if (opts) {
+      return this.bot.sendMessage(chatId, text, opts);
+    }
+    return this.bot.sendMessage(chatId, text);
+  }
+
+  /** Parse THREAD_CWD_MAP env var — maps thread name or thread_id to a CWD path */
+  private getThreadCwdMap(): Record<string, string> {
+    const raw = process.env.THREAD_CWD_MAP;
+    if (!raw) return {};
+    try {
+      return JSON.parse(raw) as Record<string, string>;
+    } catch {
+      console.warn('[cc-tg] THREAD_CWD_MAP is not valid JSON, ignoring');
+      return {};
+    }
+  }
+
   private isAllowed(userId: number): boolean {
     if (!this.opts.allowedUserIds?.length) return true;
     return this.opts.allowedUserIds.includes(userId);
@@ -251,9 +285,17 @@ export class CcTgBot {
   private async handleTelegram(msg: TelegramBot.Message): Promise<void> {
     const chatId = msg.chat.id;
     const userId = msg.from?.id ?? chatId;
+    // Forum topic thread_id — undefined for DMs and non-topic group messages
+    const threadId = msg.message_thread_id;
+    // Thread name is available on the service message that creates a new topic.
+    // forum_topic_created is not in older @types/node-telegram-bot-api versions, so cast via unknown.
+    const rawMsg = msg as unknown as Record<string, unknown>;
+    const threadName = rawMsg.forum_topic_created
+      ? (rawMsg.forum_topic_created as Record<string, unknown>).name as string | undefined
+      : undefined;
 
     if (!this.isAllowed(userId)) {
-      await this.bot.sendMessage(chatId, "Not authorized.");
+      await this.replyToChat(chatId, "Not authorized.", threadId);
       return;
     }
 
@@ -276,19 +318,19 @@ export class CcTgBot {
 
     // Voice message — transcribe then feed as text
     if (msg.voice || msg.audio) {
-      await this.handleVoice(chatId, msg);
+      await this.handleVoice(chatId, msg, threadId, threadName);
       return;
     }
 
     // Photo — send as base64 image content block to Claude
     if (msg.photo?.length) {
-      await this.handlePhoto(chatId, msg);
+      await this.handlePhoto(chatId, msg, threadId, threadName);
       return;
     }
 
     // Document — download to CWD/.cc-tg/uploads/, tell Claude the path
     if (msg.document) {
-      await this.handleDocument(chatId, msg);
+      await this.handleDocument(chatId, msg, threadId, threadName);
       return;
     }
 
@@ -301,77 +343,79 @@ export class CcTgBot {
       text = text.replace(new RegExp(`@${this.botUsername}\\s*`, "g"), "").trim();
     }
 
+    const sessionKey = this.sessionKey(chatId, threadId);
+
     // /start or /reset — kill existing session and ack
     if (text === "/start" || text === "/reset") {
-      this.killSession(chatId);
-      await this.bot.sendMessage(chatId, "Session reset. Send a message to start.");
+      this.killSession(chatId, true, threadId);
+      await this.replyToChat(chatId, "Session reset. Send a message to start.", threadId);
       return;
     }
 
     // /stop — kill active session (interrupt running Claude task)
     if (text === "/stop") {
-      const has = this.sessions.has(chatId);
-      this.killSession(chatId);
-      await this.bot.sendMessage(chatId, has ? "Stopped." : "No active session.");
+      const has = this.sessions.has(sessionKey);
+      this.killSession(chatId, true, threadId);
+      await this.replyToChat(chatId, has ? "Stopped." : "No active session.", threadId);
       return;
     }
 
     // /help — list all commands
     if (text === "/help") {
       const lines = BOT_COMMANDS.map((c) => `/${c.command} — ${c.description}`);
-      await this.bot.sendMessage(chatId, lines.join("\n"));
+      await this.replyToChat(chatId, lines.join("\n"), threadId);
       return;
     }
 
     // /status
     if (text === "/status") {
-      const has = this.sessions.has(chatId);
+      const has = this.sessions.has(sessionKey);
       let status = has ? "Session active." : "No active session.";
       const sleeping = this.pendingRetries.size;
       if (sleeping > 0) status += `\n⏸ ${sleeping} request(s) sleeping (usage limit).`;
-      await this.bot.sendMessage(chatId, status);
+      await this.replyToChat(chatId, status, threadId);
       return;
     }
 
     // /cron <schedule> <prompt> | /cron list | /cron clear | /cron remove <id>
     if (text.startsWith("/cron")) {
-      await this.handleCron(chatId, text);
+      await this.handleCron(chatId, text, threadId);
       return;
     }
 
     // /reload_mcp — kill cc-agent process so Claude Code auto-restarts it
     if (text === "/reload_mcp") {
-      await this.handleReloadMcp(chatId);
+      await this.handleReloadMcp(chatId, threadId);
       return;
     }
 
     // /mcp_status — run `claude mcp list` and show connection status
     if (text === "/mcp_status") {
-      await this.handleMcpStatus(chatId);
+      await this.handleMcpStatus(chatId, threadId);
       return;
     }
 
     // /mcp_version — show published npm version and cached npx entries
     if (text === "/mcp_version") {
-      await this.handleMcpVersion(chatId);
+      await this.handleMcpVersion(chatId, threadId);
       return;
     }
 
     // /clear_npx_cache — wipe ~/.npm/_npx/ then restart cc-agent
     if (text === "/clear_npx_cache") {
-      await this.handleClearNpxCache(chatId);
+      await this.handleClearNpxCache(chatId, threadId);
       return;
     }
 
     // /restart — restart the bot process in-place
     if (text === "/restart") {
-      await this.handleRestart(chatId);
+      await this.handleRestart(chatId, threadId);
       return;
     }
 
     // /get_file <path> — send a file from the server to the user
     if (text.startsWith("/get_file")) {
-      await this.handleGetFile(chatId, text);
+      await this.handleGetFile(chatId, text, threadId);
       return;
     }
 
@@ -387,23 +431,23 @@ export class CcTgBot {
       } catch (err) {
         console.error("[cost] cc-agent cost_summary failed:", (err as Error).message);
       }
-      await this.bot.sendMessage(chatId, reply);
+      await this.replyToChat(chatId, reply, threadId);
       return;
     }
 
-    const session = this.getOrCreateSession(chatId);
+    const session = this.getOrCreateSession(chatId, threadId, threadName);
     try {
       const prompt = buildPromptWithReplyContext(text, msg);
       session.currentPrompt = prompt;
       session.claude.sendPrompt(prompt);
       this.startTyping(chatId, session);
     } catch (err) {
-      await this.bot.sendMessage(chatId, `Error sending to Claude: ${(err as Error).message}`);
-      this.killSession(chatId);
+      await this.replyToChat(chatId, `Error sending to Claude: ${(err as Error).message}`, threadId);
+      this.killSession(chatId, true, threadId);
     }
   }
 
-  private async handleVoice(chatId: number, msg: TelegramBot.Message): Promise<void> {
+  private async handleVoice(chatId: number, msg: TelegramBot.Message, threadId?: number, threadName?: string): Promise<void> {
     const fileId = msg.voice?.file_id ?? msg.audio?.file_id;
     if (!fileId) return;
 
@@ -416,28 +460,28 @@ export class CcTgBot {
       console.log(`[voice:${chatId}] transcribed: ${transcript}`);
 
       if (!transcript || transcript === "[empty transcription]") {
-        await this.bot.sendMessage(chatId, "Could not transcribe voice message.");
+        await this.replyToChat(chatId, "Could not transcribe voice message.", threadId);
         return;
       }
 
       // Feed transcript into Claude as if user typed it
-      const session = this.getOrCreateSession(chatId);
+      const session = this.getOrCreateSession(chatId, threadId, threadName);
       try {
         const prompt = buildPromptWithReplyContext(transcript, msg);
         session.currentPrompt = prompt;
         session.claude.sendPrompt(prompt);
         this.startTyping(chatId, session);
       } catch (err) {
-        await this.bot.sendMessage(chatId, `Error sending to Claude: ${(err as Error).message}`);
-        this.killSession(chatId);
+        await this.replyToChat(chatId, `Error sending to Claude: ${(err as Error).message}`, threadId);
+        this.killSession(chatId, true, threadId);
       }
     } catch (err) {
       console.error(`[voice:${chatId}] error:`, (err as Error).message);
-      await this.bot.sendMessage(chatId, `Voice transcription failed: ${(err as Error).message}`);
+      await this.replyToChat(chatId, `Voice transcription failed: ${(err as Error).message}`, threadId);
     }
   }
 
-  private async handlePhoto(chatId: number, msg: TelegramBot.Message): Promise<void> {
+  private async handlePhoto(chatId: number, msg: TelegramBot.Message, threadId?: number, threadName?: string): Promise<void> {
     // Pick highest resolution photo
     const photos = msg.photo!;
     const best = photos[photos.length - 1];
@@ -450,16 +494,16 @@ export class CcTgBot {
       const fileLink = await this.bot.getFileLink(best.file_id);
       const imageData = await fetchAsBase64(fileLink);
       // Telegram photos are always JPEG
-      const session = this.getOrCreateSession(chatId);
+      const session = this.getOrCreateSession(chatId, threadId, threadName);
       session.claude.sendImage(imageData, "image/jpeg", caption);
       this.startTyping(chatId, session);
     } catch (err) {
       console.error(`[photo:${chatId}] error:`, (err as Error).message);
-      await this.bot.sendMessage(chatId, `Failed to process image: ${(err as Error).message}`);
+      await this.replyToChat(chatId, `Failed to process image: ${(err as Error).message}`, threadId);
     }
   }
 
-  private async handleDocument(chatId: number, msg: TelegramBot.Message): Promise<void> {
+  private async handleDocument(chatId: number, msg: TelegramBot.Message, threadId?: number, threadName?: string): Promise<void> {
     const doc = msg.document!;
     const caption = msg.caption?.trim();
     const fileName = doc.file_name ?? `file_${doc.file_id}`;
@@ -481,21 +525,33 @@ export class CcTgBot {
         ? `${caption}\n\nATTACHMENTS: [${fileName}](${destPath})`
         : `ATTACHMENTS: [${fileName}](${destPath})`;
 
-      const session = this.getOrCreateSession(chatId);
+      const session = this.getOrCreateSession(chatId, threadId, threadName);
       session.claude.sendPrompt(prompt);
       this.startTyping(chatId, session);
     } catch (err) {
       console.error(`[doc:${chatId}] error:`, (err as Error).message);
-      await this.bot.sendMessage(chatId, `Failed to receive document: ${(err as Error).message}`);
+      await this.replyToChat(chatId, `Failed to receive document: ${(err as Error).message}`, threadId);
     }
   }
 
-  private getOrCreateSession(chatId: number): Session {
-    const existing = this.sessions.get(chatId);
+  private getOrCreateSession(chatId: number, threadId?: number, threadName?: string): Session {
+    const key = this.sessionKey(chatId, threadId);
+    const existing = this.sessions.get(key);
     if (existing && !existing.claude.exited) return existing;
 
+    // Determine CWD for this thread — check THREAD_CWD_MAP by name then by ID
+    let sessionCwd = this.opts.cwd;
+    const threadCwdMap = this.getThreadCwdMap();
+    if (threadName && threadCwdMap[threadName]) {
+      sessionCwd = threadCwdMap[threadName];
+      console.log(`[cc-tg] thread "${threadName}" → cwd: ${sessionCwd}`);
+    } else if (threadId !== undefined && threadCwdMap[String(threadId)]) {
+      sessionCwd = threadCwdMap[String(threadId)];
+      console.log(`[cc-tg] thread ${threadId} → cwd: ${sessionCwd}`);
+    }
+
     const claude = new ClaudeProcess({
-      cwd: this.opts.cwd,
+      cwd: sessionCwd,
       token: getCurrentToken() || this.opts.claudeToken,
     });
 
@@ -507,6 +563,7 @@ export class CcTgBot {
       writtenFiles: new Set(),
       currentPrompt: "",
       isRetry: false,
+      threadId,
     };
 
     claude.on("usage", (usage: UsageEvent) => {
@@ -517,33 +574,33 @@ export class CcTgBot {
       // Verbose logging — log every message type and subtype
       const subtype = (msg.payload.subtype as string) ?? "";
       const toolName = this.extractToolName(msg);
-      const logParts = [`[claude:${chatId}] msg=${msg.type}`];
+      const logParts = [`[claude:${key}] msg=${msg.type}`];
       if (subtype) logParts.push(`subtype=${subtype}`);
       if (toolName) logParts.push(`tool=${toolName}`);
       console.log(logParts.join(" "));
 
       // Track files written by Write/Edit tool calls
-      this.trackWrittenFiles(msg, session, this.opts.cwd);
+      this.trackWrittenFiles(msg, session, sessionCwd);
 
       this.handleClaudeMessage(chatId, session, msg);
     });
     claude.on("stderr", (data) => {
       const line = data.trim();
-      if (line) console.error(`[claude:${chatId}:stderr]`, line);
+      if (line) console.error(`[claude:${key}:stderr]`, line);
     });
     claude.on("exit", (code) => {
-      console.log(`[claude:${chatId}] exited code=${code}`);
+      console.log(`[claude:${key}] exited code=${code}`);
       this.stopTyping(session);
-      this.sessions.delete(chatId);
+      this.sessions.delete(key);
     });
     claude.on("error", (err) => {
-      console.error(`[claude:${chatId}] process error: ${err.message}`);
+      console.error(`[claude:${key}] process error: ${err.message}`);
       this.bot.sendMessage(chatId, `Claude process error: ${err.message}`).catch(() => {});
       this.stopTyping(session);
-      this.sessions.delete(chatId);
+      this.sessions.delete(key);
     });
 
-    this.sessions.set(chatId, session);
+    this.sessions.set(key, session);
     return session;
   }
 
@@ -561,14 +618,16 @@ export class CcTgBot {
     // Check for usage/rate limit signals before forwarding to Telegram
     const sig = detectUsageLimit(text);
     if (sig.detected) {
+      const threadId = session.threadId;
+      const retryKey = this.sessionKey(chatId, threadId);
       const lastPrompt = session.currentPrompt;
-      const prevRetry = this.pendingRetries.get(chatId);
+      const prevRetry = this.pendingRetries.get(retryKey);
       const attempt = (prevRetry?.attempt ?? 0) + 1;
 
       if (prevRetry) clearTimeout(prevRetry.timer);
 
-      this.bot.sendMessage(chatId, sig.humanMessage).catch(() => {});
-      this.killSession(chatId);
+      this.replyToChat(chatId, sig.humanMessage, threadId).catch(() => {});
+      this.killSession(chatId, true, threadId);
 
       // Token rotation: if this is a usage_exhausted signal and we have multiple
       // tokens, rotate to the next one and retry immediately instead of sleeping.
@@ -579,42 +638,42 @@ export class CcTgBot {
         const newIdx = getTokenIndex();
         const total = getTokenCount();
         console.log(`[cc-tg] Token ${prevIdx + 1}/${total} exhausted, rotating to token ${newIdx + 1}/${total}`);
-        this.bot.sendMessage(chatId, `🔄 Token ${prevIdx + 1}/${total} exhausted, switching to token ${newIdx + 1}/${total}...`).catch(() => {});
+        this.replyToChat(chatId, `🔄 Token ${prevIdx + 1}/${total} exhausted, switching to token ${newIdx + 1}/${total}...`, threadId).catch(() => {});
 
-        this.pendingRetries.set(chatId, { text: lastPrompt, attempt, timer: setTimeout(() => {}, 0) });
+        this.pendingRetries.set(retryKey, { text: lastPrompt, attempt, timer: setTimeout(() => {}, 0) });
         try {
-          const retrySession = this.getOrCreateSession(chatId);
+          const retrySession = this.getOrCreateSession(chatId, threadId);
           retrySession.currentPrompt = lastPrompt;
           retrySession.isRetry = true;
           retrySession.claude.sendPrompt(lastPrompt);
           this.startTyping(chatId, retrySession);
         } catch (err) {
-          this.bot.sendMessage(chatId, `❌ Failed to retry with rotated token: ${(err as Error).message}`).catch(() => {});
+          this.replyToChat(chatId, `❌ Failed to retry with rotated token: ${(err as Error).message}`, threadId).catch(() => {});
         }
         return;
       }
 
       if (attempt > 3) {
-        this.bot.sendMessage(chatId, "❌ Claude usage limit persists after 3 retries. Please try again later.").catch(() => {});
-        this.pendingRetries.delete(chatId);
+        this.replyToChat(chatId, "❌ Claude usage limit persists after 3 retries. Please try again later.", threadId).catch(() => {});
+        this.pendingRetries.delete(retryKey);
         return;
       }
 
-      console.log(`[usage-limit:${chatId}] ${sig.reason} — scheduling retry attempt=${attempt} in ${sig.retryAfterMs}ms`);
+      console.log(`[usage-limit:${retryKey}] ${sig.reason} — scheduling retry attempt=${attempt} in ${sig.retryAfterMs}ms`);
       const timer = setTimeout(() => {
-        this.pendingRetries.delete(chatId);
+        this.pendingRetries.delete(retryKey);
         try {
-          const retrySession = this.getOrCreateSession(chatId);
+          const retrySession = this.getOrCreateSession(chatId, threadId);
           retrySession.currentPrompt = lastPrompt;
           retrySession.isRetry = true;
           retrySession.claude.sendPrompt(lastPrompt);
           this.startTyping(chatId, retrySession);
         } catch (err) {
-          this.bot.sendMessage(chatId, `❌ Failed to retry: ${(err as Error).message}`).catch(() => {});
+          this.replyToChat(chatId, `❌ Failed to retry: ${(err as Error).message}`, threadId).catch(() => {});
         }
       }, sig.retryAfterMs);
 
-      this.pendingRetries.set(chatId, { text: lastPrompt, attempt, timer });
+      this.pendingRetries.set(retryKey, { text: lastPrompt, attempt, timer });
       return;
     }
 
@@ -653,10 +712,11 @@ export class CcTgBot {
     // Format for Telegram HTML and split if needed (max 4096 chars)
     const formatted = formatForTelegram(text);
     const chunks = splitLongMessage(formatted);
+    const threadId = session.threadId;
     for (const chunk of chunks) {
-      this.bot.sendMessage(chatId, chunk, { parse_mode: "HTML" }).catch(() => {
+      this.replyToChat(chatId, chunk, threadId, { parse_mode: "HTML" }).catch(() => {
         // HTML parse failed — retry as plain text
-        this.bot.sendMessage(chatId, chunk).catch((err) =>
+        this.replyToChat(chatId, chunk, threadId).catch((err) =>
           console.error(`[tg:${chatId}] send failed:`, err.message)
         );
       });
@@ -825,11 +885,12 @@ export class CcTgBot {
       const MAX_TG_FILE_BYTES = 50 * 1024 * 1024;
       if (fileSize > MAX_TG_FILE_BYTES) {
         const mb = (fileSize / (1024 * 1024)).toFixed(1);
-        this.bot.sendMessage(chatId, `File too large for Telegram (${mb}mb). Find it at: ${filePath}`).catch(() => {});
+        this.replyToChat(chatId, `File too large for Telegram (${mb}mb). Find it at: ${filePath}`, session.threadId).catch(() => {});
         continue;
       }
       console.log(`[claude:files] uploading to telegram: ${filePath}`);
-      this.bot.sendDocument(chatId, filePath).catch((err) =>
+      const docOpts = session.threadId ? { message_thread_id: session.threadId } as TelegramBot.SendDocumentOptions : undefined;
+      this.bot.sendDocument(chatId, filePath, docOpts).catch((err) =>
         console.error(`[tg:${chatId}] sendDocument failed for ${filePath}:`, err.message)
       );
     }
@@ -927,28 +988,28 @@ export class CcTgBot {
     cronProcess.sendPrompt(taskPrompt);
   }
 
-  private async handleCron(chatId: number, text: string): Promise<void> {
+  private async handleCron(chatId: number, text: string, threadId?: number): Promise<void> {
     const args = text.slice("/cron".length).trim();
 
     // /cron list
     if (args === "list" || args === "") {
       const jobs = this.cron.list(chatId);
       if (!jobs.length) {
-        await this.bot.sendMessage(chatId, "No cron jobs.");
+        await this.replyToChat(chatId, "No cron jobs.", threadId);
         return;
       }
       const lines = jobs.map((j, i) => {
         const short = j.prompt.length > 50 ? j.prompt.slice(0, 50) + "…" : j.prompt;
         return `#${i + 1} ${j.schedule} — "${short}"`;
       });
-      await this.bot.sendMessage(chatId, `Cron jobs (${jobs.length}):\n${lines.join("\n")}`);
+      await this.replyToChat(chatId, `Cron jobs (${jobs.length}):\n${lines.join("\n")}`, threadId);
       return;
     }
 
     // /cron clear
     if (args === "clear") {
       const n = this.cron.clearAll(chatId);
-      await this.bot.sendMessage(chatId, `Cleared ${n} cron job(s).`);
+      await this.replyToChat(chatId, `Cleared ${n} cron job(s).`, threadId);
       return;
     }
 
@@ -956,22 +1017,23 @@ export class CcTgBot {
     if (args.startsWith("remove ")) {
       const id = args.slice("remove ".length).trim();
       const ok = this.cron.remove(chatId, id);
-      await this.bot.sendMessage(chatId, ok ? `Removed ${id}.` : `Not found: ${id}`);
+      await this.replyToChat(chatId, ok ? `Removed ${id}.` : `Not found: ${id}`, threadId);
       return;
     }
 
     // /cron edit [<#> ...]
     if (args === "edit" || args.startsWith("edit ")) {
-      await this.handleCronEdit(chatId, args.slice("edit".length).trim());
+      await this.handleCronEdit(chatId, args.slice("edit".length).trim(), threadId);
       return;
     }
 
     // /cron every 1h <prompt>
     const scheduleMatch = args.match(/^(every\s+\d+[mhd])\s+(.+)$/i);
     if (!scheduleMatch) {
-      await this.bot.sendMessage(
+      await this.replyToChat(
         chatId,
-        "Usage:\n/cron every 1h <prompt>\n/cron list\n/cron edit\n/cron remove <id>\n/cron clear"
+        "Usage:\n/cron every 1h <prompt>\n/cron list\n/cron edit\n/cron remove <id>\n/cron clear",
+        threadId
       );
       return;
     }
@@ -980,32 +1042,33 @@ export class CcTgBot {
     const prompt = scheduleMatch[2];
     const job = this.cron.add(chatId, schedule, prompt);
     if (!job) {
-      await this.bot.sendMessage(chatId, "Invalid schedule. Use: every 30m / every 2h / every 1d");
+      await this.replyToChat(chatId, "Invalid schedule. Use: every 30m / every 2h / every 1d", threadId);
       return;
     }
-    await this.bot.sendMessage(chatId, `Cron set [${job.id}]: ${schedule} — "${prompt}"`);
+    await this.replyToChat(chatId, `Cron set [${job.id}]: ${schedule} — "${prompt}"`, threadId);
   }
 
-  private async handleCronEdit(chatId: number, editArgs: string): Promise<void> {
+  private async handleCronEdit(chatId: number, editArgs: string, threadId?: number): Promise<void> {
     const jobs = this.cron.list(chatId);
 
     // No args — show numbered list with edit instructions
     if (!editArgs) {
       if (!jobs.length) {
-        await this.bot.sendMessage(chatId, "No cron jobs to edit.");
+        await this.replyToChat(chatId, "No cron jobs to edit.", threadId);
         return;
       }
       const lines = jobs.map((j, i) => {
         const short = j.prompt.length > 50 ? j.prompt.slice(0, 50) + "…" : j.prompt;
         return `#${i + 1} ${j.schedule} — "${short}"`;
       });
-      await this.bot.sendMessage(
+      await this.replyToChat(
         chatId,
         `Cron jobs:\n${lines.join("\n")}\n\n` +
         "Edit options:\n" +
         "/cron edit <#> every <N><unit> <new prompt>\n" +
         "/cron edit <#> schedule every <N><unit>\n" +
-        "/cron edit <#> prompt <new prompt>"
+        "/cron edit <#> prompt <new prompt>",
+        threadId
       );
       return;
     }
@@ -1013,13 +1076,13 @@ export class CcTgBot {
     // Expect: <index> <rest>
     const indexMatch = editArgs.match(/^(\d+)\s+(.+)$/);
     if (!indexMatch) {
-      await this.bot.sendMessage(chatId, "Usage: /cron edit <#> every <N><unit> <new prompt>");
+      await this.replyToChat(chatId, "Usage: /cron edit <#> every <N><unit> <new prompt>", threadId);
       return;
     }
 
     const index = parseInt(indexMatch[1], 10) - 1;
     if (index < 0 || index >= jobs.length) {
-      await this.bot.sendMessage(chatId, `Invalid job number. Use /cron edit to see the list.`);
+      await this.replyToChat(chatId, `Invalid job number. Use /cron edit to see the list.`, threadId);
       return;
     }
 
@@ -1031,11 +1094,11 @@ export class CcTgBot {
       const newSchedule = editCmd.slice("schedule ".length).trim();
       const result = this.cron.update(chatId, job.id, { schedule: newSchedule });
       if (result === null) {
-        await this.bot.sendMessage(chatId, "Invalid schedule. Use: every 30m / every 2h / every 1d");
+        await this.replyToChat(chatId, "Invalid schedule. Use: every 30m / every 2h / every 1d", threadId);
       } else if (result === false) {
-        await this.bot.sendMessage(chatId, "Job not found.");
+        await this.replyToChat(chatId, "Job not found.", threadId);
       } else {
-        await this.bot.sendMessage(chatId, `#${index + 1} schedule updated to ${newSchedule}.`);
+        await this.replyToChat(chatId, `#${index + 1} schedule updated to ${newSchedule}.`, threadId);
       }
       return;
     }
@@ -1045,9 +1108,9 @@ export class CcTgBot {
       const newPrompt = editCmd.slice("prompt ".length).trim();
       const result = this.cron.update(chatId, job.id, { prompt: newPrompt });
       if (result === false) {
-        await this.bot.sendMessage(chatId, "Job not found.");
+        await this.replyToChat(chatId, "Job not found.", threadId);
       } else {
-        await this.bot.sendMessage(chatId, `#${index + 1} prompt updated to "${newPrompt}".`);
+        await this.replyToChat(chatId, `#${index + 1} prompt updated to "${newPrompt}".`, threadId);
       }
       return;
     }
@@ -1059,21 +1122,22 @@ export class CcTgBot {
       const newPrompt = fullMatch[2];
       const result = this.cron.update(chatId, job.id, { schedule: newSchedule, prompt: newPrompt });
       if (result === null) {
-        await this.bot.sendMessage(chatId, "Invalid schedule. Use: every 30m / every 2h / every 1d");
+        await this.replyToChat(chatId, "Invalid schedule. Use: every 30m / every 2h / every 1d", threadId);
       } else if (result === false) {
-        await this.bot.sendMessage(chatId, "Job not found.");
+        await this.replyToChat(chatId, "Job not found.", threadId);
       } else {
-        await this.bot.sendMessage(chatId, `#${index + 1} updated: ${newSchedule} — "${newPrompt}"`);
+        await this.replyToChat(chatId, `#${index + 1} updated: ${newSchedule} — "${newPrompt}"`, threadId);
       }
       return;
     }
 
-    await this.bot.sendMessage(
+    await this.replyToChat(
       chatId,
       "Edit options:\n" +
       "/cron edit <#> every <N><unit> <new prompt>\n" +
       "/cron edit <#> schedule every <N><unit>\n" +
-      "/cron edit <#> prompt <new prompt>"
+      "/cron edit <#> prompt <new prompt>",
+      threadId
     );
   }
 
@@ -1102,38 +1166,39 @@ export class CcTgBot {
     return pids;
   }
 
-  private async handleReloadMcp(chatId: number): Promise<void> {
-    await this.bot.sendMessage(chatId, "Clearing npx cache and reloading MCP...");
+  private async handleReloadMcp(chatId: number, threadId?: number): Promise<void> {
+    await this.replyToChat(chatId, "Clearing npx cache and reloading MCP...", threadId);
 
     try {
       const home = process.env.HOME ?? "~";
       execSync(`rm -rf "${home}/.npm/_npx/"`, { encoding: "utf8", shell: "/bin/sh" });
       console.log("[mcp] cleared ~/.npm/_npx/");
     } catch (err) {
-      await this.bot.sendMessage(chatId, `Warning: failed to clear npx cache: ${(err as Error).message}`);
+      await this.replyToChat(chatId, `Warning: failed to clear npx cache: ${(err as Error).message}`, threadId);
     }
 
     const pids = this.killCcAgent();
     if (pids.length === 0) {
-      await this.bot.sendMessage(chatId, "NPX cache cleared. No cc-agent process found — MCP will start fresh on the next agent call.");
+      await this.replyToChat(chatId, "NPX cache cleared. No cc-agent process found — MCP will start fresh on the next agent call.", threadId);
       return;
     }
-    await this.bot.sendMessage(
+    await this.replyToChat(
       chatId,
-      `NPX cache cleared. Sent SIGTERM to cc-agent (pid${pids.length > 1 ? "s" : ""}: ${pids.join(", ")}).\nMCP restarted. New process will load on next agent call.`
+      `NPX cache cleared. Sent SIGTERM to cc-agent (pid${pids.length > 1 ? "s" : ""}: ${pids.join(", ")}).\nMCP restarted. New process will load on next agent call.`,
+      threadId
     );
   }
 
-  private async handleMcpStatus(chatId: number): Promise<void> {
+  private async handleMcpStatus(chatId: number, threadId?: number): Promise<void> {
     try {
       const output = execSync("claude mcp list", { encoding: "utf8", shell: "/bin/sh" }).trim();
-      await this.bot.sendMessage(chatId, `MCP server status:\n\n${output || "(no output)"}`);
+      await this.replyToChat(chatId, `MCP server status:\n\n${output || "(no output)"}`, threadId);
     } catch (err) {
-      await this.bot.sendMessage(chatId, `Failed to run claude mcp list: ${(err as Error).message}`);
+      await this.replyToChat(chatId, `Failed to run claude mcp list: ${(err as Error).message}`, threadId);
     }
   }
 
-  private async handleMcpVersion(chatId: number): Promise<void> {
+  private async handleMcpVersion(chatId: number, threadId?: number): Promise<void> {
     let npmVersion = "unknown";
     let cacheEntries = "(unavailable)";
 
@@ -1151,13 +1216,14 @@ export class CcTgBot {
       cacheEntries = "(empty or not found)";
     }
 
-    await this.bot.sendMessage(
+    await this.replyToChat(
       chatId,
-      `cc-agent npm version: ${npmVersion}\n\nnpx cache (~/.npm/_npx/):\n${cacheEntries}`
+      `cc-agent npm version: ${npmVersion}\n\nnpx cache (~/.npm/_npx/):\n${cacheEntries}`,
+      threadId
     );
   }
 
-  private async handleClearNpxCache(chatId: number): Promise<void> {
+  private async handleClearNpxCache(chatId: number, threadId?: number): Promise<void> {
     const home = process.env.HOME ?? "/tmp";
     const cleared: string[] = [];
     const failed: string[] = [];
@@ -1183,11 +1249,11 @@ export class CcTgBot {
       ? `Cleared: ${cleared.join(", ")}. Failed: ${failed.join(", ")}.`
       : `Cleared: ${cleared.join(", ")}.`;
 
-    await this.bot.sendMessage(chatId, `${clearNote}${pidNote} Next call picks up latest npm version.`);
+    await this.replyToChat(chatId, `${clearNote}${pidNote} Next call picks up latest npm version.`, threadId);
   }
 
-  private async handleRestart(chatId: number): Promise<void> {
-    await this.bot.sendMessage(chatId, "Clearing cache and restarting... brb.");
+  private async handleRestart(chatId: number, threadId?: number): Promise<void> {
+    await this.replyToChat(chatId, "Clearing cache and restarting... brb.", threadId);
     await new Promise(resolve => setTimeout(resolve, 300));
 
     // Clear npm caches before restart so launchd brings up fresh version
@@ -1197,18 +1263,20 @@ export class CcTgBot {
     }
 
     // Kill all active Claude sessions cleanly
-    for (const [cid] of this.sessions) {
-      this.killSession(cid);
+    for (const session of this.sessions.values()) {
+      this.stopTyping(session);
+      session.claude.kill();
     }
+    this.sessions.clear();
 
     await new Promise(resolve => setTimeout(resolve, 200));
     process.exit(0);
   }
 
-  private async handleGetFile(chatId: number, text: string): Promise<void> {
+  private async handleGetFile(chatId: number, text: string, threadId?: number): Promise<void> {
     const arg = text.slice("/get_file".length).trim();
     if (!arg) {
-      await this.bot.sendMessage(chatId, "Usage: /get_file <path>");
+      await this.replyToChat(chatId, "Usage: /get_file <path>", threadId);
       return;
     }
 
@@ -1217,22 +1285,22 @@ export class CcTgBot {
     const safeDirs = ["/tmp/", "/var/folders/", os.homedir() + "/Downloads/", this.opts.cwd ?? process.cwd()];
     const inSafeDir = safeDirs.some(d => filePath.startsWith(d));
     if (!inSafeDir) {
-      await this.bot.sendMessage(chatId, "Access denied: path not in allowed directories");
+      await this.replyToChat(chatId, "Access denied: path not in allowed directories", threadId);
       return;
     }
 
     if (!existsSync(filePath)) {
-      await this.bot.sendMessage(chatId, `File not found: ${filePath}`);
+      await this.replyToChat(chatId, `File not found: ${filePath}`, threadId);
       return;
     }
 
     if (!statSync(filePath).isFile()) {
-      await this.bot.sendMessage(chatId, `Not a file: ${filePath}`);
+      await this.replyToChat(chatId, `Not a file: ${filePath}`, threadId);
       return;
     }
 
     if (this.isSensitiveFile(filePath)) {
-      await this.bot.sendMessage(chatId, "Access denied: sensitive file");
+      await this.replyToChat(chatId, "Access denied: sensitive file", threadId);
       return;
     }
 
@@ -1240,11 +1308,12 @@ export class CcTgBot {
     const fileSize = statSync(filePath).size;
     if (fileSize > MAX_TG_FILE_BYTES) {
       const mb = (fileSize / (1024 * 1024)).toFixed(1);
-      await this.bot.sendMessage(chatId, `File too large for Telegram (${mb}mb). Find it at: ${filePath}`);
+      await this.replyToChat(chatId, `File too large for Telegram (${mb}mb). Find it at: ${filePath}`, threadId);
       return;
     }
 
-    await this.bot.sendDocument(chatId, filePath);
+    const docOpts = threadId ? { message_thread_id: threadId } as TelegramBot.SendDocumentOptions : undefined;
+    await this.bot.sendDocument(chatId, filePath, docOpts);
   }
 
   private callCcAgentTool(toolName: string, args: Record<string, unknown> = {}): Promise<string | null> {
@@ -1319,12 +1388,13 @@ export class CcTgBot {
     });
   }
 
-  private killSession(chatId: number, keepCrons = true): void {
-    const session = this.sessions.get(chatId);
+  private killSession(chatId: number, keepCrons = true, threadId?: number): void {
+    const key = this.sessionKey(chatId, threadId);
+    const session = this.sessions.get(key);
     if (session) {
       this.stopTyping(session);
       session.claude.kill();
-      this.sessions.delete(chatId);
+      this.sessions.delete(key);
     }
     if (!keepCrons) this.cron.clearAll(chatId);
   }
@@ -1335,9 +1405,11 @@ export class CcTgBot {
 
   stop(): void {
     this.bot.stopPolling();
-    for (const [chatId] of this.sessions) {
-      this.killSession(chatId);
+    for (const session of this.sessions.values()) {
+      this.stopTyping(session);
+      session.claude.kill();
     }
+    this.sessions.clear();
   }
 }
 
