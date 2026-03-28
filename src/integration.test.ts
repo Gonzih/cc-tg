@@ -381,6 +381,38 @@ describe('CronManager — real filesystem integration', () => {
     mgr.clearAll(42);
     mgr2.clearAll(42);
   });
+
+  it('fires repeatedly on each interval tick', () => {
+    const fired: number[] = [];
+    const mgr = new CronManager(dir, (_c, _p, _id, done) => {
+      fired.push(Date.now());
+      done();
+    });
+    mgr.add(1, 'every 1h', 'repeat task');
+
+    vi.advanceTimersByTime(3_600_000 * 3);
+    expect(fired).toHaveLength(3);
+  });
+
+  it('skips a tick while previous invocation is still running', () => {
+    let pendingDone: (() => void) | null = null;
+    const fired: number[] = [];
+    const mgr = new CronManager(dir, (_c, _p, _id, done) => {
+      fired.push(Date.now());
+      pendingDone = done; // hold — simulates slow async work
+    });
+    mgr.add(1, 'every 1h', 'slow task');
+
+    vi.advanceTimersByTime(3_600_000); // fires → pendingDone is set
+    expect(fired).toHaveLength(1);
+
+    vi.advanceTimersByTime(3_600_000); // tick while still running → skipped
+    expect(fired).toHaveLength(1);
+
+    pendingDone!(); // mark done
+    vi.advanceTimersByTime(3_600_000); // next tick fires normally
+    expect(fired).toHaveLength(2);
+  });
 });
 
 // ─── Formatter + splitLongMessage pipeline ────────────────────────────────
@@ -628,5 +660,38 @@ describe('detectUsageLimit + token rotation integration', () => {
     expect(signal.detected).toBe(false);
     expect(signal.retryAfterMs).toBe(0);
     expect(signal.humanMessage).toBe('');
+  });
+
+  it('wraps back to primary after exhausting backup pool', () => {
+    process.env.CLAUDE_CODE_OAUTH_TOKENS = 'tok-1,tok-2';
+    loadTokens();
+
+    rotateToken(); // tok-1 → tok-2
+    expect(getCurrentToken()).toBe('tok-2');
+
+    rotateToken(); // tok-2 → tok-1 (wrapped)
+    expect(getCurrentToken()).toBe('tok-1');
+  });
+
+  it('detects all four usage-exhausted phrases', () => {
+    const phrases = [
+      'extra usage has been consumed',
+      'Your usage has been disabled',
+      'billing_error occurred',
+      'usage limit hit',
+    ];
+    for (const phrase of phrases) {
+      const signal = detectUsageLimit(phrase);
+      expect(signal.detected, `expected detection for: "${phrase}"`).toBe(true);
+      expect(signal.reason).toBe('usage_exhausted');
+    }
+  });
+
+  it('usage_exhausted humanMessage includes a future UTC time', () => {
+    const signal = detectUsageLimit('extra usage limit reached');
+    expect(signal.detected).toBe(true);
+    expect(signal.humanMessage).toContain('Will auto-resume at');
+    // Should contain a UTC date string from toUTCString()
+    expect(signal.humanMessage).toMatch(/\w{3},\s+\d{2}\s+\w{3}\s+\d{4}/);
   });
 });
