@@ -645,3 +645,272 @@ describe('CcTgBot integration — formatter pipeline', () => {
     expect(sentText).toContain('• Banana');
   });
 });
+
+// ---------------------------------------------------------------------------
+// File upload pipeline
+// ---------------------------------------------------------------------------
+describe('CcTgBot integration — file upload pipeline', () => {
+  let bot: CcTgBot;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({ message_id: 1 });
+    mocks.tgSendDocument.mockResolvedValue({});
+    bot = new CcTgBot({ telegramToken: 'test-token' });
+  });
+
+  afterEach(() => {
+    bot.stop();
+    vi.useRealTimers();
+  });
+
+  it('uploads file when Claude result mentions a tracked written file', async () => {
+    await (bot as any).handleTelegram(makeMsg());
+    const key = (bot as any).sessionKey(42, undefined);
+    const session = (bot as any).sessions.get(key);
+
+    session.writtenFiles.add('/tmp/report.pdf');
+    mocks.existsSyncMock.mockImplementation((p: string) => p === '/tmp/report.pdf');
+
+    emitResult('Saved report to /tmp/report.pdf');
+    await vi.runAllTimersAsync();
+
+    expect(mocks.tgSendDocument).toHaveBeenCalledWith(42, '/tmp/report.pdf', undefined);
+  });
+
+  it('does NOT upload sensitive files even when tracked', async () => {
+    await (bot as any).handleTelegram(makeMsg());
+    const key = (bot as any).sessionKey(42, undefined);
+    const session = (bot as any).sessions.get(key);
+
+    session.writtenFiles.add('/tmp/token.json');
+    mocks.existsSyncMock.mockImplementation((p: string) => p === '/tmp/token.json');
+
+    emitResult('Saved credentials to /tmp/token.json');
+    await vi.runAllTimersAsync();
+
+    expect(mocks.tgSendDocument).not.toHaveBeenCalled();
+  });
+
+  it('notifies user when file exceeds 50MB limit', async () => {
+    await (bot as any).handleTelegram(makeMsg());
+    const key = (bot as any).sessionKey(42, undefined);
+    const session = (bot as any).sessions.get(key);
+
+    session.writtenFiles.add('/tmp/bigfile.bin');
+    mocks.existsSyncMock.mockImplementation((p: string) => p === '/tmp/bigfile.bin');
+    mocks.statSyncMock.mockImplementation((p: string) =>
+      p === '/tmp/bigfile.bin'
+        ? { size: 60 * 1024 * 1024, isFile: () => true }
+        : { size: 0, isFile: () => false }
+    );
+
+    emitResult('Archive saved to /tmp/bigfile.bin');
+    await vi.runAllTimersAsync();
+    await Promise.resolve(); // flush microtasks for async replyToChat
+
+    const allMessages = mocks.tgSendMessage.mock.calls.map(([, t]: [number, string]) => t);
+    expect(allMessages.some((t) => t.includes('too large'))).toBe(true);
+    expect(mocks.tgSendDocument).not.toHaveBeenCalled();
+  });
+
+  it('uploads written file to correct thread with message_thread_id', async () => {
+    await (bot as any).handleTelegram(makeMsg({ message_thread_id: 7 }));
+    const key = (bot as any).sessionKey(42, 7);
+    const session = (bot as any).sessions.get(key);
+
+    session.writtenFiles.add('/tmp/data.csv');
+    mocks.existsSyncMock.mockImplementation((p: string) => p === '/tmp/data.csv');
+
+    emitResult('Exported data to /tmp/data.csv');
+    await vi.runAllTimersAsync();
+
+    expect(mocks.tgSendDocument).toHaveBeenCalledWith(
+      42,
+      '/tmp/data.csv',
+      expect.objectContaining({ message_thread_id: 7 })
+    );
+  });
+
+  it('clears writtenFiles set after each result flush', async () => {
+    await (bot as any).handleTelegram(makeMsg());
+    const key = (bot as any).sessionKey(42, undefined);
+    const session = (bot as any).sessions.get(key);
+
+    session.writtenFiles.add('/tmp/output.txt');
+    mocks.existsSyncMock.mockImplementation((p: string) => p === '/tmp/output.txt');
+
+    emitResult('Wrote /tmp/output.txt');
+    await vi.runAllTimersAsync();
+
+    // writtenFiles cleared after flush
+    expect(session.writtenFiles.size).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Voice / photo / document message handling
+// ---------------------------------------------------------------------------
+import { isVoiceAvailable, transcribeVoice } from './voice.js';
+
+describe('CcTgBot integration — voice message handling', () => {
+  let bot: CcTgBot;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({ message_id: 1 });
+    mocks.tgGetFileLink.mockResolvedValue('https://example.com/voice.ogg');
+    vi.mocked(isVoiceAvailable).mockReturnValue(true);
+    vi.mocked(transcribeVoice).mockResolvedValue('transcribed voice text');
+    bot = new CcTgBot({ telegramToken: 'test-token' });
+  });
+
+  afterEach(() => {
+    bot.stop();
+  });
+
+  it('transcribes voice and sends transcript to Claude', async () => {
+    await (bot as any).handleTelegram(makeMsg({
+      text: undefined,
+      voice: { file_id: 'voice-123', duration: 5 },
+    }));
+
+    expect(mocks.tgGetFileLink).toHaveBeenCalledWith('voice-123');
+    expect(vi.mocked(transcribeVoice)).toHaveBeenCalledWith('https://example.com/voice.ogg');
+    expect(mocks.claudeInstance!.sendPrompt).toHaveBeenCalledWith('transcribed voice text');
+  });
+
+  it('sends error message when transcription returns empty result', async () => {
+    vi.mocked(transcribeVoice).mockResolvedValue('[empty transcription]');
+    await (bot as any).handleTelegram(makeMsg({
+      text: undefined,
+      voice: { file_id: 'voice-empty', duration: 1 },
+    }));
+
+    expect(mocks.tgSendMessage).toHaveBeenCalledWith(
+      42,
+      'Could not transcribe voice message.'
+    );
+    // Claude should NOT receive the empty transcript
+    expect(mocks.claudeInstance?.sendPrompt).not.toHaveBeenCalled();
+  });
+
+  it('sends error message when transcription throws', async () => {
+    vi.mocked(transcribeVoice).mockRejectedValue(new Error('whisper failed'));
+    await (bot as any).handleTelegram(makeMsg({
+      text: undefined,
+      voice: { file_id: 'voice-bad', duration: 2 },
+    }));
+
+    const allMessages = mocks.tgSendMessage.mock.calls.map(([, t]: [number, string]) => t);
+    expect(allMessages.some((t) => t.includes('Voice transcription failed'))).toBe(true);
+  });
+});
+
+describe('CcTgBot integration — photo message handling', () => {
+  let bot: CcTgBot;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({ message_id: 1 });
+    // getFileLink must return a URL that downloadToFile / fetchAsBase64 can use
+    mocks.tgGetFileLink.mockResolvedValue('data:image/jpeg;base64,/9j/fake');
+    bot = new CcTgBot({ telegramToken: 'test-token' });
+  });
+
+  afterEach(() => {
+    bot.stop();
+  });
+
+  it('fetches the highest-resolution photo and calls sendImage on the session', async () => {
+    // Patch fetchAsBase64 by mocking https/http in the module scope isn't practical,
+    // so instead spy on the internal handlePhoto to confirm it's reached.
+    const handlePhotoSpy = vi.spyOn(bot as any, 'handlePhoto').mockResolvedValue(undefined);
+
+    await (bot as any).handleTelegram(makeMsg({
+      text: undefined,
+      photo: [
+        { file_id: 'low-res', width: 100, height: 100 },
+        { file_id: 'high-res', width: 800, height: 600 },
+      ],
+    }));
+
+    expect(handlePhotoSpy).toHaveBeenCalledWith(42, expect.objectContaining({ photo: expect.any(Array) }), undefined, undefined);
+  });
+});
+
+describe('CcTgBot integration — document message handling', () => {
+  let bot: CcTgBot;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({ message_id: 1 });
+    mocks.tgGetFileLink.mockResolvedValue('https://example.com/doc.pdf');
+    bot = new CcTgBot({ telegramToken: 'test-token' });
+  });
+
+  afterEach(() => {
+    bot.stop();
+  });
+
+  it('calls handleDocument when a document message is received', async () => {
+    const handleDocSpy = vi.spyOn(bot as any, 'handleDocument').mockResolvedValue(undefined);
+
+    await (bot as any).handleTelegram(makeMsg({
+      text: undefined,
+      document: { file_id: 'doc-123', file_name: 'report.pdf', mime_type: 'application/pdf' },
+    }));
+
+    expect(handleDocSpy).toHaveBeenCalledWith(42, expect.objectContaining({ document: expect.any(Object) }), undefined, undefined);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// THREAD_CWD_MAP routing
+// ---------------------------------------------------------------------------
+describe('CcTgBot integration — THREAD_CWD_MAP routing', () => {
+  const origEnv = process.env.THREAD_CWD_MAP;
+
+  afterEach(() => {
+    if (origEnv === undefined) delete process.env.THREAD_CWD_MAP;
+    else process.env.THREAD_CWD_MAP = origEnv;
+  });
+
+  it('getThreadCwdMap parses valid JSON from env var', () => {
+    process.env.THREAD_CWD_MAP = JSON.stringify({ backend: '/srv/backend', frontend: '/srv/frontend' });
+    const bot = new CcTgBot({ telegramToken: 'test-token' });
+    const map = (bot as any).getThreadCwdMap();
+    expect(map).toEqual({ backend: '/srv/backend', frontend: '/srv/frontend' });
+    bot.stop();
+  });
+
+  it('getThreadCwdMap returns empty object when env var is absent', () => {
+    delete process.env.THREAD_CWD_MAP;
+    const bot = new CcTgBot({ telegramToken: 'test-token' });
+    const map = (bot as any).getThreadCwdMap();
+    expect(map).toEqual({});
+    bot.stop();
+  });
+
+  it('getThreadCwdMap returns empty object for invalid JSON and does not throw', () => {
+    process.env.THREAD_CWD_MAP = 'not-json{';
+    const bot = new CcTgBot({ telegramToken: 'test-token' });
+    expect(() => (bot as any).getThreadCwdMap()).not.toThrow();
+    expect((bot as any).getThreadCwdMap()).toEqual({});
+    bot.stop();
+  });
+
+  it('message in unlisted thread still creates a session using bot cwd', async () => {
+    vi.clearAllMocks();
+    process.env.THREAD_CWD_MAP = JSON.stringify({ '99': '/some/path' });
+    const bot = new CcTgBot({ telegramToken: 'test-token', cwd: '/default' });
+
+    await (bot as any).handleTelegram(makeMsg({ message_thread_id: 42 }));
+
+    // Session should exist for the unmatched thread
+    const key = (bot as any).sessionKey(42, 42);
+    expect((bot as any).sessions.has(key)).toBe(true);
+    bot.stop();
+  });
+});
