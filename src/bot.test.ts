@@ -94,7 +94,7 @@ vi.mock('child_process', async (importOriginal) => {
   };
 });
 
-import { CcTgBot, splitMessage } from './bot.js';
+import { CcTgBot, splitMessage, enrichPromptWithUrls, listSkills } from './bot.js';
 
 function makeMsg(overrides: Record<string, unknown> = {}) {
   return {
@@ -713,5 +713,109 @@ describe('CcTgBot', () => {
       expect(mocks.claudeSendPrompt).toHaveBeenCalled();
       (bot as any).opts.groupChatIds = [];
     });
+  });
+});
+
+describe('enrichPromptWithUrls', () => {
+  beforeEach(() => {
+    vi.stubGlobal('fetch', undefined);
+  });
+
+  it('returns text unchanged when no URLs present', async () => {
+    const result = await enrichPromptWithUrls('hello world');
+    expect(result).toBe('hello world');
+  });
+
+  it('returns text unchanged when only jina.ai URL present', async () => {
+    const result = await enrichPromptWithUrls('check https://r.jina.ai/example.com');
+    expect(result).toBe('check https://r.jina.ai/example.com');
+  });
+
+  it('prepends URL content when fetch succeeds', async () => {
+    // Mock https.get to return content
+    const { default: https } = await import('https');
+    const mockGet = vi.spyOn(https, 'get').mockImplementation((_url: any, callback: any) => {
+      const res = {
+        on: (event: string, handler: (...args: any[]) => void) => {
+          if (event === 'data') handler(Buffer.from('Page title and content here'));
+          if (event === 'end') handler();
+          return res;
+        },
+      };
+      callback(res);
+      return { on: vi.fn() } as any;
+    });
+
+    const result = await enrichPromptWithUrls('check this https://example.com please');
+    expect(result).toContain('[Web content from https://example.com]');
+    expect(result).toContain('Page title and content here');
+    expect(result).toContain('check this https://example.com please');
+    mockGet.mockRestore();
+  });
+
+  it('skips URL gracefully when fetch fails', async () => {
+    const { default: https } = await import('https');
+    const mockGet = vi.spyOn(https, 'get').mockImplementation((_url: any, callback: any) => {
+      const res = {
+        on: (event: string, handler: (...args: any[]) => void) => {
+          if (event === 'error') handler(new Error('network error'));
+          return res;
+        },
+      };
+      callback(res);
+      return { on: vi.fn() } as any;
+    });
+
+    const result = await enrichPromptWithUrls('see https://example.com for details');
+    // Should still return the original text even when fetch fails
+    expect(result).toBe('see https://example.com for details');
+    mockGet.mockRestore();
+  });
+});
+
+// Import the mocked fs module for spy access
+import * as fsModule from 'fs';
+
+describe('listSkills', () => {
+  it('returns message when skills dir does not exist', () => {
+    mocks.existsSyncMock.mockReturnValue(false);
+    const result = listSkills();
+    expect(result).toContain('No skills directory found');
+  });
+
+  it('returns message when skills dir is empty', () => {
+    mocks.existsSyncMock.mockReturnValue(true);
+    const readdirMock = vi.spyOn(fsModule, 'readdirSync').mockReturnValue([] as any);
+    const result = listSkills();
+    expect(result).toContain('No skills found');
+    readdirMock.mockRestore();
+  });
+
+  it('lists skills with descriptions from frontmatter', () => {
+    mocks.existsSyncMock.mockReturnValue(true);
+    const readdirMock = vi.spyOn(fsModule, 'readdirSync').mockReturnValue(['commit.md', 'review-pr.md'] as any);
+    const readFileMock = vi.spyOn(fsModule, 'readFileSync').mockImplementation((path: any) => {
+      if (String(path).includes('commit.md')) {
+        return '---\nname: commit\ndescription: Create a git commit with good message\n---\nContent here';
+      }
+      return '---\nname: review-pr\ndescription: Review a pull request\n---\nContent here';
+    });
+
+    const result = listSkills();
+    expect(result).toContain('/commit — Create a git commit with good message');
+    expect(result).toContain('/review-pr — Review a pull request');
+    readdirMock.mockRestore();
+    readFileMock.mockRestore();
+  });
+
+  it('lists skills without description when frontmatter is missing', () => {
+    mocks.existsSyncMock.mockReturnValue(true);
+    const readdirMock = vi.spyOn(fsModule, 'readdirSync').mockReturnValue(['my-skill.md'] as any);
+    const readFileMock = vi.spyOn(fsModule, 'readFileSync').mockReturnValue('No frontmatter here');
+
+    const result = listSkills();
+    expect(result).toContain('/my-skill');
+    readdirMock.mockRestore();
+    readFileMock.mockRestore();
   });
 });
