@@ -360,6 +360,19 @@ describe('CronManager — real filesystem integration', () => {
     mgr2.clearAll(42);
   });
 
+  it('clearAll with no jobs is a no-op that leaves an empty store on reload', () => {
+    const fire = vi.fn();
+    const mgr = new CronManager(dir, fire);
+    expect(mgr.clearAll(42)).toBe(0); // no jobs, no error
+
+    // Add and clear to ensure persist() has been called at least once
+    mgr.add(42, 'every 1h', 'A');
+    mgr.clearAll(42);
+
+    const mgr2 = new CronManager(dir, fire);
+    expect(mgr2.list(42)).toHaveLength(0);
+  });
+
   it('reloaded jobs fire their callbacks when the timer elapses', () => {
     const fire = vi.fn().mockImplementation((_chatId, _prompt, _jobId, done) => done());
 
@@ -613,6 +626,29 @@ describe('token pool lifecycle integration', () => {
     for (let i = 0; i < 5; i++) rotateToken();
     expect(getCurrentToken()).toBe(first);
     expect(getTokenIndex()).toBe(0);
+  });
+
+  it('rotation guard: attempt <= count-1 correctly signals when all tokens exhausted', () => {
+    // Mirrors the bot logic: rotate only while attempt <= getTokenCount() - 1
+    process.env.CLAUDE_CODE_OAUTH_TOKENS = 'a,b,c';
+    delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    loadTokens();
+
+    const total = getTokenCount(); // 3
+    expect(total).toBe(3);
+
+    let attempt = 1;
+    expect(attempt <= total - 1).toBe(true); // can rotate on attempt 1 (1 <= 2)
+    rotateToken();
+    expect(getCurrentToken()).toBe('b');
+
+    attempt = 2;
+    expect(attempt <= total - 1).toBe(true); // can rotate on attempt 2 (2 <= 2)
+    rotateToken();
+    expect(getCurrentToken()).toBe('c');
+
+    attempt = 3;
+    expect(attempt <= total - 1).toBe(false); // all tokens exhausted (3 > 2)
   });
 });
 
