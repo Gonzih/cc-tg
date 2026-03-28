@@ -134,6 +134,38 @@ describe('CronManager — real filesystem integration', () => {
     mgr.clearAll(42);
     mgr2.clearAll(42);
   });
+
+  it('fires repeatedly on each interval tick', () => {
+    const fired: number[] = [];
+    const mgr = new CronManager(dir, (_c, _p, _id, done) => {
+      fired.push(Date.now());
+      done();
+    });
+    mgr.add(1, 'every 1h', 'repeat task');
+
+    vi.advanceTimersByTime(3_600_000 * 3);
+    expect(fired).toHaveLength(3);
+  });
+
+  it('skips a tick while previous invocation is still running', () => {
+    let pendingDone: (() => void) | null = null;
+    const fired: number[] = [];
+    const mgr = new CronManager(dir, (_c, _p, _id, done) => {
+      fired.push(Date.now());
+      pendingDone = done; // hold — simulates slow async work
+    });
+    mgr.add(1, 'every 1h', 'slow task');
+
+    vi.advanceTimersByTime(3_600_000); // fires → pendingDone is set
+    expect(fired).toHaveLength(1);
+
+    vi.advanceTimersByTime(3_600_000); // tick while still running → skipped
+    expect(fired).toHaveLength(1);
+
+    pendingDone!(); // mark done
+    vi.advanceTimersByTime(3_600_000); // next tick fires normally
+    expect(fired).toHaveLength(2);
+  });
 });
 
 // ─── Formatter + splitLongMessage pipeline ────────────────────────────────
@@ -334,5 +366,86 @@ describe('token pool lifecycle integration', () => {
     for (let i = 0; i < 5; i++) rotateToken();
     expect(getCurrentToken()).toBe(first);
     expect(getTokenIndex()).toBe(0);
+  });
+});
+
+// ─── Token rotation + usage-limit detection pipeline ────────────────────────
+
+import { detectUsageLimit } from './usage-limit.js';
+
+describe('token rotation + usage-limit detection pipeline', () => {
+  const originalEnv = process.env;
+
+  beforeEach(() => {
+    process.env = { ...originalEnv };
+  });
+
+  afterEach(() => {
+    process.env = originalEnv;
+    loadTokens();
+  });
+
+  it('rotates to backup token when usage-exhausted signal fires', () => {
+    process.env.CLAUDE_CODE_OAUTH_TOKENS = 'primary-token,backup-token';
+    delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    loadTokens();
+    expect(getCurrentToken()).toBe('primary-token');
+
+    const signal = detectUsageLimit('Claude usage limit reached');
+    expect(signal.detected).toBe(true);
+    expect(signal.reason).toBe('usage_exhausted');
+
+    // Simulate what bot.ts does on usage_exhausted: rotate to next token
+    const next = rotateToken();
+    expect(next).toBe('backup-token');
+    expect(getCurrentToken()).toBe('backup-token');
+  });
+
+  it('wraps back to primary after exhausting backup pool', () => {
+    process.env.CLAUDE_CODE_OAUTH_TOKENS = 'tok-1,tok-2';
+    delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    loadTokens();
+
+    rotateToken(); // → tok-2
+    expect(getCurrentToken()).toBe('tok-2');
+
+    rotateToken(); // → tok-1 (wrapped)
+    expect(getCurrentToken()).toBe('tok-1');
+  });
+
+  it('rate-limit signal does not change the current token', () => {
+    process.env.CLAUDE_CODE_OAUTH_TOKENS = 'tok-a,tok-b';
+    delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    loadTokens();
+    expect(getCurrentToken()).toBe('tok-a');
+
+    const signal = detectUsageLimit('API rate limit exceeded');
+    expect(signal.detected).toBe(true);
+    expect(signal.reason).toBe('rate_limit');
+    expect(signal.retryAfterMs).toBe(2 * 60 * 1000);
+
+    // rate-limit is a temporary back-off; token stays unchanged
+    expect(getCurrentToken()).toBe('tok-a');
+  });
+
+  it('detects all usage-exhausted phrases', () => {
+    const phrases = [
+      'extra usage has been consumed',
+      'Your usage has been disabled',
+      'billing_error occurred',
+      'usage limit hit',
+    ];
+    for (const phrase of phrases) {
+      const signal = detectUsageLimit(phrase);
+      expect(signal.detected, `expected detection for: "${phrase}"`).toBe(true);
+      expect(signal.reason).toBe('usage_exhausted');
+    }
+  });
+
+  it('usage_exhausted signal includes a future retry time and human message', () => {
+    const signal = detectUsageLimit('usage limit reached');
+    expect(signal.detected).toBe(true);
+    expect(signal.retryAfterMs).toBeGreaterThan(0);
+    expect(signal.humanMessage).toContain('Will auto-resume');
   });
 });
