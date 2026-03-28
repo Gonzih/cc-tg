@@ -25,6 +25,7 @@ import { CcTgBot } from "./bot.js";
 import { loadTokens, getTokenCount } from "./tokens.js";
 import { Registry, startControlServer } from "@gonzih/agent-ops";
 import { Redis } from "ioredis";
+import { connectEventSubscriber } from "./cc-agent-events.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -158,6 +159,11 @@ if (process.env.CC_AGENT_OPS_PORT) {
   });
   console.log(`[ops] control server on port ${process.env.CC_AGENT_OPS_PORT}`);
 }
+
+// cc-agent event subscriber — watches Redis cca:events for job completions
+connectEventSubscriber().catch((err: Error) => {
+  console.error("[cc-agent-events] startup error:", err.message);
+});
 
 process.on("SIGINT", () => {
   console.log("\nShutting down...");
