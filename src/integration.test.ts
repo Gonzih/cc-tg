@@ -11,20 +11,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { EventEmitter } from 'events';
-import { PassThrough } from 'stream';
 
-// ---------------------------------------------------------------------------
-// Mock spawn so ClaudeProcess never spawns a real subprocess
-// ---------------------------------------------------------------------------
-const claudeMocks = vi.hoisted(() => ({ spawnMock: vi.fn() }));
-
-vi.mock('child_process', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('child_process')>();
-  return { ...actual, spawn: claudeMocks.spawnMock, execFileSync: vi.fn() };
-});
-
-import { ClaudeProcess, extractText, ClaudeMessage, UsageEvent } from './claude.js';
+import { ClaudeProcess, extractText, type ClaudeMessage, type UsageEvent } from './claude.js';
 import { detectUsageLimit } from './usage-limit.js';
 
 // ─── ClaudeProcess: real subprocess stream parsing ───────────────────────────
@@ -32,8 +20,6 @@ import { detectUsageLimit } from './usage-limit.js';
 // Spawns a tiny Node.js script that emits fake Claude-CLI-style JSON lines.
 // Exercises drainBuffer(), parseMessage(), usage event emission, and the
 // full event pipeline end-to-end without the actual `claude` binary.
-
-import { ClaudeProcess, extractText, type ClaudeMessage, type UsageEvent } from './claude.js';
 
 describe('ClaudeProcess integration (fake claude binary)', () => {
   let tmpDir: string;
@@ -595,171 +581,6 @@ describe('token pool lifecycle integration', () => {
     for (let i = 0; i < 5; i++) rotateToken();
     expect(getCurrentToken()).toBe(first);
     expect(getTokenIndex()).toBe(0);
-  });
-});
-
-// ─── ClaudeProcess stream parsing integration ────────────────────────────
-
-interface FakeProcess extends EventEmitter {
-  stdin: PassThrough;
-  stdout: PassThrough;
-  stderr: PassThrough;
-  kill: ReturnType<typeof vi.fn>;
-}
-
-function makeFakeProcess(): FakeProcess {
-  const proc = new EventEmitter() as FakeProcess;
-  proc.stdin = new PassThrough();
-  proc.stdout = new PassThrough();
-  proc.stderr = new PassThrough();
-  proc.kill = vi.fn(() => proc.emit('exit', null));
-  return proc;
-}
-
-function jsonLine(obj: Record<string, unknown>): string {
-  return JSON.stringify(obj) + '\n';
-}
-
-describe('ClaudeProcess stream parsing integration', () => {
-  let fakeProc: FakeProcess;
-  let claude: ClaudeProcess;
-
-  beforeEach(() => {
-    fakeProc = makeFakeProcess();
-    claudeMocks.spawnMock.mockReturnValue(fakeProc);
-    claude = new ClaudeProcess({ cwd: '/tmp' });
-  });
-
-  afterEach(() => {
-    fakeProc.emit('exit', 0);
-  });
-
-  it('emits a message event for a result-type JSON line', () => {
-    const messages: ClaudeMessage[] = [];
-    claude.on('message', (m) => messages.push(m));
-
-    fakeProc.stdout.push(jsonLine({ type: 'result', session_id: 's1', result: 'Hello' }));
-
-    expect(messages).toHaveLength(1);
-    expect(messages[0].type).toBe('result');
-    expect(messages[0].payload.result).toBe('Hello');
-  });
-
-  it('handles multiple JSON messages arriving in one chunk', () => {
-    const messages: ClaudeMessage[] = [];
-    claude.on('message', (m) => messages.push(m));
-
-    const chunk =
-      jsonLine({ type: 'system', session_id: 's1', content: 'init' }) +
-      jsonLine({ type: 'assistant', session_id: 's1', message: { content: 'hi' } }) +
-      jsonLine({ type: 'result', session_id: 's1', result: 'done' });
-
-    fakeProc.stdout.push(chunk);
-
-    expect(messages).toHaveLength(3);
-    expect(messages.map((m) => m.type)).toEqual(['system', 'assistant', 'result']);
-  });
-
-  it('reassembles a JSON message split across two chunks', () => {
-    const messages: ClaudeMessage[] = [];
-    claude.on('message', (m) => messages.push(m));
-
-    const full = JSON.stringify({ type: 'result', result: 'chunked' });
-    const half = Math.floor(full.length / 2);
-    fakeProc.stdout.push(full.slice(0, half));
-    expect(messages).toHaveLength(0); // incomplete line
-
-    fakeProc.stdout.push(full.slice(half) + '\n');
-    expect(messages).toHaveLength(1);
-    expect(messages[0].payload.result).toBe('chunked');
-  });
-
-  it('silently ignores non-JSON startup noise', () => {
-    const messages: ClaudeMessage[] = [];
-    const errors: Error[] = [];
-    claude.on('message', (m) => messages.push(m));
-    claude.on('error', (e) => errors.push(e));
-
-    fakeProc.stdout.push('Claude Code v1.2.3\nsome startup noise\n');
-    fakeProc.stdout.push(jsonLine({ type: 'result', result: 'ok' }));
-
-    expect(errors).toHaveLength(0);
-    expect(messages).toHaveLength(1);
-  });
-
-  it('emits usage events from message_start', () => {
-    const usageEvents: UsageEvent[] = [];
-    claude.on('usage', (u) => usageEvents.push(u));
-
-    fakeProc.stdout.push(
-      jsonLine({
-        type: 'message_start',
-        message: {
-          usage: {
-            input_tokens: 500,
-            cache_read_input_tokens: 100,
-            cache_creation_input_tokens: 50,
-          },
-        },
-      }),
-    );
-
-    expect(usageEvents).toHaveLength(1);
-    expect(usageEvents[0].inputTokens).toBe(500);
-    expect(usageEvents[0].cacheReadTokens).toBe(100);
-    expect(usageEvents[0].cacheWriteTokens).toBe(50);
-    expect(usageEvents[0].outputTokens).toBe(0);
-  });
-
-  it('emits usage events from message_delta (output tokens)', () => {
-    const usageEvents: UsageEvent[] = [];
-    claude.on('usage', (u) => usageEvents.push(u));
-
-    fakeProc.stdout.push(jsonLine({ type: 'message_delta', usage: { output_tokens: 250 } }));
-
-    expect(usageEvents).toHaveLength(1);
-    expect(usageEvents[0].outputTokens).toBe(250);
-    expect(usageEvents[0].inputTokens).toBe(0);
-  });
-
-  it('marks process as exited and throws on sendPrompt after exit', () => {
-    expect(claude.exited).toBe(false);
-    fakeProc.emit('exit', 0);
-    expect(claude.exited).toBe(true);
-    expect(() => claude.sendPrompt('hello')).toThrow('Claude process has exited');
-  });
-
-  it('extractText pipeline: parses assistant content-array end-to-end', () => {
-    const messages: ClaudeMessage[] = [];
-    claude.on('message', (m) => messages.push(m));
-
-    fakeProc.stdout.push(
-      jsonLine({
-        type: 'assistant',
-        message: {
-          content: [
-            { type: 'text', text: 'Hello ' },
-            { type: 'tool_use', id: 't1', name: 'Bash', input: {} },
-            { type: 'text', text: 'world' },
-          ],
-        },
-      }),
-    );
-
-    expect(messages).toHaveLength(1);
-    expect(extractText(messages[0])).toBe('Hello world');
-  });
-
-  it('stdin write is forwarded correctly for sendPrompt', () => {
-    const written: string[] = [];
-    fakeProc.stdin.on('data', (chunk: Buffer) => written.push(chunk.toString()));
-
-    claude.sendPrompt('what is 2+2?');
-
-    expect(written).toHaveLength(1);
-    const parsed = JSON.parse(written[0].trim()) as Record<string, unknown>;
-    expect(parsed.type).toBe('user');
-    expect((parsed.message as Record<string, unknown>).content).toBe('what is 2+2?');
   });
 });
 
