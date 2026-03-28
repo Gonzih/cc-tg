@@ -4,9 +4,251 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, rmSync, existsSync, readFileSync } from 'fs';
+import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+
+// ─── ClaudeProcess: real subprocess stream parsing ───────────────────────────
+//
+// Spawns a tiny Node.js script that emits fake Claude-CLI-style JSON lines.
+// Exercises drainBuffer(), parseMessage(), usage event emission, and the
+// full event pipeline end-to-end without the actual `claude` binary.
+
+import { ClaudeProcess, extractText, type ClaudeMessage, type UsageEvent } from './claude.js';
+
+describe('ClaudeProcess integration (fake claude binary)', () => {
+  let tmpDir: string;
+  let originalPath: string | undefined;
+
+  beforeEach(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), 'cc-tg-claude-test-'));
+    originalPath = process.env.PATH;
+  });
+
+  afterEach(() => {
+    process.env.PATH = originalPath;
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  /** Write a fake `claude` Node script to tmpDir that outputs messages then exits. */
+  function createFakeClaude(messages: object[], exitCode = 0): void {
+    const lines = messages.map((m) => JSON.stringify(m));
+    writeFileSync(
+      join(tmpDir, 'claude'),
+      `#!/usr/bin/env node
+const lines = ${JSON.stringify(lines)};
+for (const line of lines) process.stdout.write(line + '\\n');
+process.exit(${exitCode});
+`,
+      { mode: 0o755 },
+    );
+    process.env.PATH = `${tmpDir}:${originalPath}`;
+  }
+
+  /** Write a fake `claude` that reads one prompt from stdin and echoes it back. */
+  function createEchoClaude(): void {
+    writeFileSync(
+      join(tmpDir, 'claude'),
+      `#!/usr/bin/env node
+const chunks = [];
+process.stdin.on('data', c => chunks.push(c));
+process.stdin.on('end', () => {
+  const line = Buffer.concat(chunks).toString().split('\\n').find(l => l.trim());
+  const msg = line ? JSON.parse(line) : {};
+  const content = msg?.message?.content ?? 'empty';
+  process.stdout.write(JSON.stringify({
+    type: 'assistant',
+    session_id: 'echo-sess',
+    message: { role: 'assistant', content: 'Echo: ' + content },
+  }) + '\\n');
+  process.stdout.write(JSON.stringify({
+    type: 'result',
+    session_id: 'echo-sess',
+    result: 'Echo: ' + content,
+  }) + '\\n');
+  process.exit(0);
+});
+`,
+      { mode: 0o755 },
+    );
+    process.env.PATH = `${tmpDir}:${originalPath}`;
+  }
+
+  it('emits message events for each JSON line on stdout', async () => {
+    createFakeClaude([
+      { type: 'system', session_id: 'sess-1' },
+      { type: 'assistant', session_id: 'sess-1', message: { role: 'assistant', content: 'Hi' } },
+      { type: 'result', session_id: 'sess-1', result: 'Hi' },
+    ]);
+
+    const proc = new ClaudeProcess({ cwd: tmpDir });
+    const received: ClaudeMessage[] = [];
+
+    await new Promise<void>((resolve, reject) => {
+      proc.on('message', (msg) => received.push(msg));
+      proc.on('error', reject);
+      proc.on('exit', () => resolve());
+    });
+
+    expect(received).toHaveLength(3);
+    expect(received[0].type).toBe('system');
+    expect(received[1].type).toBe('assistant');
+    expect(received[2].type).toBe('result');
+    expect(received[0].session_id).toBe('sess-1');
+  });
+
+  it('emits usage events from message_start and message_delta lines', async () => {
+    createFakeClaude([
+      {
+        type: 'message_start',
+        message: { usage: { input_tokens: 42, cache_read_input_tokens: 10, cache_creation_input_tokens: 5 } },
+      },
+      { type: 'message_delta', usage: { output_tokens: 7 } },
+      { type: 'result', result: 'done' },
+    ]);
+
+    const proc = new ClaudeProcess({ cwd: tmpDir });
+    const usageEvents: UsageEvent[] = [];
+
+    await new Promise<void>((resolve, reject) => {
+      proc.on('usage', (u) => usageEvents.push(u));
+      proc.on('error', reject);
+      proc.on('exit', () => resolve());
+    });
+
+    expect(usageEvents).toHaveLength(2);
+    expect(usageEvents[0]).toMatchObject({ inputTokens: 42, cacheReadTokens: 10, cacheWriteTokens: 5, outputTokens: 0 });
+    expect(usageEvents[1]).toMatchObject({ outputTokens: 7, inputTokens: 0 });
+  });
+
+  it('ignores non-JSON startup noise on stdout without throwing', async () => {
+    writeFileSync(
+      join(tmpDir, 'claude'),
+      `#!/usr/bin/env node
+process.stdout.write('startup noise\\n');
+process.stdout.write('  \\n');
+process.stdout.write(JSON.stringify({ type: 'result', result: 'ok' }) + '\\n');
+process.exit(0);
+`,
+      { mode: 0o755 },
+    );
+    process.env.PATH = `${tmpDir}:${originalPath}`;
+
+    const proc = new ClaudeProcess({ cwd: tmpDir });
+    const received: ClaudeMessage[] = [];
+
+    await new Promise<void>((resolve, reject) => {
+      proc.on('message', (msg) => received.push(msg));
+      proc.on('error', reject);
+      proc.on('exit', () => resolve());
+    });
+
+    expect(received).toHaveLength(1);
+    expect(received[0].type).toBe('result');
+  });
+
+  it('marks exited=true and emits the exit code after the process exits', async () => {
+    createFakeClaude([], 42);
+
+    const proc = new ClaudeProcess({ cwd: tmpDir });
+    expect(proc.exited).toBe(false);
+
+    const code = await new Promise<number | null>((resolve, reject) => {
+      proc.on('error', reject);
+      proc.on('exit', (c) => resolve(c));
+    });
+
+    expect(proc.exited).toBe(true);
+    expect(code).toBe(42);
+  });
+
+  it('handles large burst output — drainBuffer assembles all lines', async () => {
+    const messages = Array.from({ length: 50 }, (_, i) => ({
+      type: 'assistant',
+      session_id: 'sess-burst',
+      message: { role: 'assistant', content: `msg-${i}` },
+    }));
+    createFakeClaude(messages);
+
+    const proc = new ClaudeProcess({ cwd: tmpDir });
+    const received: ClaudeMessage[] = [];
+
+    await new Promise<void>((resolve, reject) => {
+      proc.on('message', (msg) => received.push(msg));
+      proc.on('error', reject);
+      proc.on('exit', () => resolve());
+    });
+
+    expect(received).toHaveLength(50);
+  });
+
+  it('throws when sendPrompt is called after the process has exited', async () => {
+    createFakeClaude([{ type: 'result', result: 'done' }]);
+
+    const proc = new ClaudeProcess({ cwd: tmpDir });
+    await new Promise<void>((resolve, reject) => {
+      proc.on('error', reject);
+      proc.on('exit', () => resolve());
+    });
+
+    expect(() => proc.sendPrompt('hello')).toThrow('Claude process has exited');
+  });
+
+  it('round-trip: sendPrompt payload reaches stdin and response is emitted', async () => {
+    createEchoClaude();
+
+    const proc = new ClaudeProcess({ cwd: tmpDir });
+    const received: ClaudeMessage[] = [];
+
+    const done = new Promise<void>((resolve, reject) => {
+      proc.on('message', (msg) => received.push(msg));
+      proc.on('error', reject);
+      proc.on('exit', () => resolve());
+    });
+
+    proc.sendPrompt('hello world');
+    // Close stdin so the fake script's 'end' event fires
+    (proc as unknown as { proc: { stdin: NodeJS.WritableStream } }).proc.stdin.end();
+
+    await done;
+
+    const resultMsg = received.find((m) => m.type === 'result');
+    expect(resultMsg).toBeDefined();
+    expect((resultMsg!.payload as { result?: string }).result).toContain('hello world');
+  });
+
+  it('extractText + ClaudeProcess message event — full parsing pipeline', async () => {
+    createFakeClaude([
+      {
+        type: 'assistant',
+        session_id: 'sess-pipe',
+        message: {
+          role: 'assistant',
+          content: [
+            { type: 'text', text: 'The answer is ' },
+            { type: 'tool_use', id: 'x', name: 'Bash', input: {} },
+            { type: 'text', text: '42.' },
+          ],
+        },
+      },
+      { type: 'result', session_id: 'sess-pipe', result: 'The answer is 42.' },
+    ]);
+
+    const proc = new ClaudeProcess({ cwd: tmpDir });
+    const texts: string[] = [];
+
+    await new Promise<void>((resolve, reject) => {
+      proc.on('message', (msg) => {
+        const t = extractText(msg);
+        if (t) texts.push(t);
+      });
+      proc.on('error', reject);
+      proc.on('exit', () => resolve());
+    });
+
+    expect(texts).toContain('The answer is 42.');
+  });
+});
 
 // ─── CronManager: real filesystem persist / reload ─────────────────────────
 
