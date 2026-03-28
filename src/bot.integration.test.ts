@@ -346,6 +346,19 @@ describe('CcTgBot integration — message pipeline', () => {
     expect(inst1).not.toBe(inst2);
   });
 
+  it('/reset creates a fresh Claude session for the next message', async () => {
+    await (bot as any).handleTelegram(makeMsg({ text: 'hello' }));
+    const inst1 = mocks.claudeInstance;
+
+    await (bot as any).handleTelegram(makeMsg({ text: '/reset' }));
+    // Session should be cleared; next message spawns a new ClaudeProcess
+    await (bot as any).handleTelegram(makeMsg({ text: 'hello again' }));
+    const inst2 = mocks.claudeInstance;
+
+    expect(inst1).not.toBe(inst2);
+    expect((bot as any).sessions.size).toBe(1);
+  });
+
   it('/stop in one thread does not kill session in another thread', async () => {
     await (bot as any).handleTelegram(makeMsg({ text: 'thread 1', message_thread_id: 1 }));
     await (bot as any).handleTelegram(makeMsg({ text: 'thread 2', message_thread_id: 2 }));
