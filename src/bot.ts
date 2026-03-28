@@ -452,7 +452,7 @@ export class CcTgBot {
     if (!fileId) return;
 
     console.log(`[voice:${chatId}] received voice message, transcribing...`);
-    this.bot.sendChatAction(chatId, "typing").catch(() => {});
+    this.bot.sendChatAction(chatId, "typing", threadId !== undefined ? { message_thread_id: threadId } : undefined).catch(() => {});
 
     try {
       const fileLink = await this.bot.getFileLink(fileId);
@@ -488,7 +488,7 @@ export class CcTgBot {
     const caption = msg.caption?.trim();
 
     console.log(`[photo:${chatId}] received image file_id=${best.file_id}`);
-    this.bot.sendChatAction(chatId, "typing").catch(() => {});
+    this.bot.sendChatAction(chatId, "typing", threadId !== undefined ? { message_thread_id: threadId } : undefined).catch(() => {});
 
     try {
       const fileLink = await this.bot.getFileLink(best.file_id);
@@ -509,7 +509,7 @@ export class CcTgBot {
     const fileName = doc.file_name ?? `file_${doc.file_id}`;
 
     console.log(`[doc:${chatId}] received document file_name=${fileName} mime=${doc.mime_type}`);
-    this.bot.sendChatAction(chatId, "typing").catch(() => {});
+    this.bot.sendChatAction(chatId, "typing", threadId !== undefined ? { message_thread_id: threadId } : undefined).catch(() => {});
 
     try {
       const uploadsDir = join(this.opts.cwd ?? process.cwd(), ".cc-tg", "uploads");
@@ -687,9 +687,11 @@ export class CcTgBot {
   private startTyping(chatId: number, session: Session): void {
     this.stopTyping(session);
     // Send immediately, then keep alive every 4s
-    this.bot.sendChatAction(chatId, "typing").catch(() => {});
+    // Pass message_thread_id so typing appears in the correct forum topic thread
+    const threadOpts = session.threadId !== undefined ? { message_thread_id: session.threadId } : undefined;
+    this.bot.sendChatAction(chatId, "typing", threadOpts).catch(() => {});
     session.typingTimer = setInterval(() => {
-      this.bot.sendChatAction(chatId, "typing").catch(() => {});
+      this.bot.sendChatAction(chatId, "typing", threadOpts).catch(() => {});
     }, TYPING_INTERVAL_MS);
   }
 

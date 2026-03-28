@@ -635,6 +635,18 @@ describe('CcTgBot', () => {
       // At minimum, sendChatAction should have been called
       expect(mocks.claudeSendPrompt).toHaveBeenCalledWith('Hello');
     });
+
+    it('typing indicator is sent to the correct thread', async () => {
+      await sendThreadMsg('Hello', 5);
+      // sendChatAction should be called with message_thread_id: 5
+      expect(mocks.tgSendChatAction).toHaveBeenCalledWith(42, 'typing', { message_thread_id: 5 });
+    });
+
+    it('typing indicator for DM has no message_thread_id', async () => {
+      await (bot as any).handleTelegram(makeMsg({ text: 'Hello' }));
+      // sendChatAction should be called without thread options
+      expect(mocks.tgSendChatAction).toHaveBeenCalledWith(42, 'typing', undefined);
+    });
   });
 
   describe('group chat support', () => {
