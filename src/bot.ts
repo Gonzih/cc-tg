@@ -31,6 +31,7 @@ const BOT_COMMANDS: Array<{ command: string; description: string }> = [
   { command: "restart", description: "Restart the bot process in-place" },
   { command: "get_file", description: "Send a file from the server to this chat" },
   { command: "cost", description: "Show session token usage and cost" },
+  { command: "skills", description: "List available Claude skills with descriptions" },
 ];
 
 export interface BotOptions {
@@ -435,9 +436,16 @@ export class CcTgBot {
       return;
     }
 
+    // /skills — list available Claude skills from ~/.claude/skills/
+    if (text === "/skills") {
+      await this.replyToChat(chatId, listSkills(), threadId);
+      return;
+    }
+
     const session = this.getOrCreateSession(chatId, threadId, threadName);
     try {
-      const prompt = buildPromptWithReplyContext(text, msg);
+      const enriched = await enrichPromptWithUrls(text);
+      const prompt = buildPromptWithReplyContext(enriched, msg);
       session.currentPrompt = prompt;
       session.claude.sendPrompt(prompt);
       this.startTyping(chatId, session);
@@ -1453,6 +1461,87 @@ function downloadToFile(url: string, destPath: string): Promise<void> {
       file.on("error", reject);
     }).on("error", reject);
   });
+}
+
+/** Fetch URL via Jina Reader and return first maxChars characters */
+function fetchUrlViaJina(url: string, maxChars = 2000): Promise<string> {
+  const jinaUrl = `https://r.jina.ai/${url}`;
+  return new Promise((resolve, reject) => {
+    https.get(jinaUrl, (res) => {
+      const chunks: Buffer[] = [];
+      res.on("data", (chunk: Buffer) => chunks.push(chunk));
+      res.on("end", () => {
+        const text = Buffer.concat(chunks).toString("utf8");
+        resolve(text.slice(0, maxChars));
+      });
+      res.on("error", reject);
+    }).on("error", reject);
+  });
+}
+
+/** Detect URLs in text, fetch each via Jina Reader, and prepend content to the prompt */
+export async function enrichPromptWithUrls(text: string): Promise<string> {
+  const urlRegex = /https?:\/\/[^\s]+/g;
+  const urls = text.match(urlRegex);
+  if (!urls || urls.length === 0) return text;
+
+  const prefixes: string[] = [];
+  for (const url of urls) {
+    // Skip jina.ai URLs to avoid recursion
+    if (url.includes("r.jina.ai")) continue;
+    try {
+      const content = await fetchUrlViaJina(url);
+      if (content.trim()) {
+        prefixes.push(`[Web content from ${url}]:\n${content}`);
+      }
+    } catch (err) {
+      console.warn(`[url-fetch] failed to fetch ${url}:`, (err as Error).message);
+    }
+  }
+
+  if (prefixes.length === 0) return text;
+  return prefixes.join("\n\n") + "\n\n" + text;
+}
+
+/** Parse frontmatter description from a skill markdown file */
+function parseSkillDescription(content: string): string | null {
+  const match = content.match(/^---\s*\n([\s\S]*?)\n---/);
+  if (!match) return null;
+  const frontmatter = match[1];
+  const descMatch = frontmatter.match(/^description:\s*(.+)$/m);
+  return descMatch ? descMatch[1].trim() : null;
+}
+
+/** List available skills from ~/.claude/skills/ */
+export function listSkills(): string {
+  const skillsDir = join(os.homedir(), ".claude", "skills");
+  if (!existsSync(skillsDir)) {
+    return "No skills directory found at ~/.claude/skills/";
+  }
+
+  let files: string[];
+  try {
+    files = readdirSync(skillsDir).filter((f) => f.endsWith(".md"));
+  } catch {
+    return "Could not read skills directory.";
+  }
+
+  if (files.length === 0) {
+    return "No skills found in ~/.claude/skills/";
+  }
+
+  const lines: string[] = ["Available skills:"];
+  for (const file of files.sort()) {
+    const name = "/" + file.replace(/\.md$/, "");
+    try {
+      const content = readFileSync(join(skillsDir, file), "utf8");
+      const description = parseSkillDescription(content);
+      lines.push(description ? `${name} — ${description}` : name);
+    } catch {
+      lines.push(name);
+    }
+  }
+  return lines.join("\n");
 }
 
 export function splitMessage(text: string, maxLen = 4096): string[] {
