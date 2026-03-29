@@ -10,11 +10,13 @@ import os from "os";
 import { execSync, spawn } from "child_process";
 import https from "https";
 import http from "http";
+import { Redis } from "ioredis";
 import { ClaudeProcess, extractText, ClaudeMessage, UsageEvent } from "./claude.js";
 import { transcribeVoice, isVoiceAvailable } from "./voice.js";
 import { formatForTelegram, splitLongMessage } from "./formatter.js";
 import { detectUsageLimit } from "./usage-limit.js";
 import { getCurrentToken, rotateToken, getTokenIndex, getTokenCount } from "./tokens.js";
+import { writeChatLog, type ChatMessage } from "./notifier.js";
 
 const BOT_COMMANDS: Array<{ command: string; description: string }> = [
   { command: "start", description: "Reset session and start fresh" },
@@ -38,6 +40,8 @@ export interface BotOptions {
   cwd?: string;
   allowedUserIds?: number[];
   groupChatIds?: number[];
+  redis?: Redis;
+  namespace?: string;
 }
 
 interface Session {
@@ -204,9 +208,13 @@ export class CcTgBot {
   private costStore: CostStore;
   private botUsername = "";
   private botId = 0;
+  private redis?: Redis;
+  private namespace: string;
 
   constructor(opts: BotOptions) {
     this.opts = opts;
+    this.redis = opts.redis;
+    this.namespace = opts.namespace ?? "default";
     this.bot = new TelegramBot(opts.telegramToken, { polling: true });
     this.bot.on("message", (msg) => this.handleTelegram(msg));
     this.bot.on("polling_error", (err) => console.error("[tg]", err.message));
@@ -229,6 +237,20 @@ export class CcTgBot {
     this.bot.setMyCommands(BOT_COMMANDS)
       .then(() => console.log("[tg] bot commands registered"))
       .catch((err: Error) => console.error("[tg] setMyCommands failed:", err.message));
+  }
+
+  /** Write a message to the Redis chat log. Fire-and-forget — no-op if Redis is not configured. */
+  private writeChatMessage(role: ChatMessage["role"], source: ChatMessage["source"], content: string, chatId: number): void {
+    if (!this.redis) return;
+    const msg: ChatMessage = {
+      id: `${source}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      source,
+      role,
+      content,
+      timestamp: new Date().toISOString(),
+      chatId,
+    };
+    writeChatLog(this.redis, this.namespace, msg);
   }
 
   /** Session key: "chatId:threadId" for topics, "chatId:main" for DMs/non-topic groups */
@@ -428,6 +450,7 @@ export class CcTgBot {
       session.currentPrompt = prompt;
       session.claude.sendPrompt(prompt);
       this.startTyping(chatId, session);
+      this.writeChatMessage("user", "telegram", text, chatId);
     } catch (err) {
       await this.replyToChat(chatId, `Error sending to Claude: ${(err as Error).message}`, threadId);
       this.killSession(chatId, true, threadId);
@@ -445,6 +468,7 @@ export class CcTgBot {
       session.currentPrompt = enriched;
       session.claude.sendPrompt(enriched);
       this.startTyping(chatId, session);
+      this.writeChatMessage("user", "ui", text, chatId);
     } catch (err) {
       await this.replyToChat(chatId, `Error sending to Claude: ${(err as Error).message}`);
       this.killSession(chatId, true);
@@ -586,6 +610,25 @@ export class CcTgBot {
       // Track files written by Write/Edit tool calls
       this.trackWrittenFiles(msg, session, sessionCwd);
 
+      // Publish tool call events to the chat log
+      if (msg.type === "assistant") {
+        const message = msg.payload.message as Record<string, unknown> | undefined;
+        const content = message?.content;
+        if (Array.isArray(content)) {
+          for (const block of content as Record<string, unknown>[]) {
+            if (block.type !== "tool_use") continue;
+            const name = block.name as string;
+            const input = block.input as Record<string, unknown> | undefined;
+            this.writeChatMessage(
+              "tool",
+              "cc-tg",
+              `[tool] ${name}: ${JSON.stringify(input ?? {}).slice(0, 120)}`,
+              chatId
+            );
+          }
+        }
+      }
+
       this.handleClaudeMessage(chatId, session, msg);
     });
     claude.on("stderr", (data) => {
@@ -711,6 +754,8 @@ export class CcTgBot {
     session.pendingText = "";
     session.flushTimer = null;
     if (!raw) return;
+
+    this.writeChatMessage("assistant", "cc-tg", raw, chatId);
 
     const text = session.isRetry ? `✅ Claude is back!\n\n${raw}` : raw;
     session.isRetry = false;
