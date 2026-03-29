@@ -15,6 +15,7 @@ const mocks = vi.hoisted(() => ({
   existsSyncMock: vi.fn().mockReturnValue(false),
   statSyncMock: vi.fn().mockReturnValue({ size: 1024, isFile: () => true }),
   execSyncMock: vi.fn().mockReturnValue(''),
+  writeChatLog: vi.fn(),
 }));
 
 vi.mock('node-telegram-bot-api', () => ({
@@ -70,6 +71,10 @@ vi.mock('child_process', async (importOriginal) => {
     execSync: mocks.execSyncMock,
   };
 });
+
+vi.mock('./notifier.js', () => ({
+  writeChatLog: mocks.writeChatLog,
+}));
 
 import { CcTgBot, splitMessage, enrichPromptWithUrls, listSkills } from './bot.js';
 
@@ -711,5 +716,117 @@ describe('listSkills', () => {
     expect(result).toContain('/my-skill');
     readdirMock.mockRestore();
     readFileMock.mockRestore();
+  });
+});
+
+describe('CcTgBot chat bridge', () => {
+  const mockRedis = {
+    lpush: vi.fn().mockResolvedValue(1),
+    ltrim: vi.fn().mockResolvedValue('OK'),
+    publish: vi.fn().mockResolvedValue(1),
+  };
+
+  function makeBotWithRedis() {
+    return new CcTgBot({ telegramToken: 'test-token', redis: mockRedis as never, namespace: 'test-ns' });
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({});
+    mocks.tgSetMyCommands.mockResolvedValue({});
+    mocks.existsSyncMock.mockReturnValue(false);
+  });
+
+  afterEach((ctx) => {
+    // stop bot if test stored one
+    const b = (ctx as any).bot as CcTgBot | undefined;
+    if (b) b.stop();
+  });
+
+  it('writes user message to Redis when a Telegram message is sent', async () => {
+    const bot = makeBotWithRedis();
+    await (bot as any).handleTelegram(makeMsg({ text: 'Hello Claude' }));
+    bot.stop();
+
+    expect(mocks.writeChatLog).toHaveBeenCalledWith(
+      mockRedis,
+      'test-ns',
+      expect.objectContaining({ role: 'user', source: 'telegram', content: 'Hello Claude' })
+    );
+  });
+
+  it('does not call writeChatLog when Redis is not configured', async () => {
+    const bot = new CcTgBot({ telegramToken: 'test-token' });
+    await (bot as any).handleTelegram(makeMsg({ text: 'Hello Claude' }));
+    bot.stop();
+
+    expect(mocks.writeChatLog).not.toHaveBeenCalled();
+  });
+
+  it('writes user message to Redis via handleUserMessage', async () => {
+    const bot = makeBotWithRedis();
+    await bot.handleUserMessage(42, 'UI message');
+    bot.stop();
+
+    expect(mocks.writeChatLog).toHaveBeenCalledWith(
+      mockRedis,
+      'test-ns',
+      expect.objectContaining({ role: 'user', source: 'ui', content: 'UI message' })
+    );
+  });
+
+  it('writes assistant response to Redis when Claude result is flushed', async () => {
+    vi.useFakeTimers();
+    const bot = makeBotWithRedis();
+
+    // Trigger session creation and get the message handler
+    await (bot as any).handleTelegram(makeMsg({ text: 'Hello' }));
+    const onCalls = mocks.claudeOn.mock.calls as [string, (...args: unknown[]) => void][];
+    const messageHandler = onCalls.find(([event]) => event === 'message')?.[1];
+
+    // Fire a result message from Claude
+    messageHandler?.({ type: 'result', payload: { result: 'Hi there!' }, raw: {} });
+    vi.advanceTimersByTime(1000);
+
+    bot.stop();
+    vi.useRealTimers();
+
+    expect(mocks.writeChatLog).toHaveBeenCalledWith(
+      mockRedis,
+      'test-ns',
+      expect.objectContaining({ role: 'assistant', source: 'cc-tg', content: 'Hi there!' })
+    );
+  });
+
+  it('writes tool call events to Redis when Claude uses a tool', async () => {
+    const bot = makeBotWithRedis();
+
+    await (bot as any).handleTelegram(makeMsg({ text: 'Hello' }));
+    const onCalls = mocks.claudeOn.mock.calls as [string, (...args: unknown[]) => void][];
+    const messageHandler = onCalls.find(([event]) => event === 'message')?.[1];
+
+    // Fire an assistant message with a tool_use block
+    messageHandler?.({
+      type: 'assistant',
+      payload: {
+        message: {
+          role: 'assistant',
+          content: [{ type: 'tool_use', name: 'Bash', input: { command: 'ls -la' } }],
+        },
+      },
+      raw: {},
+    });
+
+    bot.stop();
+
+    expect(mocks.writeChatLog).toHaveBeenCalledWith(
+      mockRedis,
+      'test-ns',
+      expect.objectContaining({
+        role: 'tool',
+        source: 'cc-tg',
+        content: expect.stringContaining('[tool] Bash:'),
+      })
+    );
   });
 });

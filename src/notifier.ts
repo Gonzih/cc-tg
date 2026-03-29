@@ -15,8 +15,8 @@ import TelegramBot from "node-telegram-bot-api";
 
 export interface ChatMessage {
   id: string;
-  source: "telegram" | "ui" | "claude";
-  role: "user" | "assistant";
+  source: "telegram" | "ui" | "claude" | "cc-tg";
+  role: "user" | "assistant" | "tool";
   content: string;
   timestamp: string;
   chatId: number;
