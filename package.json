@@ -1,6 +1,6 @@
 {
   "name": "@gonzih/cc-tg",
-  "version": "0.6.5",
+  "version": "0.6.6",
   "description": "Claude Code Telegram bot — chat with Claude Code via Telegram",
   "type": "module",
   "bin": {
