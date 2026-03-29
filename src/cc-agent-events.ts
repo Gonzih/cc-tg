@@ -11,6 +11,8 @@
  * Requires CC_AGENT_NOTIFY_CHAT_ID to send Telegram notifications.
  */
 
+import { readFileSync } from "fs";
+import { join } from "path";
 import { Redis } from "ioredis";
 import TelegramBot from "node-telegram-bot-api";
 import { ClaudeProcess, extractText } from "./claude.js";
@@ -47,6 +49,7 @@ export interface HandlerDeps {
   readJobOutput: (jobId: string) => Promise<string[]>;
   readCoordinatorPlan: (jobId: string) => Promise<CoordinatorPlan | null>;
   getRunningJobCount: () => Promise<number>;
+  getActiveChatIds: () => Promise<number[]>;
 }
 
 function log(level: "info" | "warn" | "error", ...args: unknown[]): void {
@@ -99,10 +102,21 @@ Reply in JSON:
 }`;
 }
 
+function extractJson(text: string): string {
+  // Strip ```json ... ``` fences
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fenced) return fenced[1].trim();
+  // Find first { ... } block
+  const start = text.indexOf("{");
+  const end = text.lastIndexOf("}");
+  if (start !== -1 && end !== -1) return text.slice(start, end + 1);
+  return "";
+}
+
 export function parseDecision(raw: string): DecisionResult {
-  const match = raw.match(/\{[\s\S]*\}/);
-  if (!match) throw new Error(`No JSON found in Claude response: ${raw.slice(0, 200)}`);
-  const parsed = JSON.parse(match[0]) as DecisionResult;
+  const extracted = extractJson(raw);
+  if (!extracted) throw new Error(`No JSON found in Claude response: ${raw.slice(0, 200)}`);
+  const parsed = JSON.parse(extracted) as DecisionResult;
   if (!["NOTIFY_ONLY", "SPAWN_FOLLOWUP", "SILENT"].includes(parsed.action)) {
     throw new Error(`Unknown action: ${parsed.action}`);
   }
@@ -130,14 +144,6 @@ function formatFailureMessage(event: JobEvent): string {
   const lastLine = event.lastLines[event.lastLines.length - 1] ?? "";
   const repoShort = event.repoUrl.replace(/^https?:\/\/github\.com\//, "");
   return `✗ ${event.title} failed\n${repoShort} — exit 1\nLast line: ${lastLine}`;
-}
-
-function getChatId(): number | null {
-  const chatIdStr = process.env.CC_AGENT_NOTIFY_CHAT_ID;
-  if (!chatIdStr) return null;
-  const chatId = Number(chatIdStr);
-  if (isNaN(chatId)) return null;
-  return chatId;
 }
 
 /**
@@ -281,6 +287,37 @@ export async function defaultGetRunningJobCount(): Promise<number> {
 }
 
 /**
+ * Returns chat IDs to notify about job events.
+ * Reads unique chatIds from the cron jobs file (same users who set up cron jobs).
+ * Falls back to CC_AGENT_NOTIFY_CHAT_ID env var for backward compatibility.
+ */
+export async function defaultGetActiveChatIds(): Promise<number[]> {
+  const ids = new Set<number>();
+
+  // Backward compat: explicit env var
+  const chatIdStr = process.env.CC_AGENT_NOTIFY_CHAT_ID;
+  if (chatIdStr) {
+    const chatId = Number(chatIdStr);
+    if (!isNaN(chatId)) ids.add(chatId);
+  }
+
+  // Read chatIds from cron jobs persistence file
+  try {
+    const cwd = process.env.CWD ?? process.cwd();
+    const cronFile = join(cwd, ".cc-tg", "crons.json");
+    const raw = readFileSync(cronFile, "utf-8");
+    const jobs = JSON.parse(raw) as Array<{ chatId: number }>;
+    for (const job of jobs) {
+      if (typeof job.chatId === "number") ids.add(job.chatId);
+    }
+  } catch {
+    // file doesn't exist or parse error — ignore
+  }
+
+  return Array.from(ids);
+}
+
+/**
  * Write a coordinator plan for a job, so cc-tg knows what follow-up to spawn.
  * Call this when spawning a job that has a planned follow-up.
  * TTL: 7 days.
@@ -342,10 +379,14 @@ export async function handleJobEvent(
   }
 
   let decision: DecisionResult;
+  let rawResponse = "";
   try {
-    const rawResponse = await deps.askClaude(buildDecisionPrompt(event, last40lines, coordinatorPlan));
+    rawResponse = await deps.askClaude(buildDecisionPrompt(event, last40lines, coordinatorPlan));
     decision = parseDecision(rawResponse);
   } catch (err) {
+    if (rawResponse) {
+      log("error", "[cc-agent-events] Claude raw response:", rawResponse.slice(0, 200));
+    }
     log("error", "Claude decision failed, falling back to NOTIFY_ONLY:", (err as Error).message);
     const fallbackMsg = event.status === "failed"
       ? formatFailureMessage(event)
@@ -355,17 +396,24 @@ export async function handleJobEvent(
 
   log("info", `Decision: ${decision.action} for job ${event.jobId}`);
 
-  const chatId = getChatId();
+  let chatIds: number[] = [];
+  try {
+    chatIds = await deps.getActiveChatIds();
+  } catch (err) {
+    log("warn", "Failed to get active chat IDs:", (err as Error).message);
+  }
 
   try {
     if (decision.action === "NOTIFY_ONLY") {
-      if (!chatId) {
-        log("warn", "NOTIFY_ONLY: CC_AGENT_NOTIFY_CHAT_ID not set, skipping notification");
+      if (chatIds.length === 0) {
+        log("warn", "NOTIFY_ONLY: no active chat IDs, skipping notification");
         return;
       }
       const msg = decision.message
         ?? (event.status === "failed" ? formatFailureMessage(event) : `Job completed: ${event.title}`);
-      await deps.sendTelegramMessage(chatId, msg);
+      for (const chatId of chatIds) {
+        await deps.sendTelegramMessage(chatId, msg);
+      }
     } else if (decision.action === "SPAWN_FOLLOWUP") {
       if (!decision.followup) {
         log("warn", "SPAWN_FOLLOWUP: no followup details in response");
@@ -376,11 +424,13 @@ export async function handleJobEvent(
         decision.followup.task
       );
       // Send Telegram notification about the spawn
-      if (chatId) {
+      if (chatIds.length > 0) {
         let runningCount = 0;
         try { runningCount = await deps.getRunningJobCount(); } catch {}
         const spawnMsg = formatSpawnMessage(event, decision.followup, runningCount);
-        await deps.sendTelegramMessage(chatId, spawnMsg);
+        for (const chatId of chatIds) {
+          await deps.sendTelegramMessage(chatId, spawnMsg);
+        }
       }
     } else {
       // SILENT — log only
@@ -399,6 +449,7 @@ function makeDefaultDeps(): HandlerDeps {
     readJobOutput: defaultReadJobOutput,
     readCoordinatorPlan: defaultReadCoordinatorPlan,
     getRunningJobCount: defaultGetRunningJobCount,
+    getActiveChatIds: defaultGetActiveChatIds,
   };
 }
 

@@ -55,6 +55,7 @@ function makeDeps(overrides: Partial<HandlerDeps> = {}): HandlerDeps & {
   readJobOutput: ReturnType<typeof vi.fn>;
   readCoordinatorPlan: ReturnType<typeof vi.fn>;
   getRunningJobCount: ReturnType<typeof vi.fn>;
+  getActiveChatIds: ReturnType<typeof vi.fn>;
 } {
   return {
     askClaude: vi.fn().mockResolvedValue('{"action":"SILENT"}'),
@@ -63,6 +64,7 @@ function makeDeps(overrides: Partial<HandlerDeps> = {}): HandlerDeps & {
     readJobOutput: vi.fn().mockResolvedValue([]),
     readCoordinatorPlan: vi.fn().mockResolvedValue(null),
     getRunningJobCount: vi.fn().mockResolvedValue(0),
+    getActiveChatIds: vi.fn().mockResolvedValue([]),
     ...overrides,
   };
 }
@@ -125,14 +127,12 @@ describe("handleJobEvent", () => {
     expect(deps.spawnFollowupAgent).not.toHaveBeenCalled();
   });
 
-  it("NOTIFY_ONLY — sends Telegram message with CC_AGENT_NOTIFY_CHAT_ID", async () => {
-    const originalEnv = process.env.CC_AGENT_NOTIFY_CHAT_ID;
-    process.env.CC_AGENT_NOTIFY_CHAT_ID = "12345";
-
+  it("NOTIFY_ONLY — sends Telegram message to all active chat IDs", async () => {
     const deps = makeDeps({
       askClaude: vi.fn().mockResolvedValue(
         JSON.stringify({ action: "NOTIFY_ONLY", message: "Job done successfully!" })
       ),
+      getActiveChatIds: vi.fn().mockResolvedValue([12345]),
     });
     const event = makeEvent({ status: "done" });
     await handleJobEvent(JSON.stringify(event), deps);
@@ -140,39 +140,32 @@ describe("handleJobEvent", () => {
     expect(deps.sendTelegramMessage).toHaveBeenCalledOnce();
     expect(deps.sendTelegramMessage).toHaveBeenCalledWith(12345, "Job done successfully!");
     expect(deps.spawnFollowupAgent).not.toHaveBeenCalled();
-
-    process.env.CC_AGENT_NOTIFY_CHAT_ID = originalEnv;
   });
 
-  it("NOTIFY_ONLY — skips silently if CC_AGENT_NOTIFY_CHAT_ID not set", async () => {
-    const originalEnv = process.env.CC_AGENT_NOTIFY_CHAT_ID;
-    delete process.env.CC_AGENT_NOTIFY_CHAT_ID;
-
+  it("NOTIFY_ONLY — skips silently if no active chat IDs", async () => {
     const deps = makeDeps({
       askClaude: vi.fn().mockResolvedValue(
         JSON.stringify({ action: "NOTIFY_ONLY", message: "Done!" })
       ),
+      getActiveChatIds: vi.fn().mockResolvedValue([]),
     });
     const event = makeEvent({ status: "done" });
     await handleJobEvent(JSON.stringify(event), deps);
 
     expect(deps.sendTelegramMessage).not.toHaveBeenCalled();
-
-    process.env.CC_AGENT_NOTIFY_CHAT_ID = originalEnv;
   });
 
   it("NOTIFY_ONLY — uses fallback message if none provided", async () => {
-    process.env.CC_AGENT_NOTIFY_CHAT_ID = "99";
     const deps = makeDeps({
       askClaude: vi.fn().mockResolvedValue(
         JSON.stringify({ action: "NOTIFY_ONLY" })
       ),
+      getActiveChatIds: vi.fn().mockResolvedValue([99]),
     });
     const event = makeEvent({ title: "my cool job" });
     await handleJobEvent(JSON.stringify(event), deps);
 
     expect(deps.sendTelegramMessage).toHaveBeenCalledWith(99, "Job completed: my cool job");
-    delete process.env.CC_AGENT_NOTIFY_CHAT_ID;
   });
 
   it("SPAWN_FOLLOWUP — calls spawnFollowupAgent with correct params", async () => {
@@ -194,8 +187,7 @@ describe("handleJobEvent", () => {
     );
   });
 
-  it("SPAWN_FOLLOWUP — sends Telegram notification when CC_AGENT_NOTIFY_CHAT_ID is set", async () => {
-    process.env.CC_AGENT_NOTIFY_CHAT_ID = "777";
+  it("SPAWN_FOLLOWUP — sends Telegram notification to all active chat IDs", async () => {
     const deps = makeDeps({
       askClaude: vi.fn().mockResolvedValue(
         JSON.stringify({
@@ -204,6 +196,7 @@ describe("handleJobEvent", () => {
         })
       ),
       getRunningJobCount: vi.fn().mockResolvedValue(3),
+      getActiveChatIds: vi.fn().mockResolvedValue([777]),
     });
     const event = makeEvent({ status: "done", score: 0.85, title: "backtesting harness" });
     await handleJobEvent(JSON.stringify(event), deps);
@@ -216,13 +209,9 @@ describe("handleJobEvent", () => {
     expect(msg).toContain("0.85");
     expect(msg).toContain("fix the tests");
     expect(msg).toContain("3 jobs running");
-    delete process.env.CC_AGENT_NOTIFY_CHAT_ID;
   });
 
-  it("SPAWN_FOLLOWUP — no Telegram when CC_AGENT_NOTIFY_CHAT_ID not set", async () => {
-    const originalEnv = process.env.CC_AGENT_NOTIFY_CHAT_ID;
-    delete process.env.CC_AGENT_NOTIFY_CHAT_ID;
-
+  it("SPAWN_FOLLOWUP — no Telegram when no active chat IDs", async () => {
     const deps = makeDeps({
       askClaude: vi.fn().mockResolvedValue(
         JSON.stringify({
@@ -230,14 +219,13 @@ describe("handleJobEvent", () => {
           followup: { repo_url: "https://github.com/foo/bar", task: "fix the tests" },
         })
       ),
+      getActiveChatIds: vi.fn().mockResolvedValue([]),
     });
     const event = makeEvent({ status: "done" });
     await handleJobEvent(JSON.stringify(event), deps);
 
     expect(deps.spawnFollowupAgent).toHaveBeenCalledOnce();
     expect(deps.sendTelegramMessage).not.toHaveBeenCalled();
-
-    process.env.CC_AGENT_NOTIFY_CHAT_ID = originalEnv;
   });
 
   it("SPAWN_FOLLOWUP without followup details — logs warning, no crash", async () => {
@@ -252,37 +240,32 @@ describe("handleJobEvent", () => {
     expect(deps.spawnFollowupAgent).not.toHaveBeenCalled();
   });
 
-  it("handles Claude error gracefully — falls back to NOTIFY_ONLY (no chatId = no telegram)", async () => {
-    const originalEnv = process.env.CC_AGENT_NOTIFY_CHAT_ID;
-    delete process.env.CC_AGENT_NOTIFY_CHAT_ID;
-
+  it("handles Claude error gracefully — falls back to NOTIFY_ONLY (no chatIds = no telegram)", async () => {
     const deps = makeDeps({
       askClaude: vi.fn().mockRejectedValue(new Error("Claude crashed")),
+      getActiveChatIds: vi.fn().mockResolvedValue([]),
     });
     const event = makeEvent({ status: "done" });
 
     await expect(handleJobEvent(JSON.stringify(event), deps)).resolves.toBeUndefined();
     expect(deps.sendTelegramMessage).not.toHaveBeenCalled();
-
-    process.env.CC_AGENT_NOTIFY_CHAT_ID = originalEnv;
   });
 
-  it("Claude error with chatId set — falls back to NOTIFY_ONLY and sends telegram", async () => {
-    process.env.CC_AGENT_NOTIFY_CHAT_ID = "42";
+  it("Claude error with active chatIds — falls back to NOTIFY_ONLY and sends telegram", async () => {
     const deps = makeDeps({
       askClaude: vi.fn().mockRejectedValue(new Error("Claude crashed")),
+      getActiveChatIds: vi.fn().mockResolvedValue([42]),
     });
     const event = makeEvent({ status: "done", title: "my job" });
 
     await expect(handleJobEvent(JSON.stringify(event), deps)).resolves.toBeUndefined();
     expect(deps.sendTelegramMessage).toHaveBeenCalledWith(42, "Job completed: my job");
-    delete process.env.CC_AGENT_NOTIFY_CHAT_ID;
   });
 
   it("failed job + Claude error — fallback uses failure format", async () => {
-    process.env.CC_AGENT_NOTIFY_CHAT_ID = "42";
     const deps = makeDeps({
       askClaude: vi.fn().mockRejectedValue(new Error("Claude crashed")),
+      getActiveChatIds: vi.fn().mockResolvedValue([42]),
     });
     const event = makeEvent({ status: "failed", title: "broken build", lastLines: ["error: build failed"] });
 
@@ -290,22 +273,17 @@ describe("handleJobEvent", () => {
     const [, msg] = deps.sendTelegramMessage.mock.calls[0] as [number, string];
     expect(msg).toContain("✗ broken build failed");
     expect(msg).toContain("error: build failed");
-    delete process.env.CC_AGENT_NOTIFY_CHAT_ID;
   });
 
   it("handles malformed Claude JSON gracefully — falls back to NOTIFY_ONLY", async () => {
-    const originalEnv = process.env.CC_AGENT_NOTIFY_CHAT_ID;
-    delete process.env.CC_AGENT_NOTIFY_CHAT_ID;
-
     const deps = makeDeps({
       askClaude: vi.fn().mockResolvedValue("I cannot decide right now."),
+      getActiveChatIds: vi.fn().mockResolvedValue([]),
     });
     const event = makeEvent({ status: "done" });
 
     await expect(handleJobEvent(JSON.stringify(event), deps)).resolves.toBeUndefined();
     expect(deps.sendTelegramMessage).not.toHaveBeenCalled();
-
-    process.env.CC_AGENT_NOTIFY_CHAT_ID = originalEnv;
   });
 
   it("handles malformed event message gracefully", async () => {
@@ -315,17 +293,16 @@ describe("handleJobEvent", () => {
   });
 
   it("handles Telegram send failure gracefully — no crash", async () => {
-    process.env.CC_AGENT_NOTIFY_CHAT_ID = "42";
     const deps = makeDeps({
       askClaude: vi.fn().mockResolvedValue(
         JSON.stringify({ action: "NOTIFY_ONLY", message: "Done!" })
       ),
       sendTelegramMessage: vi.fn().mockRejectedValue(new Error("Telegram API down")),
+      getActiveChatIds: vi.fn().mockResolvedValue([42]),
     });
     const event = makeEvent({ status: "done" });
 
     await expect(handleJobEvent(JSON.stringify(event), deps)).resolves.toBeUndefined();
-    delete process.env.CC_AGENT_NOTIFY_CHAT_ID;
   });
 
   it("calls readJobOutput with the job ID", async () => {
@@ -396,6 +373,35 @@ describe("handleJobEvent", () => {
     const prompt = deps.askClaude.mock.calls[0][0] as string;
     expect(prompt).toContain("run integration tests");
     expect(prompt).toContain("phase 2 of migration");
+  });
+
+  it("parses markdown-fenced JSON from Claude and fires SPAWN_FOLLOWUP", async () => {
+    const fencedResponse = [
+      "Here is my decision:",
+      "```json",
+      JSON.stringify({
+        action: "SPAWN_FOLLOWUP",
+        followup: { repo_url: "https://github.com/foo/bar", task: "run integration tests" },
+      }),
+      "```",
+    ].join("\n");
+
+    const deps = makeDeps({
+      askClaude: vi.fn().mockResolvedValue(fencedResponse),
+      getActiveChatIds: vi.fn().mockResolvedValue([42]),
+      readCoordinatorPlan: vi.fn().mockResolvedValue({
+        nextStep: { repo_url: "https://github.com/foo/bar", task: "run integration tests" },
+        summary: "phase 2",
+      }),
+    });
+    const event = makeEvent({ status: "done" });
+    await handleJobEvent(JSON.stringify(event), deps);
+
+    expect(deps.spawnFollowupAgent).toHaveBeenCalledWith(
+      "https://github.com/foo/bar",
+      "run integration tests"
+    );
+    expect(deps.sendTelegramMessage).toHaveBeenCalledOnce();
   });
 
   it("falls back gracefully when readCoordinatorPlan throws", async () => {
@@ -487,6 +493,19 @@ describe("parseDecision", () => {
 
   it("throws on unknown action", () => {
     expect(() => parseDecision('{"action":"UNKNOWN"}')).toThrow("Unknown action");
+  });
+
+  it("parses JSON wrapped in ```json fences", () => {
+    const raw = "```json\n{\"action\":\"NOTIFY_ONLY\",\"message\":\"all done\"}\n```";
+    const result = parseDecision(raw);
+    expect(result.action).toBe("NOTIFY_ONLY");
+    expect(result.message).toBe("all done");
+  });
+
+  it("parses JSON wrapped in plain ``` fences", () => {
+    const raw = "```\n{\"action\":\"SILENT\"}\n```";
+    const result = parseDecision(raw);
+    expect(result.action).toBe("SILENT");
   });
 });
 
