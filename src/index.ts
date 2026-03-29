@@ -127,22 +127,28 @@ const groupChatIds = process.env.GROUP_CHAT_IDS
 
 const cwd = process.env.CWD ?? process.cwd();
 
+// agent-ops / chat bridge — Redis is always initialized so the chat bridge works
+// regardless of whether CC_AGENT_OPS_PORT or CC_AGENT_NOTIFY_CHAT_ID are set.
+const redisUrl = process.env.REDIS_URL || "redis://localhost:6379";
+const namespace = process.env.CC_AGENT_NAMESPACE || "default";
+const sharedRedis = new Redis(redisUrl);
+sharedRedis.on("error", (err: Error) => {
+  // Non-fatal — Redis features (chat bridge, ops) degrade gracefully
+  console.warn("[redis] connection error:", err.message);
+});
+
 const bot = new CcTgBot({
   telegramToken,
   claudeToken,
   cwd,
   allowedUserIds,
   groupChatIds,
+  redis: sharedRedis,
+  namespace,
 });
-
-// agent-ops: optional self-registration + HTTP control endpoint
-const redisUrl = process.env.REDIS_URL || "redis://localhost:6379";
-const namespace = process.env.CC_AGENT_NAMESPACE || "default";
-let sharedRedis: Redis | null = null;
 
 if (process.env.CC_AGENT_OPS_PORT) {
   const botInfo = await bot.getMe();
-  sharedRedis = new Redis(redisUrl);
   const registry = new Registry(sharedRedis);
   await registry.register({
     namespace,
@@ -164,17 +170,23 @@ if (process.env.CC_AGENT_OPS_PORT) {
   console.log(`[ops] control server on port ${process.env.CC_AGENT_OPS_PORT}`);
 }
 
-// Notifier — subscribe to cca:notify:{namespace} and cca:chat:incoming:{namespace}
+// Notifier — always subscribe to cca:notify and cca:chat:incoming channels.
+// CC_AGENT_NOTIFY_CHAT_ID pins a fixed Telegram chatId; without it the last
+// active chatId is used dynamically for the chat bridge.
 const notifyChatId = process.env.CC_AGENT_NOTIFY_CHAT_ID
   ? Number(process.env.CC_AGENT_NOTIFY_CHAT_ID)
   : null;
 
-if (notifyChatId) {
-  if (!sharedRedis) sharedRedis = new Redis(redisUrl);
-  const notifierBot = new TelegramBot(telegramToken, { polling: false });
-  startNotifier(notifierBot, notifyChatId, namespace, sharedRedis, (cid, text) => bot.handleUserMessage(cid, text));
-  console.log(`[notifier] started for namespace=${namespace} chatId=${notifyChatId}`);
-}
+const notifierBot = new TelegramBot(telegramToken, { polling: false });
+startNotifier(
+  notifierBot,
+  notifyChatId,
+  namespace,
+  sharedRedis,
+  (cid, text) => bot.handleUserMessage(cid, text),
+  () => bot.getLastActiveChatId()
+);
+console.log(`[notifier] started for namespace=${namespace} chatId=${notifyChatId ?? "dynamic"}`);
 
 process.on("SIGINT", () => {
   console.log("\nShutting down...");

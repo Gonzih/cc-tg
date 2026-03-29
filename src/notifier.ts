@@ -54,17 +54,19 @@ export function writeChatLog(
  * Start the notifier.
  *
  * @param bot       - Telegram bot instance (for sending messages)
- * @param chatId    - Telegram chat ID to forward notifications to
+ * @param chatId    - Telegram chat ID to forward notifications to. Pass null to use getActiveChatId.
  * @param namespace - cc-agent namespace (used to build Redis channel names)
  * @param redis     - ioredis client in normal mode (will be duplicated for pub/sub)
  * @param handleUserMessage - Optional callback to feed UI messages into the active Claude session
+ * @param getActiveChatId   - Optional callback to resolve chatId dynamically (used when chatId is null)
  */
 export function startNotifier(
   bot: TelegramBot,
-  chatId: number,
+  chatId: number | null,
   namespace: string,
   redis: Redis,
-  handleUserMessage?: (chatId: number, text: string) => void
+  handleUserMessage?: (chatId: number, text: string) => void,
+  getActiveChatId?: () => number | undefined
 ): void {
   const sub = redis.duplicate({
     retryStrategy: (times: number) => {
@@ -105,9 +107,11 @@ export function startNotifier(
     const incomingChannel = `cca:chat:incoming:${namespace}`;
 
     if (channel === notifyChannel) {
-      bot.sendMessage(chatId, message).catch((err: Error) => {
-        log("warn", "sendMessage failed:", err.message);
-      });
+      if (chatId !== null) {
+        bot.sendMessage(chatId, message).catch((err: Error) => {
+          log("warn", "sendMessage failed:", err.message);
+        });
+      }
       return;
     }
 
@@ -120,25 +124,32 @@ export function startNotifier(
         // raw string message — use as-is
       }
 
-      // Echo to Telegram so the user sees UI messages in the chat
-      bot.sendMessage(chatId, `📱 [from UI]: ${content}`).catch((err: Error) => {
-        log("warn", "sendMessage (UI echo) failed:", err.message);
-      });
+      // Resolve the target chatId: prefer the fixed chatId, fall back to last active
+      const targetChatId = chatId ?? getActiveChatId?.();
 
-      // Log the incoming message
-      const inMsg: ChatMessage = {
-        id: `ui-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-        source: "ui",
-        role: "user",
-        content,
-        timestamp: new Date().toISOString(),
-        chatId,
-      };
-      writeChatLog(redis, namespace, inMsg);
+      if (targetChatId !== undefined) {
+        // Echo to Telegram so the user sees UI messages in the chat
+        bot.sendMessage(targetChatId, `📱 [from UI]: ${content}`).catch((err: Error) => {
+          log("warn", "sendMessage (UI echo) failed:", err.message);
+        });
 
-      // Feed into active Claude session as if user typed it
-      if (handleUserMessage) {
-        handleUserMessage(chatId, content);
+        // Log the incoming message
+        const inMsg: ChatMessage = {
+          id: `ui-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          source: "ui",
+          role: "user",
+          content,
+          timestamp: new Date().toISOString(),
+          chatId: targetChatId,
+        };
+        writeChatLog(redis, namespace, inMsg);
+
+        // Feed into active Claude session as if user typed it
+        if (handleUserMessage) {
+          handleUserMessage(targetChatId, content);
+        }
+      } else {
+        log("warn", "cca:chat:incoming: no active chatId to route message to");
       }
     }
   });
