@@ -20,19 +20,18 @@ import { PassThrough } from 'stream';
 // ---------------------------------------------------------------------------
 const claudeMocks = vi.hoisted(() => ({
   spawnMock: vi.fn(),
-  // realSpawn is populated by the mock factory below
   realSpawn: undefined as unknown as (...args: unknown[]) => unknown,
 }));
 
 vi.mock('child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('child_process')>();
-  // Save the real spawn so tests that need a genuine subprocess can restore it
   claudeMocks.realSpawn = actual.spawn as unknown as (...args: unknown[]) => unknown;
   return { ...actual, spawn: claudeMocks.spawnMock, execFileSync: vi.fn() };
 });
 
-import { ClaudeProcess, extractText, ClaudeMessage, UsageEvent } from './claude.js';
+import { ClaudeProcess, extractText, type ClaudeMessage, type UsageEvent } from './claude.js';
 import { detectUsageLimit } from './usage-limit.js';
+import { CronManager, type CronJob } from './cron.js';
 
 // ─── ClaudeProcess: real subprocess stream parsing ───────────────────────────
 //
@@ -280,166 +279,6 @@ process.exit(0);
   });
 });
 
-// ─── CronManager: real filesystem persist / reload ─────────────────────────
-
-import { CronManager, type CronJob } from './cron.js';
-
-describe('CronManager — real filesystem integration', () => {
-  let dir: string;
-
-  beforeEach(() => {
-    vi.useFakeTimers();
-    dir = mkdtempSync(join(tmpdir(), 'cc-tg-cron-test-'));
-  });
-
-  afterEach(() => {
-    vi.useRealTimers();
-    rmSync(dir, { recursive: true, force: true });
-  });
-
-  it('persists a job to disk and a new instance reloads it', () => {
-    const fire = vi.fn();
-    const mgr = new CronManager(dir, fire);
-    const job = mgr.add(42, 'every 1h', 'run diagnostics')!;
-    expect(job).not.toBeNull();
-
-    // The .cc-tg/crons.json file must exist now
-    const storePath = join(dir, '.cc-tg', 'crons.json');
-    expect(existsSync(storePath)).toBe(true);
-
-    // A freshly-created instance with the same directory should reload the job
-    const mgr2 = new CronManager(dir, fire);
-    const reloaded = mgr2.list(42);
-    expect(reloaded).toHaveLength(1);
-    expect(reloaded[0].id).toBe(job.id);
-    expect(reloaded[0].prompt).toBe('run diagnostics');
-    expect(reloaded[0].schedule).toBe('every 1h');
-    expect(reloaded[0].intervalMs).toBe(3_600_000);
-    expect(reloaded[0].chatId).toBe(42);
-
-    // Clean up timers from both managers
-    mgr.clearAll(42);
-    mgr2.clearAll(42);
-  });
-
-  it('persists multiple jobs across chats and reloads all of them', () => {
-    const fire = vi.fn();
-    const mgr = new CronManager(dir, fire);
-    mgr.add(42, 'every 30m', 'check logs');
-    mgr.add(42, 'every 2h', 'weekly report');
-    mgr.add(99, 'every 1d', 'backup');
-
-    const mgr2 = new CronManager(dir, fire);
-    expect(mgr2.list(42)).toHaveLength(2);
-    expect(mgr2.list(99)).toHaveLength(1);
-    expect(mgr2.list(99)[0].prompt).toBe('backup');
-
-    mgr.clearAll(42);
-    mgr.clearAll(99);
-    mgr2.clearAll(42);
-    mgr2.clearAll(99);
-  });
-
-  it('removal is reflected on disk — a new instance sees the updated list', () => {
-    const fire = vi.fn();
-    const mgr = new CronManager(dir, fire);
-    const a = mgr.add(42, 'every 1h', 'job A')!;
-    const b = mgr.add(42, 'every 2h', 'job B')!;
-
-    mgr.remove(42, a.id);
-
-    const mgr2 = new CronManager(dir, fire);
-    const jobs = mgr2.list(42);
-    expect(jobs).toHaveLength(1);
-    expect(jobs[0].id).toBe(b.id);
-
-    mgr.clearAll(42);
-    mgr2.clearAll(42);
-  });
-
-  it('clearAll removes all entries from disk', () => {
-    const fire = vi.fn();
-    const mgr = new CronManager(dir, fire);
-    mgr.add(42, 'every 1h', 'A');
-    mgr.add(42, 'every 2h', 'B');
-    mgr.clearAll(42);
-
-    const storePath = join(dir, '.cc-tg', 'crons.json');
-    const data: CronJob[] = JSON.parse(readFileSync(storePath, 'utf8'));
-    expect(data).toHaveLength(0);
-  });
-
-  it('update is persisted and visible to a new instance', () => {
-    const fire = vi.fn();
-    const mgr = new CronManager(dir, fire);
-    const job = mgr.add(42, 'every 1h', 'original prompt')!;
-    mgr.update(42, job.id, { prompt: 'updated prompt', schedule: 'every 2h' });
-
-    const mgr2 = new CronManager(dir, fire);
-    const reloaded = mgr2.list(42)[0];
-    expect(reloaded.prompt).toBe('updated prompt');
-    expect(reloaded.schedule).toBe('every 2h');
-    expect(reloaded.intervalMs).toBe(2 * 3_600_000);
-
-    mgr.clearAll(42);
-    mgr2.clearAll(42);
-  });
-
-  it('reloaded jobs fire their callbacks when the timer elapses', () => {
-    const fire = vi.fn().mockImplementation((_chatId, _prompt, _jobId, done) => done());
-
-    // Populate disk with a job using a first instance, then let it go out of scope
-    // without clearing (clearAll would erase the persisted data)
-    const mgr = new CronManager(dir, fire);
-    const job = mgr.add(42, 'every 1m', 'ping')!;
-
-    // Second instance loads from disk — it must also schedule the timer
-    const mgr2 = new CronManager(dir, fire);
-    expect(mgr2.list(42)[0].id).toBe(job.id);
-
-    // Advance time: both mgr and mgr2 have timers, so fire is called at least twice.
-    // The important thing is that mgr2's reloaded timer fires correctly.
-    vi.advanceTimersByTime(60_000);
-    expect(fire).toHaveBeenCalledWith(42, 'ping', expect.any(String), expect.any(Function));
-    expect(fire.mock.calls.length).toBeGreaterThanOrEqual(1);
-
-    mgr.clearAll(42);
-    mgr2.clearAll(42);
-  });
-
-  it('fires repeatedly on each interval tick', () => {
-    const fired: number[] = [];
-    const mgr = new CronManager(dir, (_c, _p, _id, done) => {
-      fired.push(Date.now());
-      done();
-    });
-    mgr.add(1, 'every 1h', 'repeat task');
-
-    vi.advanceTimersByTime(3_600_000 * 3);
-    expect(fired).toHaveLength(3);
-  });
-
-  it('skips a tick while previous invocation is still running', () => {
-    let pendingDone: (() => void) | null = null;
-    const fired: number[] = [];
-    const mgr = new CronManager(dir, (_c, _p, _id, done) => {
-      fired.push(Date.now());
-      pendingDone = done; // hold — simulates slow async work
-    });
-    mgr.add(1, 'every 1h', 'slow task');
-
-    vi.advanceTimersByTime(3_600_000); // fires → pendingDone is set
-    expect(fired).toHaveLength(1);
-
-    vi.advanceTimersByTime(3_600_000); // tick while still running → skipped
-    expect(fired).toHaveLength(1);
-
-    pendingDone!(); // mark done
-    vi.advanceTimersByTime(3_600_000); // next tick fires normally
-    expect(fired).toHaveLength(2);
-  });
-});
-
 // ─── Formatter + splitLongMessage pipeline ────────────────────────────────
 
 import { formatForTelegram, splitLongMessage } from './formatter.js';
@@ -639,6 +478,264 @@ describe('token pool lifecycle integration', () => {
     expect(getCurrentToken()).toBe(first);
     expect(getTokenIndex()).toBe(0);
   });
+
+  it('rotation guard: attempt <= count-1 correctly signals when all tokens exhausted', () => {
+    // Mirrors the bot logic: rotate only while attempt <= getTokenCount() - 1
+    process.env.CLAUDE_CODE_OAUTH_TOKENS = 'a,b,c';
+    delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    loadTokens();
+
+    const total = getTokenCount(); // 3
+    expect(total).toBe(3);
+
+    let attempt = 1;
+    expect(attempt <= total - 1).toBe(true); // can rotate on attempt 1 (1 <= 2)
+    rotateToken();
+    expect(getCurrentToken()).toBe('b');
+
+    attempt = 2;
+    expect(attempt <= total - 1).toBe(true); // can rotate on attempt 2 (2 <= 2)
+    rotateToken();
+    expect(getCurrentToken()).toBe('c');
+
+    attempt = 3;
+    expect(attempt <= total - 1).toBe(false); // all tokens exhausted (3 > 2)
+  });
+});
+
+// ─── detectUsageLimit + token rotation flow ──────────────────────────────
+
+describe('detectUsageLimit + token rotation integration', () => {
+  const origTokens = process.env.CLAUDE_CODE_OAUTH_TOKENS;
+
+  afterEach(() => {
+    if (origTokens !== undefined) {
+      process.env.CLAUDE_CODE_OAUTH_TOKENS = origTokens;
+    } else {
+      delete process.env.CLAUDE_CODE_OAUTH_TOKENS;
+    }
+    loadTokens();
+  });
+
+  it('usage_exhausted signal detected and token is rotated to secondary', () => {
+    process.env.CLAUDE_CODE_OAUTH_TOKENS = 'token-primary,token-secondary';
+    loadTokens();
+
+    const signal = detectUsageLimit('Claude: usage limit reached — extra usage has been disabled');
+
+    expect(signal.detected).toBe(true);
+    expect(signal.reason).toBe('usage_exhausted');
+    expect(signal.retryAfterMs).toBeGreaterThan(0);
+
+    const before = getCurrentToken();
+    rotateToken();
+    const after = getCurrentToken();
+
+    expect(before).toBe('token-primary');
+    expect(after).toBe('token-secondary');
+  });
+
+  it('rate_limit signal returns 2-minute retry window', () => {
+    const signal = detectUsageLimit('The API is currently overloaded');
+    expect(signal.detected).toBe(true);
+    expect(signal.reason).toBe('rate_limit');
+    expect(signal.retryAfterMs).toBe(2 * 60 * 1000);
+  });
+
+  it('clean text produces no signal', () => {
+    const signal = detectUsageLimit('Task complete. All tests passed.');
+    expect(signal.detected).toBe(false);
+    expect(signal.retryAfterMs).toBe(0);
+    expect(signal.humanMessage).toBe('');
+  });
+
+  it('wraps back to primary after exhausting backup pool', () => {
+    process.env.CLAUDE_CODE_OAUTH_TOKENS = 'tok-1,tok-2';
+    loadTokens();
+
+    rotateToken(); // tok-1 → tok-2
+    expect(getCurrentToken()).toBe('tok-2');
+
+    rotateToken(); // tok-2 → tok-1 (wrapped)
+    expect(getCurrentToken()).toBe('tok-1');
+  });
+
+  it('detects all four usage-exhausted phrases', () => {
+    const phrases = [
+      'extra usage has been consumed',
+      'Your usage has been disabled',
+      'billing_error occurred',
+      'usage limit hit',
+    ];
+    for (const phrase of phrases) {
+      const signal = detectUsageLimit(phrase);
+      expect(signal.detected, `expected detection for: "${phrase}"`).toBe(true);
+      expect(signal.reason).toBe('usage_exhausted');
+    }
+  });
+
+  it('usage_exhausted humanMessage includes a future UTC time', () => {
+    const signal = detectUsageLimit('extra usage limit reached');
+    expect(signal.detected).toBe(true);
+    expect(signal.humanMessage).toContain('Will auto-resume at');
+    // Should contain a UTC date string from toUTCString()
+    expect(signal.humanMessage).toMatch(/\w{3},\s+\d{2}\s+\w{3}\s+\d{4}/);
+  });
+});
+describe('CronManager — real filesystem integration', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    dir = mkdtempSync(join(tmpdir(), 'cc-tg-cron-test-'));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('persists a job to disk and a new instance reloads it', () => {
+    const fire = vi.fn();
+    const mgr = new CronManager(dir, fire);
+    const job = mgr.add(42, 'every 1h', 'run diagnostics')!;
+    expect(job).not.toBeNull();
+
+    // The .cc-tg/crons.json file must exist now
+    const storePath = join(dir, '.cc-tg', 'crons.json');
+    expect(existsSync(storePath)).toBe(true);
+
+    // A freshly-created instance with the same directory should reload the job
+    const mgr2 = new CronManager(dir, fire);
+    const reloaded = mgr2.list(42);
+    expect(reloaded).toHaveLength(1);
+    expect(reloaded[0].id).toBe(job.id);
+    expect(reloaded[0].prompt).toBe('run diagnostics');
+    expect(reloaded[0].schedule).toBe('every 1h');
+    expect(reloaded[0].intervalMs).toBe(3_600_000);
+    expect(reloaded[0].chatId).toBe(42);
+
+    // Clean up timers from both managers
+    mgr.clearAll(42);
+    mgr2.clearAll(42);
+  });
+
+  it('persists multiple jobs across chats and reloads all of them', () => {
+    const fire = vi.fn();
+    const mgr = new CronManager(dir, fire);
+    mgr.add(42, 'every 30m', 'check logs');
+    mgr.add(42, 'every 2h', 'weekly report');
+    mgr.add(99, 'every 1d', 'backup');
+
+    const mgr2 = new CronManager(dir, fire);
+    expect(mgr2.list(42)).toHaveLength(2);
+    expect(mgr2.list(99)).toHaveLength(1);
+    expect(mgr2.list(99)[0].prompt).toBe('backup');
+
+    mgr.clearAll(42);
+    mgr.clearAll(99);
+    mgr2.clearAll(42);
+    mgr2.clearAll(99);
+  });
+
+  it('removal is reflected on disk — a new instance sees the updated list', () => {
+    const fire = vi.fn();
+    const mgr = new CronManager(dir, fire);
+    const a = mgr.add(42, 'every 1h', 'job A')!;
+    const b = mgr.add(42, 'every 2h', 'job B')!;
+
+    mgr.remove(42, a.id);
+
+    const mgr2 = new CronManager(dir, fire);
+    const jobs = mgr2.list(42);
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0].id).toBe(b.id);
+
+    mgr.clearAll(42);
+    mgr2.clearAll(42);
+  });
+
+  it('clearAll removes all entries from disk', () => {
+    const fire = vi.fn();
+    const mgr = new CronManager(dir, fire);
+    mgr.add(42, 'every 1h', 'A');
+    mgr.add(42, 'every 2h', 'B');
+    mgr.clearAll(42);
+
+    const storePath = join(dir, '.cc-tg', 'crons.json');
+    const data: CronJob[] = JSON.parse(readFileSync(storePath, 'utf8'));
+    expect(data).toHaveLength(0);
+  });
+
+  it('update is persisted and visible to a new instance', () => {
+    const fire = vi.fn();
+    const mgr = new CronManager(dir, fire);
+    const job = mgr.add(42, 'every 1h', 'original prompt')!;
+    mgr.update(42, job.id, { prompt: 'updated prompt', schedule: 'every 2h' });
+
+    const mgr2 = new CronManager(dir, fire);
+    const reloaded = mgr2.list(42)[0];
+    expect(reloaded.prompt).toBe('updated prompt');
+    expect(reloaded.schedule).toBe('every 2h');
+    expect(reloaded.intervalMs).toBe(2 * 3_600_000);
+
+    mgr.clearAll(42);
+    mgr2.clearAll(42);
+  });
+
+  it('reloaded jobs fire their callbacks when the timer elapses', () => {
+    const fire = vi.fn().mockImplementation((_chatId, _prompt, _jobId, done) => done());
+
+    // Populate disk with a job using a first instance, then let it go out of scope
+    // without clearing (clearAll would erase the persisted data)
+    const mgr = new CronManager(dir, fire);
+    const job = mgr.add(42, 'every 1m', 'ping')!;
+
+    // Second instance loads from disk — it must also schedule the timer
+    const mgr2 = new CronManager(dir, fire);
+    expect(mgr2.list(42)[0].id).toBe(job.id);
+
+    // Advance time: both mgr and mgr2 have timers, so fire is called at least twice.
+    // The important thing is that mgr2's reloaded timer fires correctly.
+    vi.advanceTimersByTime(60_000);
+    expect(fire).toHaveBeenCalledWith(42, 'ping', expect.any(String), expect.any(Function));
+    expect(fire.mock.calls.length).toBeGreaterThanOrEqual(1);
+
+    mgr.clearAll(42);
+    mgr2.clearAll(42);
+  });
+
+  it('fires repeatedly on each interval tick', () => {
+    const fired: number[] = [];
+    const mgr = new CronManager(dir, (_c, _p, _id, done) => {
+      fired.push(Date.now());
+      done();
+    });
+    mgr.add(1, 'every 1h', 'repeat task');
+
+    vi.advanceTimersByTime(3_600_000 * 3);
+    expect(fired).toHaveLength(3);
+  });
+
+  it('skips a tick while previous invocation is still running', () => {
+    let pendingDone: (() => void) | null = null;
+    const fired: number[] = [];
+    const mgr = new CronManager(dir, (_c, _p, _id, done) => {
+      fired.push(Date.now());
+      pendingDone = done; // hold — simulates slow async work
+    });
+    mgr.add(1, 'every 1h', 'slow task');
+
+    vi.advanceTimersByTime(3_600_000); // fires → pendingDone is set
+    expect(fired).toHaveLength(1);
+
+    vi.advanceTimersByTime(3_600_000); // tick while still running → skipped
+    expect(fired).toHaveLength(1);
+
+    pendingDone!(); // mark done
+    vi.advanceTimersByTime(3_600_000); // next tick fires normally
+    expect(fired).toHaveLength(2);
+  });
 });
 
 // ─── ClaudeProcess stream parsing integration ────────────────────────────
@@ -803,85 +900,5 @@ describe('ClaudeProcess stream parsing integration', () => {
     const parsed = JSON.parse(written[0].trim()) as Record<string, unknown>;
     expect(parsed.type).toBe('user');
     expect((parsed.message as Record<string, unknown>).content).toBe('what is 2+2?');
-  });
-});
-
-// ─── detectUsageLimit + token rotation flow ──────────────────────────────
-
-describe('detectUsageLimit + token rotation integration', () => {
-  const origTokens = process.env.CLAUDE_CODE_OAUTH_TOKENS;
-
-  afterEach(() => {
-    if (origTokens !== undefined) {
-      process.env.CLAUDE_CODE_OAUTH_TOKENS = origTokens;
-    } else {
-      delete process.env.CLAUDE_CODE_OAUTH_TOKENS;
-    }
-    loadTokens();
-  });
-
-  it('usage_exhausted signal detected and token is rotated to secondary', () => {
-    process.env.CLAUDE_CODE_OAUTH_TOKENS = 'token-primary,token-secondary';
-    loadTokens();
-
-    const signal = detectUsageLimit('Claude: usage limit reached — extra usage has been disabled');
-
-    expect(signal.detected).toBe(true);
-    expect(signal.reason).toBe('usage_exhausted');
-    expect(signal.retryAfterMs).toBeGreaterThan(0);
-
-    const before = getCurrentToken();
-    rotateToken();
-    const after = getCurrentToken();
-
-    expect(before).toBe('token-primary');
-    expect(after).toBe('token-secondary');
-  });
-
-  it('rate_limit signal returns 2-minute retry window', () => {
-    const signal = detectUsageLimit('The API is currently overloaded');
-    expect(signal.detected).toBe(true);
-    expect(signal.reason).toBe('rate_limit');
-    expect(signal.retryAfterMs).toBe(2 * 60 * 1000);
-  });
-
-  it('clean text produces no signal', () => {
-    const signal = detectUsageLimit('Task complete. All tests passed.');
-    expect(signal.detected).toBe(false);
-    expect(signal.retryAfterMs).toBe(0);
-    expect(signal.humanMessage).toBe('');
-  });
-
-  it('wraps back to primary after exhausting backup pool', () => {
-    process.env.CLAUDE_CODE_OAUTH_TOKENS = 'tok-1,tok-2';
-    loadTokens();
-
-    rotateToken(); // tok-1 → tok-2
-    expect(getCurrentToken()).toBe('tok-2');
-
-    rotateToken(); // tok-2 → tok-1 (wrapped)
-    expect(getCurrentToken()).toBe('tok-1');
-  });
-
-  it('detects all four usage-exhausted phrases', () => {
-    const phrases = [
-      'extra usage has been consumed',
-      'Your usage has been disabled',
-      'billing_error occurred',
-      'usage limit hit',
-    ];
-    for (const phrase of phrases) {
-      const signal = detectUsageLimit(phrase);
-      expect(signal.detected, `expected detection for: "${phrase}"`).toBe(true);
-      expect(signal.reason).toBe('usage_exhausted');
-    }
-  });
-
-  it('usage_exhausted humanMessage includes a future UTC time', () => {
-    const signal = detectUsageLimit('extra usage limit reached');
-    expect(signal.detected).toBe(true);
-    expect(signal.humanMessage).toContain('Will auto-resume at');
-    // Should contain a UTC date string
-    expect(signal.humanMessage).toMatch(/\w{3},\s+\d{2}\s+\w{3}\s+\d{4}/);
   });
 });

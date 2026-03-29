@@ -1,0 +1,10 @@
+{
+  "42": {
+    "totalInputTokens": 0,
+    "totalOutputTokens": 0,
+    "totalCacheReadTokens": 0,
+    "totalCacheWriteTokens": 0,
+    "totalCostUsd": 0,
+    "messageCount": 1
+  }
+}

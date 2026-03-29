@@ -10,12 +10,14 @@ import os from "os";
 import { execSync, spawn } from "child_process";
 import https from "https";
 import http from "http";
+import { Redis } from "ioredis";
 import { ClaudeProcess, extractText, ClaudeMessage, UsageEvent } from "./claude.js";
 import { transcribeVoice, isVoiceAvailable } from "./voice.js";
-import { CronManager } from "./cron.js";
 import { formatForTelegram, splitLongMessage } from "./formatter.js";
 import { detectUsageLimit } from "./usage-limit.js";
 import { getCurrentToken, rotateToken, getTokenIndex, getTokenCount } from "./tokens.js";
+import { writeChatLog, type ChatMessage } from "./notifier.js";
+import { CronManager } from "./cron.js";
 
 const BOT_COMMANDS: Array<{ command: string; description: string }> = [
   { command: "start", description: "Reset session and start fresh" },
@@ -23,7 +25,6 @@ const BOT_COMMANDS: Array<{ command: string; description: string }> = [
   { command: "stop", description: "Stop the current Claude task" },
   { command: "status", description: "Check if a session is active" },
   { command: "help", description: "Show all available commands" },
-  { command: "cron", description: "Manage cron jobs — add/list/edit/remove/clear" },
   { command: "reload_mcp", description: "Restart the cc-agent MCP server process" },
   { command: "mcp_status", description: "Check MCP server connection status" },
   { command: "mcp_version", description: "Show cc-agent npm version and npx cache info" },
@@ -31,6 +32,8 @@ const BOT_COMMANDS: Array<{ command: string; description: string }> = [
   { command: "restart", description: "Restart the bot process in-place" },
   { command: "get_file", description: "Send a file from the server to this chat" },
   { command: "cost", description: "Show session token usage and cost" },
+  { command: "skills", description: "List available Claude skills with descriptions" },
+  { command: "cron", description: "Manage cron jobs — add/list/edit/remove/clear" },
 ];
 
 export interface BotOptions {
@@ -39,6 +42,8 @@ export interface BotOptions {
   cwd?: string;
   allowedUserIds?: number[];
   groupChatIds?: number[];
+  redis?: Redis;
+  namespace?: string;
 }
 
 interface Session {
@@ -111,11 +116,6 @@ function formatCostReport(cost: SessionCost): string {
     `  Cache read: ${formatTokens(cost.totalCacheReadTokens)} tokens ($${cacheReadCost.toFixed(3)})`,
     `  Cache write: ${formatTokens(cost.totalCacheWriteTokens)} tokens ($${cacheWriteCost.toFixed(3)})`,
   ].join("\n");
-}
-
-function formatCronCostFooter(usage: UsageEvent): string {
-  const cost = computeCostUsd(usage);
-  return `\n💰 Cron cost: $${cost.toFixed(4)} (${formatTokens(usage.inputTokens)} in / ${formatTokens(usage.outputTokens)} out tokens)`;
 }
 
 function formatAgentCostSummary(text: string): string {
@@ -207,13 +207,18 @@ export class CcTgBot {
   private sessions = new Map<string, Session>();
   private pendingRetries = new Map<string, PendingRetry>();
   private opts: BotOptions;
-  private cron: CronManager;
   private costStore: CostStore;
   private botUsername = "";
   private botId = 0;
+  private redis?: Redis;
+  private namespace: string;
+  private lastActiveChatId?: number;
+  private cron: CronManager;
 
   constructor(opts: BotOptions) {
     this.opts = opts;
+    this.redis = opts.redis;
+    this.namespace = opts.namespace ?? "default";
     this.bot = new TelegramBot(opts.telegramToken, { polling: true });
     this.bot.on("message", (msg) => this.handleTelegram(msg));
     this.bot.on("polling_error", (err) => console.error("[tg]", err.message));
@@ -224,14 +229,11 @@ export class CcTgBot {
       console.log(`[tg] bot identity: @${this.botUsername} (id=${this.botId})`);
     }).catch((err: Error) => console.error("[tg] getMe failed:", err.message));
 
-    // Cron manager — fires each task into an isolated ClaudeProcess.
-    // The `done` callback is passed through to runCronTask so the cron manager
-    // knows when a task finishes and can allow the next tick to run.
-    this.cron = new CronManager(opts.cwd ?? process.cwd(), (chatId, prompt, jobId, done) => {
+    this.costStore = new CostStore(opts.cwd ?? process.cwd());
+
+    this.cron = new CronManager(opts.cwd ?? process.cwd(), (chatId, prompt, _jobId, done) => {
       this.runCronTask(chatId, prompt, done);
     });
-
-    this.costStore = new CostStore(opts.cwd ?? process.cwd());
 
     this.registerBotCommands();
 
@@ -243,6 +245,25 @@ export class CcTgBot {
     this.bot.setMyCommands(BOT_COMMANDS)
       .then(() => console.log("[tg] bot commands registered"))
       .catch((err: Error) => console.error("[tg] setMyCommands failed:", err.message));
+  }
+
+  /** Write a message to the Redis chat log. Fire-and-forget — no-op if Redis is not configured. */
+  private writeChatMessage(role: ChatMessage["role"], source: ChatMessage["source"], content: string, chatId: number): void {
+    if (!this.redis) return;
+    const msg: ChatMessage = {
+      id: `${source}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      source,
+      role,
+      content,
+      timestamp: new Date().toISOString(),
+      chatId,
+    };
+    writeChatLog(this.redis, this.namespace, msg);
+  }
+
+  /** Returns the last chatId that sent a message — used by the chat bridge when no fixed chatId is configured. */
+  public getLastActiveChatId(): number | undefined {
+    return this.lastActiveChatId;
   }
 
   /** Session key: "chatId:threadId" for topics, "chatId:main" for DMs/non-topic groups */
@@ -298,6 +319,9 @@ export class CcTgBot {
       await this.replyToChat(chatId, "Not authorized.", threadId);
       return;
     }
+
+    // Track the last chat that sent us a message for the chat bridge
+    this.lastActiveChatId = chatId;
 
     // Group chat handling
     const isGroup = msg.chat.type === "group" || msg.chat.type === "supergroup";
@@ -377,12 +401,6 @@ export class CcTgBot {
       return;
     }
 
-    // /cron <schedule> <prompt> | /cron list | /cron clear | /cron remove <id>
-    if (text.startsWith("/cron")) {
-      await this.handleCron(chatId, text, threadId);
-      return;
-    }
-
     // /reload_mcp — kill cc-agent process so Claude Code auto-restarts it
     if (text === "/reload_mcp") {
       await this.handleReloadMcp(chatId, threadId);
@@ -413,6 +431,12 @@ export class CcTgBot {
       return;
     }
 
+    // /cron <schedule> <prompt> | /cron list | /cron clear | /cron remove <id>
+    if (text.startsWith("/cron")) {
+      await this.handleCron(chatId, text, threadId);
+      return;
+    }
+
     // /get_file <path> — send a file from the server to the user
     if (text.startsWith("/get_file")) {
       await this.handleGetFile(chatId, text, threadId);
@@ -435,15 +459,41 @@ export class CcTgBot {
       return;
     }
 
+    // /skills — list available Claude skills from ~/.claude/skills/
+    if (text === "/skills") {
+      await this.replyToChat(chatId, listSkills(), threadId);
+      return;
+    }
+
     const session = this.getOrCreateSession(chatId, threadId, threadName);
     try {
-      const prompt = buildPromptWithReplyContext(text, msg);
+      const enriched = await enrichPromptWithUrls(text);
+      const prompt = buildPromptWithReplyContext(enriched, msg);
       session.currentPrompt = prompt;
       session.claude.sendPrompt(prompt);
       this.startTyping(chatId, session);
+      this.writeChatMessage("user", "telegram", text, chatId);
     } catch (err) {
       await this.replyToChat(chatId, `Error sending to Claude: ${(err as Error).message}`, threadId);
       this.killSession(chatId, true, threadId);
+    }
+  }
+
+  /**
+   * Feed a text message into the active Claude session for the given chat.
+   * Called by the notifier when a UI message arrives via Redis pub/sub.
+   */
+  public async handleUserMessage(chatId: number, text: string): Promise<void> {
+    const session = this.getOrCreateSession(chatId);
+    try {
+      const enriched = await enrichPromptWithUrls(text);
+      session.currentPrompt = enriched;
+      session.claude.sendPrompt(enriched);
+      this.startTyping(chatId, session);
+      this.writeChatMessage("user", "ui", text, chatId);
+    } catch (err) {
+      await this.replyToChat(chatId, `Error sending to Claude: ${(err as Error).message}`);
+      this.killSession(chatId, true);
     }
   }
 
@@ -582,6 +632,25 @@ export class CcTgBot {
       // Track files written by Write/Edit tool calls
       this.trackWrittenFiles(msg, session, sessionCwd);
 
+      // Publish tool call events to the chat log
+      if (msg.type === "assistant") {
+        const message = msg.payload.message as Record<string, unknown> | undefined;
+        const content = message?.content;
+        if (Array.isArray(content)) {
+          for (const block of content as Record<string, unknown>[]) {
+            if (block.type !== "tool_use") continue;
+            const name = block.name as string;
+            const input = block.input as Record<string, unknown> | undefined;
+            this.writeChatMessage(
+              "tool",
+              "cc-tg",
+              `[tool] ${name}: ${JSON.stringify(input ?? {}).slice(0, 120)}`,
+              chatId
+            );
+          }
+        }
+      }
+
       this.handleClaudeMessage(chatId, session, msg);
     });
     claude.on("stderr", (data) => {
@@ -707,6 +776,8 @@ export class CcTgBot {
     session.pendingText = "";
     session.flushTimer = null;
     if (!raw) return;
+
+    this.writeChatMessage("assistant", "cc-tg", raw, chatId);
 
     const text = session.isRetry ? `✅ Claude is back!\n\n${raw}` : raw;
     session.isRetry = false;
@@ -910,238 +981,6 @@ export class CcTgBot {
     return (toolUse?.name as string) ?? "";
   }
 
-  private runCronTask(chatId: number, prompt: string, done: () => void = () => {}): void {
-    // Fresh isolated Claude session — never touches main conversation
-    const cronProcess = new ClaudeProcess({
-      cwd: this.opts.cwd,
-      token: this.opts.claudeToken,
-    });
-
-    const taskPrompt = [
-      "You are handling a scheduled background task.",
-      "This is NOT part of the user's ongoing conversation.",
-      "Be concise. Report results only. No greetings or pleasantries.",
-      "If there is nothing to report, say so in one sentence.",
-      "DEDUP RULE: If this task involves resuming or restarting interrupted agents/jobs,",
-      "  skip any job whose task description already starts with 'RESUMING' (it is already",
-      "  a resume attempt). Also skip any job that has a non-empty 'resumed_by' field.",
-      "  Only spawn a resume agent for a job if resume_count < 2 (when that field exists).",
-      "  This prevents exponential job growth when a cron re-discovers its own spawned agents.",
-      "",
-      `SCHEDULED TASK: ${prompt}`,
-    ].join("\n");
-
-    let output = "";
-    const cronUsage: UsageEvent = { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
-
-    cronProcess.on("usage", (usage: UsageEvent) => {
-      cronUsage.inputTokens += usage.inputTokens;
-      cronUsage.outputTokens += usage.outputTokens;
-      cronUsage.cacheReadTokens += usage.cacheReadTokens;
-      cronUsage.cacheWriteTokens += usage.cacheWriteTokens;
-    });
-
-    cronProcess.on("message", (msg: ClaudeMessage) => {
-      if (msg.type === "result") {
-        const text = extractText(msg);
-        if (text) output += text;
-
-        const result = output.trim();
-        if (result) {
-          let footer = "";
-          try {
-            footer = formatCronCostFooter(cronUsage);
-          } catch (err) {
-            console.error(`[cron] cost footer error:`, (err as Error).message);
-          }
-          const cronFormatted = formatForTelegram(`🕐 ${result}${footer}`);
-          const chunks = splitLongMessage(cronFormatted);
-          (async () => {
-            for (const chunk of chunks) {
-              try {
-                await this.bot.sendMessage(chatId, chunk, { parse_mode: "HTML" });
-              } catch {
-                // HTML parse failed — retry as plain text
-                try {
-                  await this.bot.sendMessage(chatId, chunk);
-                } catch (err) {
-                  console.error(`[cron] failed to send result to chat=${chatId}:`, (err as Error).message);
-                }
-              }
-            }
-          })();
-        }
-
-        cronProcess.kill();
-      }
-    });
-
-    cronProcess.on("error", (err: Error) => {
-      console.error(`[cron] task error for chat=${chatId}:`, err.message);
-      cronProcess.kill();
-      done();
-    });
-
-    cronProcess.on("exit", () => {
-      console.log(`[cron] task complete for chat=${chatId}`);
-      done();
-    });
-
-    cronProcess.sendPrompt(taskPrompt);
-  }
-
-  private async handleCron(chatId: number, text: string, threadId?: number): Promise<void> {
-    const args = text.slice("/cron".length).trim();
-
-    // /cron list
-    if (args === "list" || args === "") {
-      const jobs = this.cron.list(chatId);
-      if (!jobs.length) {
-        await this.replyToChat(chatId, "No cron jobs.", threadId);
-        return;
-      }
-      const lines = jobs.map((j, i) => {
-        const short = j.prompt.length > 50 ? j.prompt.slice(0, 50) + "…" : j.prompt;
-        return `#${i + 1} ${j.schedule} — "${short}"`;
-      });
-      await this.replyToChat(chatId, `Cron jobs (${jobs.length}):\n${lines.join("\n")}`, threadId);
-      return;
-    }
-
-    // /cron clear
-    if (args === "clear") {
-      const n = this.cron.clearAll(chatId);
-      await this.replyToChat(chatId, `Cleared ${n} cron job(s).`, threadId);
-      return;
-    }
-
-    // /cron remove <id>
-    if (args.startsWith("remove ")) {
-      const id = args.slice("remove ".length).trim();
-      const ok = this.cron.remove(chatId, id);
-      await this.replyToChat(chatId, ok ? `Removed ${id}.` : `Not found: ${id}`, threadId);
-      return;
-    }
-
-    // /cron edit [<#> ...]
-    if (args === "edit" || args.startsWith("edit ")) {
-      await this.handleCronEdit(chatId, args.slice("edit".length).trim(), threadId);
-      return;
-    }
-
-    // /cron every 1h <prompt>
-    const scheduleMatch = args.match(/^(every\s+\d+[mhd])\s+(.+)$/i);
-    if (!scheduleMatch) {
-      await this.replyToChat(
-        chatId,
-        "Usage:\n/cron every 1h <prompt>\n/cron list\n/cron edit\n/cron remove <id>\n/cron clear",
-        threadId
-      );
-      return;
-    }
-
-    const schedule = scheduleMatch[1];
-    const prompt = scheduleMatch[2];
-    const job = this.cron.add(chatId, schedule, prompt);
-    if (!job) {
-      await this.replyToChat(chatId, "Invalid schedule. Use: every 30m / every 2h / every 1d", threadId);
-      return;
-    }
-    await this.replyToChat(chatId, `Cron set [${job.id}]: ${schedule} — "${prompt}"`, threadId);
-  }
-
-  private async handleCronEdit(chatId: number, editArgs: string, threadId?: number): Promise<void> {
-    const jobs = this.cron.list(chatId);
-
-    // No args — show numbered list with edit instructions
-    if (!editArgs) {
-      if (!jobs.length) {
-        await this.replyToChat(chatId, "No cron jobs to edit.", threadId);
-        return;
-      }
-      const lines = jobs.map((j, i) => {
-        const short = j.prompt.length > 50 ? j.prompt.slice(0, 50) + "…" : j.prompt;
-        return `#${i + 1} ${j.schedule} — "${short}"`;
-      });
-      await this.replyToChat(
-        chatId,
-        `Cron jobs:\n${lines.join("\n")}\n\n` +
-        "Edit options:\n" +
-        "/cron edit <#> every <N><unit> <new prompt>\n" +
-        "/cron edit <#> schedule every <N><unit>\n" +
-        "/cron edit <#> prompt <new prompt>",
-        threadId
-      );
-      return;
-    }
-
-    // Expect: <index> <rest>
-    const indexMatch = editArgs.match(/^(\d+)\s+(.+)$/);
-    if (!indexMatch) {
-      await this.replyToChat(chatId, "Usage: /cron edit <#> every <N><unit> <new prompt>", threadId);
-      return;
-    }
-
-    const index = parseInt(indexMatch[1], 10) - 1;
-    if (index < 0 || index >= jobs.length) {
-      await this.replyToChat(chatId, `Invalid job number. Use /cron edit to see the list.`, threadId);
-      return;
-    }
-
-    const job = jobs[index];
-    const editCmd = indexMatch[2];
-
-    // /cron edit <#> schedule every <N><unit>
-    if (editCmd.startsWith("schedule ")) {
-      const newSchedule = editCmd.slice("schedule ".length).trim();
-      const result = this.cron.update(chatId, job.id, { schedule: newSchedule });
-      if (result === null) {
-        await this.replyToChat(chatId, "Invalid schedule. Use: every 30m / every 2h / every 1d", threadId);
-      } else if (result === false) {
-        await this.replyToChat(chatId, "Job not found.", threadId);
-      } else {
-        await this.replyToChat(chatId, `#${index + 1} schedule updated to ${newSchedule}.`, threadId);
-      }
-      return;
-    }
-
-    // /cron edit <#> prompt <new-prompt>
-    if (editCmd.startsWith("prompt ")) {
-      const newPrompt = editCmd.slice("prompt ".length).trim();
-      const result = this.cron.update(chatId, job.id, { prompt: newPrompt });
-      if (result === false) {
-        await this.replyToChat(chatId, "Job not found.", threadId);
-      } else {
-        await this.replyToChat(chatId, `#${index + 1} prompt updated to "${newPrompt}".`, threadId);
-      }
-      return;
-    }
-
-    // /cron edit <#> every <N><unit> <new-prompt>
-    const fullMatch = editCmd.match(/^(every\s+\d+[mhd])\s+(.+)$/i);
-    if (fullMatch) {
-      const newSchedule = fullMatch[1];
-      const newPrompt = fullMatch[2];
-      const result = this.cron.update(chatId, job.id, { schedule: newSchedule, prompt: newPrompt });
-      if (result === null) {
-        await this.replyToChat(chatId, "Invalid schedule. Use: every 30m / every 2h / every 1d", threadId);
-      } else if (result === false) {
-        await this.replyToChat(chatId, "Job not found.", threadId);
-      } else {
-        await this.replyToChat(chatId, `#${index + 1} updated: ${newSchedule} — "${newPrompt}"`, threadId);
-      }
-      return;
-    }
-
-    await this.replyToChat(
-      chatId,
-      "Edit options:\n" +
-      "/cron edit <#> every <N><unit> <new prompt>\n" +
-      "/cron edit <#> schedule every <N><unit>\n" +
-      "/cron edit <#> prompt <new prompt>",
-      threadId
-    );
-  }
 
   /** Find cc-agent PIDs via pgrep. Returns array of numeric PIDs. */
   private findCcAgentPids(): number[] {
@@ -1275,6 +1114,74 @@ export class CcTgBot {
     process.exit(0);
   }
 
+  private async handleCron(chatId: number, text: string, threadId?: number): Promise<void> {
+    const args = text.slice("/cron".length).trim();
+
+    if (args === "list" || args === "") {
+      const jobs = this.cron.list(chatId);
+      if (!jobs.length) {
+        await this.replyToChat(chatId, "No cron jobs.", threadId);
+        return;
+      }
+      const lines = jobs.map((j, i) => {
+        const short = j.prompt.length > 50 ? j.prompt.slice(0, 50) + "…" : j.prompt;
+        return `#${i + 1} ${j.schedule} — "${short}"`;
+      });
+      await this.replyToChat(chatId, `Cron jobs (${jobs.length}):\n${lines.join("\n")}`, threadId);
+      return;
+    }
+
+    if (args === "clear") {
+      const n = this.cron.clearAll(chatId);
+      await this.replyToChat(chatId, `Cleared ${n} cron job(s).`, threadId);
+      return;
+    }
+
+    if (args.startsWith("remove ")) {
+      const id = args.slice("remove ".length).trim();
+      const ok = this.cron.remove(chatId, id);
+      await this.replyToChat(chatId, ok ? `Removed ${id}.` : `Not found: ${id}`, threadId);
+      return;
+    }
+
+    const scheduleMatch = args.match(/^(every\s+\d+[mhd])\s+(.+)$/i);
+    if (!scheduleMatch) {
+      await this.replyToChat(
+        chatId,
+        "Usage:\n/cron every 1h <prompt>\n/cron list\n/cron remove <id>\n/cron clear",
+        threadId
+      );
+      return;
+    }
+
+    const schedule = scheduleMatch[1];
+    const prompt = scheduleMatch[2];
+    const job = this.cron.add(chatId, schedule, prompt);
+    if (!job) {
+      await this.replyToChat(chatId, "Invalid schedule. Use: every 30m / every 2h / every 1d", threadId);
+      return;
+    }
+    await this.replyToChat(chatId, `Cron set [${job.id}]: ${schedule} — "${prompt}"`, threadId);
+  }
+
+  private runCronTask(chatId: number, prompt: string, done: () => void = () => {}): void {
+    const cronProcess = new ClaudeProcess({ cwd: this.opts.cwd ?? process.cwd() });
+    cronProcess.sendPrompt(prompt);
+    cronProcess.on("message", (msg: ClaudeMessage) => {
+      const result = extractText(msg);
+      if (result) {
+        const formatted = formatForTelegram(`🕐 ${result}`);
+        const chunks = splitLongMessage(formatted);
+        for (const chunk of chunks) {
+          this.replyToChat(chatId, chunk).catch((err: Error) =>
+            console.error("[cron] send failed:", err.message)
+          );
+        }
+      }
+    });
+    cronProcess.on("exit", () => done());
+  }
+
   private async handleGetFile(chatId: number, text: string, threadId?: number): Promise<void> {
     const arg = text.slice("/get_file".length).trim();
     if (!arg) {
@@ -1390,7 +1297,7 @@ export class CcTgBot {
     });
   }
 
-  private killSession(chatId: number, keepCrons = true, threadId?: number): void {
+  private killSession(chatId: number, _keepCrons = true, threadId?: number): void {
     const key = this.sessionKey(chatId, threadId);
     const session = this.sessions.get(key);
     if (session) {
@@ -1398,7 +1305,6 @@ export class CcTgBot {
       session.claude.kill();
       this.sessions.delete(key);
     }
-    if (!keepCrons) this.cron.clearAll(chatId);
   }
 
   getMe(): Promise<TelegramBot.User> {
@@ -1453,6 +1359,87 @@ function downloadToFile(url: string, destPath: string): Promise<void> {
       file.on("error", reject);
     }).on("error", reject);
   });
+}
+
+/** Fetch URL via Jina Reader and return first maxChars characters */
+function fetchUrlViaJina(url: string, maxChars = 2000): Promise<string> {
+  const jinaUrl = `https://r.jina.ai/${url}`;
+  return new Promise((resolve, reject) => {
+    https.get(jinaUrl, (res) => {
+      const chunks: Buffer[] = [];
+      res.on("data", (chunk: Buffer) => chunks.push(chunk));
+      res.on("end", () => {
+        const text = Buffer.concat(chunks).toString("utf8");
+        resolve(text.slice(0, maxChars));
+      });
+      res.on("error", reject);
+    }).on("error", reject);
+  });
+}
+
+/** Detect URLs in text, fetch each via Jina Reader, and prepend content to the prompt */
+export async function enrichPromptWithUrls(text: string): Promise<string> {
+  const urlRegex = /https?:\/\/[^\s]+/g;
+  const urls = text.match(urlRegex);
+  if (!urls || urls.length === 0) return text;
+
+  const prefixes: string[] = [];
+  for (const url of urls) {
+    // Skip jina.ai URLs to avoid recursion
+    if (url.includes("r.jina.ai")) continue;
+    try {
+      const content = await fetchUrlViaJina(url);
+      if (content.trim()) {
+        prefixes.push(`[Web content from ${url}]:\n${content}`);
+      }
+    } catch (err) {
+      console.warn(`[url-fetch] failed to fetch ${url}:`, (err as Error).message);
+    }
+  }
+
+  if (prefixes.length === 0) return text;
+  return prefixes.join("\n\n") + "\n\n" + text;
+}
+
+/** Parse frontmatter description from a skill markdown file */
+function parseSkillDescription(content: string): string | null {
+  const match = content.match(/^---\s*\n([\s\S]*?)\n---/);
+  if (!match) return null;
+  const frontmatter = match[1];
+  const descMatch = frontmatter.match(/^description:\s*(.+)$/m);
+  return descMatch ? descMatch[1].trim() : null;
+}
+
+/** List available skills from ~/.claude/skills/ */
+export function listSkills(): string {
+  const skillsDir = join(os.homedir(), ".claude", "skills");
+  if (!existsSync(skillsDir)) {
+    return "No skills directory found at ~/.claude/skills/";
+  }
+
+  let files: string[];
+  try {
+    files = readdirSync(skillsDir).filter((f) => f.endsWith(".md"));
+  } catch {
+    return "Could not read skills directory.";
+  }
+
+  if (files.length === 0) {
+    return "No skills found in ~/.claude/skills/";
+  }
+
+  const lines: string[] = ["Available skills:"];
+  for (const file of files.sort()) {
+    const name = "/" + file.replace(/\.md$/, "");
+    try {
+      const content = readFileSync(join(skillsDir, file), "utf8");
+      const description = parseSkillDescription(content);
+      lines.push(description ? `${name} — ${description}` : name);
+    } catch {
+      lines.push(name);
+    }
+  }
+  return lines.join("\n");
 }
 
 export function splitMessage(text: string, maxLen = 4096): string[] {

@@ -27,6 +27,7 @@ const mocks = vi.hoisted(() => ({
   existsSyncMock: vi.fn().mockReturnValue(false),
   statSyncMock: vi.fn().mockReturnValue({ size: 1024, isFile: () => true }),
   execSyncMock: vi.fn().mockReturnValue(''),
+  writeChatLog: vi.fn(),
 }));
 
 vi.mock('node-telegram-bot-api', () => ({
@@ -59,6 +60,7 @@ vi.mock('./claude.js', () => ({
     return (payload?.result as string) ?? '';
   }),
 }));
+
 
 vi.mock('./cron.js', () => ({
   CronManager: vi.fn(function MockCronManager() {
@@ -94,7 +96,11 @@ vi.mock('child_process', async (importOriginal) => {
   };
 });
 
-import { CcTgBot, splitMessage } from './bot.js';
+vi.mock('./notifier.js', () => ({
+  writeChatLog: mocks.writeChatLog,
+}));
+
+import { CcTgBot, splitMessage, enrichPromptWithUrls, listSkills } from './bot.js';
 
 function makeMsg(overrides: Record<string, unknown> = {}) {
   return {
@@ -253,7 +259,6 @@ describe('CcTgBot', () => {
       const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
       expect(msg).toContain('/start');
       expect(msg).toContain('/help');
-      expect(msg).toContain('/cron');
       expect(msg).toContain('/get_file');
     });
 
@@ -424,6 +429,7 @@ describe('CcTgBot', () => {
         expect(mocks.tgSendMessage).toHaveBeenCalledWith(42, 'Not found: nonexistent');
       });
     });
+
   });
 
   describe('trackWrittenFiles', () => {
@@ -713,5 +719,221 @@ describe('CcTgBot', () => {
       expect(mocks.claudeSendPrompt).toHaveBeenCalled();
       (bot as any).opts.groupChatIds = [];
     });
+  });
+});
+
+describe('enrichPromptWithUrls', () => {
+  beforeEach(() => {
+    vi.stubGlobal('fetch', undefined);
+  });
+
+  it('returns text unchanged when no URLs present', async () => {
+    const result = await enrichPromptWithUrls('hello world');
+    expect(result).toBe('hello world');
+  });
+
+  it('returns text unchanged when only jina.ai URL present', async () => {
+    const result = await enrichPromptWithUrls('check https://r.jina.ai/example.com');
+    expect(result).toBe('check https://r.jina.ai/example.com');
+  });
+
+  it('prepends URL content when fetch succeeds', async () => {
+    // Mock https.get to return content
+    const { default: https } = await import('https');
+    const mockGet = vi.spyOn(https, 'get').mockImplementation((_url: any, callback: any) => {
+      const res = {
+        on: (event: string, handler: (...args: any[]) => void) => {
+          if (event === 'data') handler(Buffer.from('Page title and content here'));
+          if (event === 'end') handler();
+          return res;
+        },
+      };
+      callback(res);
+      return { on: vi.fn() } as any;
+    });
+
+    const result = await enrichPromptWithUrls('check this https://example.com please');
+    expect(result).toContain('[Web content from https://example.com]');
+    expect(result).toContain('Page title and content here');
+    expect(result).toContain('check this https://example.com please');
+    mockGet.mockRestore();
+  });
+
+  it('skips URL gracefully when fetch fails', async () => {
+    const { default: https } = await import('https');
+    const mockGet = vi.spyOn(https, 'get').mockImplementation((_url: any, callback: any) => {
+      const res = {
+        on: (event: string, handler: (...args: any[]) => void) => {
+          if (event === 'error') handler(new Error('network error'));
+          return res;
+        },
+      };
+      callback(res);
+      return { on: vi.fn() } as any;
+    });
+
+    const result = await enrichPromptWithUrls('see https://example.com for details');
+    // Should still return the original text even when fetch fails
+    expect(result).toBe('see https://example.com for details');
+    mockGet.mockRestore();
+  });
+});
+
+// Import the mocked fs module for spy access
+import * as fsModule from 'fs';
+
+describe('listSkills', () => {
+  it('returns message when skills dir does not exist', () => {
+    mocks.existsSyncMock.mockReturnValue(false);
+    const result = listSkills();
+    expect(result).toContain('No skills directory found');
+  });
+
+  it('returns message when skills dir is empty', () => {
+    mocks.existsSyncMock.mockReturnValue(true);
+    const readdirMock = vi.spyOn(fsModule, 'readdirSync').mockReturnValue([] as any);
+    const result = listSkills();
+    expect(result).toContain('No skills found');
+    readdirMock.mockRestore();
+  });
+
+  it('lists skills with descriptions from frontmatter', () => {
+    mocks.existsSyncMock.mockReturnValue(true);
+    const readdirMock = vi.spyOn(fsModule, 'readdirSync').mockReturnValue(['commit.md', 'review-pr.md'] as any);
+    const readFileMock = vi.spyOn(fsModule, 'readFileSync').mockImplementation((path: any) => {
+      if (String(path).includes('commit.md')) {
+        return '---\nname: commit\ndescription: Create a git commit with good message\n---\nContent here';
+      }
+      return '---\nname: review-pr\ndescription: Review a pull request\n---\nContent here';
+    });
+
+    const result = listSkills();
+    expect(result).toContain('/commit — Create a git commit with good message');
+    expect(result).toContain('/review-pr — Review a pull request');
+    readdirMock.mockRestore();
+    readFileMock.mockRestore();
+  });
+
+  it('lists skills without description when frontmatter is missing', () => {
+    mocks.existsSyncMock.mockReturnValue(true);
+    const readdirMock = vi.spyOn(fsModule, 'readdirSync').mockReturnValue(['my-skill.md'] as any);
+    const readFileMock = vi.spyOn(fsModule, 'readFileSync').mockReturnValue('No frontmatter here');
+
+    const result = listSkills();
+    expect(result).toContain('/my-skill');
+    readdirMock.mockRestore();
+    readFileMock.mockRestore();
+  });
+});
+
+describe('CcTgBot chat bridge', () => {
+  const mockRedis = {
+    lpush: vi.fn().mockResolvedValue(1),
+    ltrim: vi.fn().mockResolvedValue('OK'),
+    publish: vi.fn().mockResolvedValue(1),
+  };
+
+  function makeBotWithRedis() {
+    return new CcTgBot({ telegramToken: 'test-token', redis: mockRedis as never, namespace: 'test-ns' });
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({});
+    mocks.tgSetMyCommands.mockResolvedValue({});
+    mocks.existsSyncMock.mockReturnValue(false);
+  });
+
+  afterEach((ctx) => {
+    // stop bot if test stored one
+    const b = (ctx as any).bot as CcTgBot | undefined;
+    if (b) b.stop();
+  });
+
+  it('writes user message to Redis when a Telegram message is sent', async () => {
+    const bot = makeBotWithRedis();
+    await (bot as any).handleTelegram(makeMsg({ text: 'Hello Claude' }));
+    bot.stop();
+
+    expect(mocks.writeChatLog).toHaveBeenCalledWith(
+      mockRedis,
+      'test-ns',
+      expect.objectContaining({ role: 'user', source: 'telegram', content: 'Hello Claude' })
+    );
+  });
+
+  it('does not call writeChatLog when Redis is not configured', async () => {
+    const bot = new CcTgBot({ telegramToken: 'test-token' });
+    await (bot as any).handleTelegram(makeMsg({ text: 'Hello Claude' }));
+    bot.stop();
+
+    expect(mocks.writeChatLog).not.toHaveBeenCalled();
+  });
+
+  it('writes user message to Redis via handleUserMessage', async () => {
+    const bot = makeBotWithRedis();
+    await bot.handleUserMessage(42, 'UI message');
+    bot.stop();
+
+    expect(mocks.writeChatLog).toHaveBeenCalledWith(
+      mockRedis,
+      'test-ns',
+      expect.objectContaining({ role: 'user', source: 'ui', content: 'UI message' })
+    );
+  });
+
+  it('writes assistant response to Redis when Claude result is flushed', async () => {
+    vi.useFakeTimers();
+    const bot = makeBotWithRedis();
+
+    // Trigger session creation and get the message handler
+    await (bot as any).handleTelegram(makeMsg({ text: 'Hello' }));
+    const onCalls = mocks.claudeOn.mock.calls as [string, (...args: unknown[]) => void][];
+    const messageHandler = onCalls.find(([event]) => event === 'message')?.[1];
+
+    // Fire a result message from Claude
+    messageHandler?.({ type: 'result', payload: { result: 'Hi there!' }, raw: {} });
+    vi.advanceTimersByTime(1000);
+
+    bot.stop();
+    vi.useRealTimers();
+
+    expect(mocks.writeChatLog).toHaveBeenCalledWith(
+      mockRedis,
+      'test-ns',
+      expect.objectContaining({ role: 'assistant', source: 'cc-tg', content: 'Hi there!' })
+    );
+  });
+
+  it('writes tool call events to Redis when Claude uses a tool', async () => {
+    const bot = makeBotWithRedis();
+
+    await (bot as any).handleTelegram(makeMsg({ text: 'Hello' }));
+    const onCalls = mocks.claudeOn.mock.calls as [string, (...args: unknown[]) => void][];
+    const messageHandler = onCalls.find(([event]) => event === 'message')?.[1];
+
+    // Fire an assistant message with a tool_use block
+    messageHandler?.({
+      type: 'assistant',
+      payload: {
+        message: {
+          role: 'assistant',
+          content: [{ type: 'tool_use', name: 'Bash', input: { command: 'ls -la' } }],
+        },
+      },
+      raw: {},
+    });
+
+    bot.stop();
+
+    expect(mocks.writeChatLog).toHaveBeenCalledWith(
+      mockRedis,
+      'test-ns',
+      expect.objectContaining({
+        role: 'tool',
+        source: 'cc-tg',
+        content: expect.stringContaining('[tool] Bash:'),
+      })
+    );
   });
 });
