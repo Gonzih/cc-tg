@@ -6,6 +6,7 @@ import {
   writeCoordinatorPlan,
   defaultReadJobOutput,
   defaultReadCoordinatorPlan,
+  defaultGetRunningJobCount,
   replayStreamEvents,
   parseStreamFields,
   streamEntryToMessage,
@@ -21,6 +22,8 @@ const mockLrange = vi.fn().mockResolvedValue([]);
 const mockGet = vi.fn().mockResolvedValue(null);
 const mockSet = vi.fn().mockResolvedValue("OK");
 const mockXread = vi.fn().mockResolvedValue(null);
+const mockScan = vi.fn().mockResolvedValue(["0", []]);
+const mockSmembers = vi.fn().mockResolvedValue([]);
 
 vi.mock("ioredis", () => {
   // Must use a regular function (not arrow) so it can be used as a constructor with `new`
@@ -32,6 +35,8 @@ vi.mock("ioredis", () => {
       get: mockGet,
       set: mockSet,
       xread: mockXread,
+      scan: mockScan,
+      smembers: mockSmembers,
       subscribe: () => Promise.resolve(),
       unsubscribe: () => Promise.resolve(),
       on: () => {},
@@ -611,6 +616,105 @@ describe("defaultReadCoordinatorPlan", () => {
   it("disconnects after reading", async () => {
     mockGet.mockResolvedValue(null);
     await defaultReadCoordinatorPlan("job-abc");
+    expect(mockDisconnect).toHaveBeenCalled();
+  });
+});
+
+describe("defaultGetRunningJobCount", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockConnect.mockResolvedValue(undefined);
+    mockScan.mockResolvedValue(["0", []]);
+    mockSmembers.mockResolvedValue([]);
+    mockGet.mockResolvedValue(null);
+  });
+
+  it("returns 0 when no namespace sets exist", async () => {
+    mockScan.mockResolvedValue(["0", []]);
+    const result = await defaultGetRunningJobCount();
+    expect(result).toBe(0);
+  });
+
+  it("returns 0 when namespace set is empty", async () => {
+    mockScan.mockResolvedValue(["0", ["cca:jobs:myns"]]);
+    mockSmembers.mockResolvedValue([]);
+    const result = await defaultGetRunningJobCount();
+    expect(result).toBe(0);
+    expect(mockSmembers).toHaveBeenCalledWith("cca:jobs:myns");
+  });
+
+  it("counts jobs with status=running", async () => {
+    mockScan.mockResolvedValue(["0", ["cca:jobs:myns"]]);
+    mockSmembers.mockResolvedValue(["job-1", "job-2", "job-3"]);
+    mockGet
+      .mockResolvedValueOnce(JSON.stringify({ status: "running" }))
+      .mockResolvedValueOnce(JSON.stringify({ status: "done" }))
+      .mockResolvedValueOnce(JSON.stringify({ status: "running" }));
+    const result = await defaultGetRunningJobCount();
+    expect(result).toBe(2);
+    expect(mockGet).toHaveBeenCalledWith("cca:job:job-1");
+    expect(mockGet).toHaveBeenCalledWith("cca:job:job-2");
+    expect(mockGet).toHaveBeenCalledWith("cca:job:job-3");
+  });
+
+  it("deduplicates job IDs across multiple namespace sets", async () => {
+    mockScan.mockResolvedValue(["0", ["cca:jobs:ns1", "cca:jobs:ns2"]]);
+    mockSmembers
+      .mockResolvedValueOnce(["job-1", "job-2"])
+      .mockResolvedValueOnce(["job-2", "job-3"]);
+    mockGet
+      .mockResolvedValueOnce(JSON.stringify({ status: "running" }))
+      .mockResolvedValueOnce(JSON.stringify({ status: "done" }))
+      .mockResolvedValueOnce(JSON.stringify({ status: "running" }));
+    const result = await defaultGetRunningJobCount();
+    expect(result).toBe(2);
+    // job-2 deduplicated — only 3 get calls total
+    expect(mockGet).toHaveBeenCalledTimes(3);
+  });
+
+  it("skips jobs with missing or null records", async () => {
+    mockScan.mockResolvedValue(["0", ["cca:jobs:myns"]]);
+    mockSmembers.mockResolvedValue(["job-1", "job-2"]);
+    mockGet
+      .mockResolvedValueOnce(JSON.stringify({ status: "running" }))
+      .mockResolvedValueOnce(null);
+    const result = await defaultGetRunningJobCount();
+    expect(result).toBe(1);
+  });
+
+  it("skips malformed job JSON without crashing", async () => {
+    mockScan.mockResolvedValue(["0", ["cca:jobs:myns"]]);
+    mockSmembers.mockResolvedValue(["job-bad", "job-good"]);
+    mockGet
+      .mockResolvedValueOnce("NOT_JSON")
+      .mockResolvedValueOnce(JSON.stringify({ status: "running" }));
+    const result = await defaultGetRunningJobCount();
+    expect(result).toBe(1);
+  });
+
+  it("returns 0 and disconnects when Redis connect fails", async () => {
+    mockConnect.mockRejectedValue(new Error("connection refused"));
+    const result = await defaultGetRunningJobCount();
+    expect(result).toBe(0);
+  });
+
+  it("handles paginated SCAN (multiple cursor iterations)", async () => {
+    mockScan
+      .mockResolvedValueOnce(["42", ["cca:jobs:ns1"]])
+      .mockResolvedValueOnce(["0", ["cca:jobs:ns2"]]);
+    mockSmembers
+      .mockResolvedValueOnce(["job-1"])
+      .mockResolvedValueOnce(["job-2"]);
+    mockGet
+      .mockResolvedValueOnce(JSON.stringify({ status: "running" }))
+      .mockResolvedValueOnce(JSON.stringify({ status: "running" }));
+    const result = await defaultGetRunningJobCount();
+    expect(result).toBe(2);
+    expect(mockScan).toHaveBeenCalledTimes(2);
+  });
+
+  it("disconnects after counting", async () => {
+    await defaultGetRunningJobCount();
     expect(mockDisconnect).toHaveBeenCalled();
   });
 });
