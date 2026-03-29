@@ -285,7 +285,44 @@ export async function defaultReadCoordinatorPlan(jobId: string): Promise<Coordin
 }
 
 export async function defaultGetRunningJobCount(): Promise<number> {
-  return 0;
+  const redis = makeRedisClient();
+  try {
+    await redis.connect();
+    // Find all namespace job sets (cca:jobs:{namespace})
+    let cursor = "0";
+    const namespaceKeys: string[] = [];
+    do {
+      const [nextCursor, keys] = await redis.scan(cursor, "MATCH", "cca:jobs:*", "COUNT", "100");
+      cursor = nextCursor;
+      namespaceKeys.push(...keys);
+    } while (cursor !== "0");
+
+    // Collect all job IDs across namespaces (deduplicate)
+    const jobIds = new Set<string>();
+    for (const nsKey of namespaceKeys) {
+      const ids = await redis.smembers(nsKey);
+      for (const id of ids) jobIds.add(id);
+    }
+
+    // Count jobs with status=running
+    let count = 0;
+    for (const jobId of jobIds) {
+      const raw = await redis.get(`cca:job:${jobId}`);
+      if (raw) {
+        try {
+          const job = JSON.parse(raw) as { status?: string };
+          if (job.status === "running") count++;
+        } catch {
+          // malformed JSON — skip
+        }
+      }
+    }
+    return count;
+  } catch {
+    return 0;
+  } finally {
+    try { redis.disconnect(); } catch {}
+  }
 }
 
 /**
