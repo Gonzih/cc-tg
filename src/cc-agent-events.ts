@@ -4,7 +4,7 @@
  * Listens to the `cca:events` pub/sub channel for job completion events,
  * asks Claude to decide what to do, and acts accordingly:
  *   NOTIFY_ONLY    — send a Telegram message to the configured chat
- *   SPAWN_FOLLOWUP — spawn a follow-up cc-agent job via MCP
+ *   SPAWN_FOLLOWUP — spawn a follow-up cc-agent job via MCP + notify Telegram
  *   SILENT         — log and do nothing
  *
  * Controlled via CC_AGENT_EVENTS_ENABLED env var (default: true).
@@ -25,6 +25,11 @@ export interface JobEvent {
   timestamp: number;
 }
 
+export interface CoordinatorPlan {
+  nextStep?: { repo_url: string; task: string };
+  summary: string;
+}
+
 export interface DecisionResult {
   action: "NOTIFY_ONLY" | "SPAWN_FOLLOWUP" | "SILENT";
   message?: string;
@@ -39,6 +44,9 @@ export interface HandlerDeps {
   askClaude: (prompt: string) => Promise<string>;
   sendTelegramMessage: (chatId: number, text: string) => Promise<void>;
   spawnFollowupAgent: (repoUrl: string, task: string) => Promise<void>;
+  readJobOutput: (jobId: string) => Promise<string[]>;
+  readCoordinatorPlan: (jobId: string) => Promise<CoordinatorPlan | null>;
+  getRunningJobCount: () => Promise<number>;
 }
 
 function log(level: "info" | "warn" | "error", ...args: unknown[]): void {
@@ -51,31 +59,44 @@ function log(level: "info" | "warn" | "error", ...args: unknown[]): void {
   fn("[cc-agent-events]", ...args);
 }
 
-export function buildDecisionPrompt(event: JobEvent): string {
+export function buildDecisionPrompt(
+  event: JobEvent,
+  last40lines: string[],
+  coordinatorPlan: CoordinatorPlan | null
+): string {
+  const scoreStr = event.score !== undefined ? String(event.score) : "n/a";
+  const planStr = coordinatorPlan ? JSON.stringify(coordinatorPlan, null, 2) : "none";
   return `A cc-agent job just completed.
 
 Job: ${event.title}
 Repo: ${event.repoUrl}
 Status: ${event.status}
-Last output:
-${event.lastLines.join("\n")}
+Score: ${scoreStr}
 
-Decide what to do next. Options:
-1. NOTIFY_ONLY — send a brief Telegram message to Maksim summarizing what completed
-2. SPAWN_FOLLOWUP — spawn a follow-up cc-agent job (provide repo_url and task)
-3. SILENT — log it, no action needed (routine/expected completion)
+Last output + LEARNINGS:
+${last40lines.join("\n")}
 
-Reply in this exact JSON format:
+Coordinator plan for this job (if any):
+${planStr}
+
+Decide what to do next:
+1. SPAWN_FOLLOWUP — spawn a follow-up job (provide repo_url and task)
+2. NOTIFY_ONLY — send Telegram message, no spawn needed
+3. SILENT — routine completion, no action
+
+Rules:
+- If LEARNINGS has "Recommendations for next agent" with a clear actionable next step → consider SPAWN_FOLLOWUP
+- If coordinator plan has nextStep → SPAWN_FOLLOWUP with that task (prefer coordinator plan over LEARNINGS)
+- Failed jobs → NOTIFY_ONLY always
+- Score < 0.5 → NOTIFY_ONLY
+- Routine/expected completions → SILENT
+
+Reply in JSON:
 {
-  "action": "NOTIFY_ONLY" | "SPAWN_FOLLOWUP" | "SILENT",
-  "message": "...",
-  "followup": {
-    "repo_url": "...",
-    "task": "..."
-  }
-}
-
-Be conservative. Only SPAWN_FOLLOWUP if clearly needed. Only NOTIFY_ONLY for important completions. Use SILENT for routine jobs.`;
+  "action": "SPAWN_FOLLOWUP" | "NOTIFY_ONLY" | "SILENT",
+  "message": "brief telegram message (1-2 lines)",
+  "followup": { "repo_url": "...", "task": "..." } | null
+}`;
 }
 
 export function parseDecision(raw: string): DecisionResult {
@@ -86,6 +107,37 @@ export function parseDecision(raw: string): DecisionResult {
     throw new Error(`Unknown action: ${parsed.action}`);
   }
   return parsed;
+}
+
+function formatSpawnMessage(
+  event: JobEvent,
+  followup: { repo_url: string; task: string },
+  runningCount: number
+): string {
+  const scoreStr = event.score !== undefined ? ` (score: ${event.score})` : "";
+  const repoShort = followup.repo_url.replace(/^https?:\/\/github\.com\//, "");
+  const lines = [
+    `✓ ${event.title} done${scoreStr}`,
+    `→ spawned: ${followup.task} (${repoShort})`,
+  ];
+  if (runningCount > 0) {
+    lines.push(`${runningCount} jobs running`);
+  }
+  return lines.join("\n");
+}
+
+function formatFailureMessage(event: JobEvent): string {
+  const lastLine = event.lastLines[event.lastLines.length - 1] ?? "";
+  const repoShort = event.repoUrl.replace(/^https?:\/\/github\.com\//, "");
+  return `✗ ${event.title} failed\n${repoShort} — exit 1\nLast line: ${lastLine}`;
+}
+
+function getChatId(): number | null {
+  const chatIdStr = process.env.CC_AGENT_NOTIFY_CHAT_ID;
+  if (!chatIdStr) return null;
+  const chatId = Number(chatIdStr);
+  if (isNaN(chatId)) return null;
+  return chatId;
 }
 
 /**
@@ -194,6 +246,60 @@ Call the spawn_agent tool now with these exact parameters. Report the job ID whe
   });
 }
 
+function makeRedisClient(): Redis {
+  return new Redis(process.env.REDIS_URL || "redis://localhost:6379", {
+    lazyConnect: true,
+    enableOfflineQueue: false,
+  });
+}
+
+export async function defaultReadJobOutput(jobId: string): Promise<string[]> {
+  const redis = makeRedisClient();
+  try {
+    await redis.connect();
+    const lines = await redis.lrange(`cca:job:${jobId}:output`, -40, -1);
+    return lines;
+  } finally {
+    try { redis.disconnect(); } catch {}
+  }
+}
+
+export async function defaultReadCoordinatorPlan(jobId: string): Promise<CoordinatorPlan | null> {
+  const redis = makeRedisClient();
+  try {
+    await redis.connect();
+    const raw = await redis.get(`cca:coordinator:plan:${jobId}`);
+    if (!raw) return null;
+    return JSON.parse(raw) as CoordinatorPlan;
+  } finally {
+    try { redis.disconnect(); } catch {}
+  }
+}
+
+export async function defaultGetRunningJobCount(): Promise<number> {
+  return 0;
+}
+
+/**
+ * Write a coordinator plan for a job, so cc-tg knows what follow-up to spawn.
+ * Call this when spawning a job that has a planned follow-up.
+ * TTL: 7 days.
+ */
+export async function writeCoordinatorPlan(
+  jobId: string,
+  plan: { nextStep?: { repo_url: string; task: string }; summary: string }
+): Promise<void> {
+  const redis = makeRedisClient();
+  try {
+    await redis.connect();
+    const key = `cca:coordinator:plan:${jobId}`;
+    const ttlSeconds = 7 * 24 * 60 * 60; // 7 days
+    await redis.set(key, JSON.stringify(plan), "EX", ttlSeconds);
+  } finally {
+    try { redis.disconnect(); } catch {}
+  }
+}
+
 /**
  * Handle a single job event message from Redis pub/sub.
  * Exported for testability — production code passes defaultDeps.
@@ -218,34 +324,48 @@ export async function handleJobEvent(
 
   log("info", `Processing ${event.status} event for job: ${event.title} (${event.jobId})`);
 
+  // Read job output from Redis (fall back to event.lastLines on error)
+  let last40lines: string[] = event.lastLines;
+  try {
+    const lines = await deps.readJobOutput(event.jobId);
+    if (lines.length > 0) last40lines = lines;
+  } catch (err) {
+    log("warn", "Failed to read job output, using event.lastLines:", (err as Error).message);
+  }
+
+  // Read coordinator plan from Redis (fall back to null on error)
+  let coordinatorPlan: CoordinatorPlan | null = null;
+  try {
+    coordinatorPlan = await deps.readCoordinatorPlan(event.jobId);
+  } catch (err) {
+    log("warn", "Failed to read coordinator plan:", (err as Error).message);
+  }
+
   let decision: DecisionResult;
   try {
-    const rawResponse = await deps.askClaude(buildDecisionPrompt(event));
+    const rawResponse = await deps.askClaude(buildDecisionPrompt(event, last40lines, coordinatorPlan));
     decision = parseDecision(rawResponse);
   } catch (err) {
-    log("error", "Claude decision failed:", (err as Error).message);
-    return;
+    log("error", "Claude decision failed, falling back to NOTIFY_ONLY:", (err as Error).message);
+    const fallbackMsg = event.status === "failed"
+      ? formatFailureMessage(event)
+      : `Job completed: ${event.title}`;
+    decision = { action: "NOTIFY_ONLY", message: fallbackMsg };
   }
 
   log("info", `Decision: ${decision.action} for job ${event.jobId}`);
 
+  const chatId = getChatId();
+
   try {
     if (decision.action === "NOTIFY_ONLY") {
-      const chatIdStr =
-        process.env.CC_AGENT_NOTIFY_CHAT_ID;
-      if (!chatIdStr) {
+      if (!chatId) {
         log("warn", "NOTIFY_ONLY: CC_AGENT_NOTIFY_CHAT_ID not set, skipping notification");
         return;
       }
-      const chatId = Number(chatIdStr);
-      if (isNaN(chatId)) {
-        log("warn", `NOTIFY_ONLY: invalid CC_AGENT_NOTIFY_CHAT_ID: ${chatIdStr}`);
-        return;
-      }
-      await deps.sendTelegramMessage(
-        chatId,
-        decision.message ?? `Job completed: ${event.title}`
-      );
+      const msg = decision.message
+        ?? (event.status === "failed" ? formatFailureMessage(event) : `Job completed: ${event.title}`);
+      await deps.sendTelegramMessage(chatId, msg);
     } else if (decision.action === "SPAWN_FOLLOWUP") {
       if (!decision.followup) {
         log("warn", "SPAWN_FOLLOWUP: no followup details in response");
@@ -255,6 +375,13 @@ export async function handleJobEvent(
         decision.followup.repo_url,
         decision.followup.task
       );
+      // Send Telegram notification about the spawn
+      if (chatId) {
+        let runningCount = 0;
+        try { runningCount = await deps.getRunningJobCount(); } catch {}
+        const spawnMsg = formatSpawnMessage(event, decision.followup, runningCount);
+        await deps.sendTelegramMessage(chatId, spawnMsg);
+      }
     } else {
       // SILENT — log only
       log("info", `SILENT: no action taken for job ${event.jobId}`);
@@ -269,6 +396,9 @@ function makeDefaultDeps(): HandlerDeps {
     askClaude: defaultAskClaude,
     sendTelegramMessage: defaultSendTelegramMessage,
     spawnFollowupAgent: defaultSpawnFollowupAgent,
+    readJobOutput: defaultReadJobOutput,
+    readCoordinatorPlan: defaultReadCoordinatorPlan,
+    getRunningJobCount: defaultGetRunningJobCount,
   };
 }
 
