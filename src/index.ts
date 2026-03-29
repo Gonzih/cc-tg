@@ -21,11 +21,12 @@ import { tmpdir } from "os";
 import os from "os";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
+import TelegramBot from "node-telegram-bot-api";
 import { CcTgBot } from "./bot.js";
 import { loadTokens, getTokenCount } from "./tokens.js";
 import { Registry, startControlServer } from "@gonzih/agent-ops";
 import { Redis } from "ioredis";
-import { connectEventSubscriber } from "./cc-agent-events.js";
+import { startNotifier } from "./notifier.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -135,11 +136,14 @@ const bot = new CcTgBot({
 });
 
 // agent-ops: optional self-registration + HTTP control endpoint
+const redisUrl = process.env.REDIS_URL || "redis://localhost:6379";
+const namespace = process.env.CC_AGENT_NAMESPACE || "default";
+let sharedRedis: Redis | null = null;
+
 if (process.env.CC_AGENT_OPS_PORT) {
   const botInfo = await bot.getMe();
-  const redis = new Redis(process.env.REDIS_URL || "redis://localhost:6379");
-  const registry = new Registry(redis);
-  const namespace = process.env.CC_AGENT_NAMESPACE || "default";
+  sharedRedis = new Redis(redisUrl);
+  const registry = new Registry(sharedRedis);
   await registry.register({
     namespace,
     hostname: os.hostname(),
@@ -160,10 +164,17 @@ if (process.env.CC_AGENT_OPS_PORT) {
   console.log(`[ops] control server on port ${process.env.CC_AGENT_OPS_PORT}`);
 }
 
-// cc-agent event subscriber — watches Redis cca:events for job completions
-connectEventSubscriber().catch((err: Error) => {
-  console.error("[cc-agent-events] startup error:", err.message);
-});
+// Notifier — subscribe to cca:notify:{namespace} and cca:chat:incoming:{namespace}
+const notifyChatId = process.env.CC_AGENT_NOTIFY_CHAT_ID
+  ? Number(process.env.CC_AGENT_NOTIFY_CHAT_ID)
+  : null;
+
+if (notifyChatId) {
+  if (!sharedRedis) sharedRedis = new Redis(redisUrl);
+  const notifierBot = new TelegramBot(telegramToken, { polling: false });
+  startNotifier(notifierBot, notifyChatId, namespace, sharedRedis);
+  console.log(`[notifier] started for namespace=${namespace} chatId=${notifyChatId}`);
+}
 
 process.on("SIGINT", () => {
   console.log("\nShutting down...");
