@@ -172,7 +172,7 @@ const notifyChatId = process.env.CC_AGENT_NOTIFY_CHAT_ID
 if (notifyChatId) {
   if (!sharedRedis) sharedRedis = new Redis(redisUrl);
   const notifierBot = new TelegramBot(telegramToken, { polling: false });
-  startNotifier(notifierBot, notifyChatId, namespace, sharedRedis);
+  startNotifier(notifierBot, notifyChatId, namespace, sharedRedis, (cid, text) => bot.handleUserMessage(cid, text));
   console.log(`[notifier] started for namespace=${namespace} chatId=${notifyChatId}`);
 }
 
