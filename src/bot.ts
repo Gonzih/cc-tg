@@ -434,6 +434,23 @@ export class CcTgBot {
     }
   }
 
+  /**
+   * Feed a text message into the active Claude session for the given chat.
+   * Called by the notifier when a UI message arrives via Redis pub/sub.
+   */
+  public async handleUserMessage(chatId: number, text: string): Promise<void> {
+    const session = this.getOrCreateSession(chatId);
+    try {
+      const enriched = await enrichPromptWithUrls(text);
+      session.currentPrompt = enriched;
+      session.claude.sendPrompt(enriched);
+      this.startTyping(chatId, session);
+    } catch (err) {
+      await this.replyToChat(chatId, `Error sending to Claude: ${(err as Error).message}`);
+      this.killSession(chatId, true);
+    }
+  }
+
   private async handleVoice(chatId: number, msg: TelegramBot.Message, threadId?: number, threadName?: string): Promise<void> {
     const fileId = msg.voice?.file_id ?? msg.audio?.file_id;
     if (!fileId) return;
