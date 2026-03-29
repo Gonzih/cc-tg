@@ -66,10 +66,20 @@ export function startNotifier(
   redis: Redis,
   handleUserMessage?: (chatId: number, text: string) => void
 ): void {
-  const sub = redis.duplicate();
+  const sub = redis.duplicate({
+    retryStrategy: (times: number) => {
+      const delay = Math.min(1000 * Math.pow(2, times - 1), 30_000);
+      log("info", `subscriber reconnecting in ${delay}ms (attempt ${times})`);
+      return delay;
+    },
+  });
 
   sub.on("error", (err: Error) => {
     log("warn", "subscriber error:", err.message);
+  });
+
+  sub.on("close", () => {
+    log("info", "subscriber disconnected, will reconnect with backoff");
   });
 
   // cca:notify:{namespace} — forward job completion notifications to Telegram
