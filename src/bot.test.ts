@@ -12,18 +12,6 @@ const mocks = vi.hoisted(() => ({
   claudeOn: vi.fn(),
   claudeSendPrompt: vi.fn(),
   claudeKill: vi.fn(),
-  cronList: vi.fn().mockReturnValue([]),
-  cronAdd: vi.fn().mockReturnValue({
-    id: 'job-1',
-    schedule: 'every 1h',
-    prompt: 'test',
-    chatId: 42,
-    intervalMs: 3_600_000,
-    createdAt: '',
-  }),
-  cronRemove: vi.fn().mockReturnValue(true),
-  cronClearAll: vi.fn().mockReturnValue(0),
-  cronUpdate: vi.fn(),
   existsSyncMock: vi.fn().mockReturnValue(false),
   statSyncMock: vi.fn().mockReturnValue({ size: 1024, isFile: () => true }),
   execSyncMock: vi.fn().mockReturnValue(''),
@@ -60,17 +48,6 @@ vi.mock('./claude.js', () => ({
   }),
 }));
 
-vi.mock('./cron.js', () => ({
-  CronManager: vi.fn(function MockCronManager() {
-    return {
-      list: mocks.cronList,
-      add: mocks.cronAdd,
-      remove: mocks.cronRemove,
-      clearAll: mocks.cronClearAll,
-      update: mocks.cronUpdate,
-    };
-  }),
-}));
 
 vi.mock('./voice.js', () => ({
   isVoiceAvailable: vi.fn().mockReturnValue(false),
@@ -154,17 +131,6 @@ describe('CcTgBot', () => {
     mocks.tgSendMessage.mockResolvedValue({});
     mocks.tgSendDocument.mockResolvedValue({});
     mocks.tgSetMyCommands.mockResolvedValue({});
-    mocks.cronList.mockReturnValue([]);
-    mocks.cronAdd.mockReturnValue({
-      id: 'job-1',
-      schedule: 'every 1h',
-      prompt: 'test',
-      chatId: 42,
-      intervalMs: 3_600_000,
-      createdAt: '',
-    });
-    mocks.cronClearAll.mockReturnValue(0);
-    mocks.cronRemove.mockReturnValue(true);
     mocks.existsSyncMock.mockReturnValue(false);
     mocks.statSyncMock.mockReturnValue({ size: 1024, isFile: () => true });
     mocks.execSyncMock.mockReturnValue('');
@@ -253,7 +219,6 @@ describe('CcTgBot', () => {
       const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
       expect(msg).toContain('/start');
       expect(msg).toContain('/help');
-      expect(msg).toContain('/cron');
       expect(msg).toContain('/get_file');
     });
 
@@ -353,77 +318,6 @@ describe('CcTgBot', () => {
       });
     });
 
-    describe('/cron commands', () => {
-      it('/cron list with no jobs', async () => {
-        mocks.cronList.mockReturnValue([]);
-        await sendCommand('/cron list');
-        expect(mocks.tgSendMessage).toHaveBeenCalledWith(42, 'No cron jobs.');
-      });
-
-      it('/cron with no args shows no jobs', async () => {
-        mocks.cronList.mockReturnValue([]);
-        await sendCommand('/cron');
-        expect(mocks.tgSendMessage).toHaveBeenCalledWith(42, 'No cron jobs.');
-      });
-
-      it('/cron list with jobs shows them', async () => {
-        mocks.cronList.mockReturnValue([
-          { id: 'abc', chatId: 42, schedule: 'every 1h', prompt: 'check status', intervalMs: 3_600_000, createdAt: '' },
-        ]);
-        await sendCommand('/cron list');
-        const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
-        expect(msg).toContain('every 1h');
-        expect(msg).toContain('check status');
-      });
-
-      it('/cron every 1h <prompt> adds a job', async () => {
-        mocks.cronAdd.mockReturnValue({
-          id: 'new-job',
-          schedule: 'every 1h',
-          prompt: 'run check',
-          chatId: 42,
-          intervalMs: 3_600_000,
-          createdAt: '',
-        });
-        await sendCommand('/cron every 1h run check');
-        const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
-        expect(msg).toContain('Cron set');
-        expect(msg).toContain('every 1h');
-        expect(msg).toContain('run check');
-      });
-
-      it('/cron with invalid schedule format sends usage', async () => {
-        await sendCommand('/cron bogus schedule here');
-        const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
-        expect(msg).toContain('Usage');
-      });
-
-      it('/cron add returns null for bad schedule', async () => {
-        mocks.cronAdd.mockReturnValue(null);
-        await sendCommand('/cron every 5s test');
-        const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
-        // "every 5s test" doesn't match /^(every\s+\d+[mhd])\s+(.+)$/ so usage is shown
-        expect(msg).toContain('Usage');
-      });
-
-      it('/cron clear clears all jobs', async () => {
-        mocks.cronClearAll.mockReturnValue(3);
-        await sendCommand('/cron clear');
-        expect(mocks.tgSendMessage).toHaveBeenCalledWith(42, 'Cleared 3 cron job(s).');
-      });
-
-      it('/cron remove <id> removes a job', async () => {
-        mocks.cronRemove.mockReturnValue(true);
-        await sendCommand('/cron remove abc-123');
-        expect(mocks.tgSendMessage).toHaveBeenCalledWith(42, 'Removed abc-123.');
-      });
-
-      it('/cron remove <id> not found', async () => {
-        mocks.cronRemove.mockReturnValue(false);
-        await sendCommand('/cron remove nonexistent');
-        expect(mocks.tgSendMessage).toHaveBeenCalledWith(42, 'Not found: nonexistent');
-      });
-    });
   });
 
   describe('trackWrittenFiles', () => {
