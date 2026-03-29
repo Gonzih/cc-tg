@@ -6,6 +6,9 @@ import {
   writeCoordinatorPlan,
   defaultReadJobOutput,
   defaultReadCoordinatorPlan,
+  replayStreamEvents,
+  parseStreamFields,
+  streamEntryToMessage,
   type JobEvent,
   type HandlerDeps,
   type CoordinatorPlan,
@@ -17,6 +20,7 @@ const mockDisconnect = vi.fn();
 const mockLrange = vi.fn().mockResolvedValue([]);
 const mockGet = vi.fn().mockResolvedValue(null);
 const mockSet = vi.fn().mockResolvedValue("OK");
+const mockXread = vi.fn().mockResolvedValue(null);
 
 vi.mock("ioredis", () => {
   // Must use a regular function (not arrow) so it can be used as a constructor with `new`
@@ -27,6 +31,7 @@ vi.mock("ioredis", () => {
       lrange: mockLrange,
       get: mockGet,
       set: mockSet,
+      xread: mockXread,
       subscribe: () => Promise.resolve(),
       unsubscribe: () => Promise.resolve(),
       on: () => {},
@@ -359,10 +364,10 @@ describe("handleJobEvent", () => {
     expect(deps.readCoordinatorPlan).toHaveBeenCalledWith("job-xyz");
   });
 
-  it("includes coordinator plan in the prompt when present", async () => {
+  it("includes coordinator plan in the prompt when present (no nextStep — slow path)", async () => {
+    // Plans without nextStep still go through Claude so it can see the context
     const plan: CoordinatorPlan = {
-      nextStep: { repo_url: "https://github.com/a/b", task: "run integration tests" },
-      summary: "phase 2 of migration",
+      summary: "phase 2 of migration — run integration tests next",
     };
     const deps = makeDeps({
       readCoordinatorPlan: vi.fn().mockResolvedValue(plan),
@@ -371,11 +376,63 @@ describe("handleJobEvent", () => {
     await handleJobEvent(JSON.stringify(event), deps);
 
     const prompt = deps.askClaude.mock.calls[0][0] as string;
-    expect(prompt).toContain("run integration tests");
     expect(prompt).toContain("phase 2 of migration");
   });
 
-  it("parses markdown-fenced JSON from Claude and fires SPAWN_FOLLOWUP", async () => {
+  it("fast path: coordinator plan with nextStep — spawns directly without calling Claude", async () => {
+    const deps = makeDeps({
+      askClaude: vi.fn().mockResolvedValue("should not be called"),
+      getActiveChatIds: vi.fn().mockResolvedValue([42]),
+      readCoordinatorPlan: vi.fn().mockResolvedValue({
+        nextStep: { repo_url: "https://github.com/foo/bar", task: "run integration tests" },
+        summary: "phase 2",
+      }),
+    });
+    const event = makeEvent({ status: "done" });
+    await handleJobEvent(JSON.stringify(event), deps);
+
+    expect(deps.askClaude).not.toHaveBeenCalled();
+    expect(deps.spawnFollowupAgent).toHaveBeenCalledWith(
+      "https://github.com/foo/bar",
+      "run integration tests"
+    );
+    expect(deps.sendTelegramMessage).toHaveBeenCalledOnce();
+  });
+
+  it("fast path: notification message includes title, score, and repo short name", async () => {
+    const deps = makeDeps({
+      getActiveChatIds: vi.fn().mockResolvedValue([99]),
+      readCoordinatorPlan: vi.fn().mockResolvedValue({
+        nextStep: { repo_url: "https://github.com/acme/my-service", task: "run smoke tests" },
+        summary: "deploy then test",
+      }),
+    });
+    const event = makeEvent({ title: "deploy v2", score: 0.9, status: "done" });
+    await handleJobEvent(JSON.stringify(event), deps);
+
+    const [chatId, msg] = deps.sendTelegramMessage.mock.calls[0] as [number, string];
+    expect(chatId).toBe(99);
+    expect(msg).toContain("✓ deploy v2 done");
+    expect(msg).toContain("0.9");
+    expect(msg).toContain("my-service");
+  });
+
+  it("fast path: no Telegram when no active chat IDs", async () => {
+    const deps = makeDeps({
+      getActiveChatIds: vi.fn().mockResolvedValue([]),
+      readCoordinatorPlan: vi.fn().mockResolvedValue({
+        nextStep: { repo_url: "https://github.com/foo/bar", task: "do thing" },
+        summary: "phase 2",
+      }),
+    });
+    const event = makeEvent({ status: "done" });
+    await handleJobEvent(JSON.stringify(event), deps);
+
+    expect(deps.spawnFollowupAgent).toHaveBeenCalledOnce();
+    expect(deps.sendTelegramMessage).not.toHaveBeenCalled();
+  });
+
+  it("parses markdown-fenced JSON from Claude and fires SPAWN_FOLLOWUP (no coordinator nextStep)", async () => {
     const fencedResponse = [
       "Here is my decision:",
       "```json",
@@ -389,10 +446,7 @@ describe("handleJobEvent", () => {
     const deps = makeDeps({
       askClaude: vi.fn().mockResolvedValue(fencedResponse),
       getActiveChatIds: vi.fn().mockResolvedValue([42]),
-      readCoordinatorPlan: vi.fn().mockResolvedValue({
-        nextStep: { repo_url: "https://github.com/foo/bar", task: "run integration tests" },
-        summary: "phase 2",
-      }),
+      readCoordinatorPlan: vi.fn().mockResolvedValue(null),
     });
     const event = makeEvent({ status: "done" });
     await handleJobEvent(JSON.stringify(event), deps);
@@ -599,5 +653,170 @@ describe("writeCoordinatorPlan", () => {
       "EX",
       7 * 24 * 60 * 60
     );
+  });
+});
+
+describe("parseStreamFields", () => {
+  it("converts flat field array to record", () => {
+    const result = parseStreamFields(["jobId", "job-1", "status", "done", "title", "my job"]);
+    expect(result).toEqual({ jobId: "job-1", status: "done", title: "my job" });
+  });
+
+  it("returns empty record for empty array", () => {
+    expect(parseStreamFields([])).toEqual({});
+  });
+
+  it("ignores trailing unpaired key", () => {
+    const result = parseStreamFields(["a", "1", "orphan"]);
+    expect(result).toEqual({ a: "1" });
+  });
+});
+
+describe("streamEntryToMessage", () => {
+  it("builds a valid JSON event message from stream fields", () => {
+    const fields = {
+      jobId: "job-42",
+      status: "done",
+      title: "feat: new feature",
+      repoUrl: "https://github.com/foo/bar",
+      lastLines: JSON.stringify(["line1", "line2"]),
+      score: "0.85",
+      timestamp: "1711234567890",
+    };
+    const msg = streamEntryToMessage(fields);
+    expect(msg).not.toBeNull();
+    const event = JSON.parse(msg!) as JobEvent;
+    expect(event.jobId).toBe("job-42");
+    expect(event.status).toBe("done");
+    expect(event.score).toBe(0.85);
+    expect(event.lastLines).toEqual(["line1", "line2"]);
+  });
+
+  it("returns null score when score field is empty", () => {
+    const fields = {
+      jobId: "job-1", status: "done", title: "t", repoUrl: "u",
+      lastLines: "[]", score: "", timestamp: "0",
+    };
+    const msg = streamEntryToMessage(fields);
+    const event = JSON.parse(msg!) as JobEvent;
+    expect(event.score).toBeUndefined();
+  });
+
+  it("returns null score when score field is absent", () => {
+    const fields = {
+      jobId: "job-1", status: "done", title: "t", repoUrl: "u",
+      lastLines: "[]", timestamp: "0",
+    };
+    const msg = streamEntryToMessage(fields);
+    const event = JSON.parse(msg!) as JobEvent;
+    expect(event.score).toBeUndefined();
+  });
+
+  it("returns null on malformed lastLines JSON", () => {
+    const fields = {
+      jobId: "job-1", status: "done", title: "t", repoUrl: "u",
+      lastLines: "not json", timestamp: "0",
+    };
+    expect(streamEntryToMessage(fields)).toBeNull();
+  });
+});
+
+describe("replayStreamEvents", () => {
+  function makeMockRedis(overrides: Record<string, unknown> = {}) {
+    return {
+      get: vi.fn().mockResolvedValue(null),
+      set: vi.fn().mockResolvedValue("OK"),
+      xread: vi.fn().mockResolvedValue(null),
+      ...overrides,
+    };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("does nothing when xread returns null (no stream entries)", async () => {
+    const redis = makeMockRedis();
+    const deps = makeDeps();
+    await replayStreamEvents(redis as never, deps, "test-bot");
+
+    expect(deps.askClaude).not.toHaveBeenCalled();
+  });
+
+  it("reads last-id from Redis and passes it to xread", async () => {
+    const redis = makeMockRedis({
+      get: vi.fn().mockResolvedValue("1234567890-0"),
+    });
+    const deps = makeDeps();
+    await replayStreamEvents(redis as never, deps, "test-bot");
+
+    expect(redis.xread).toHaveBeenCalledWith("COUNT", 20, "STREAMS", "cca:event-stream", "1234567890-0");
+  });
+
+  it("uses '0' as default last-id when Redis key is missing", async () => {
+    const redis = makeMockRedis({ get: vi.fn().mockResolvedValue(null) });
+    const deps = makeDeps();
+    await replayStreamEvents(redis as never, deps, "test-bot");
+
+    expect(redis.xread).toHaveBeenCalledWith("COUNT", 20, "STREAMS", "cca:event-stream", "0");
+  });
+
+  it("handles a stream entry and updates last-id", async () => {
+    const entry: [string, string[]] = [
+      "1711234567890-0",
+      [
+        "jobId", "job-stream-1",
+        "status", "done",
+        "title", "stream job",
+        "repoUrl", "https://github.com/foo/bar",
+        "lastLines", JSON.stringify(["done"]),
+        "score", "1.0",
+        "timestamp", "1711234567890",
+      ],
+    ];
+    const xreadResult: Array<[string, Array<[string, string[]]>]> = [
+      ["cca:event-stream", [entry]],
+    ];
+    const redis = makeMockRedis({ xread: vi.fn().mockResolvedValue(xreadResult) });
+    const deps = makeDeps({
+      askClaude: vi.fn().mockResolvedValue('{"action":"SILENT"}'),
+    });
+
+    await replayStreamEvents(redis as never, deps, "test-bot");
+
+    expect(deps.askClaude).toHaveBeenCalledOnce();
+    expect(redis.set).toHaveBeenCalledWith("cca:event-stream:last-id:test-bot", "1711234567890-0");
+  });
+
+  it("continues gracefully when xread throws", async () => {
+    const redis = makeMockRedis({ xread: vi.fn().mockRejectedValue(new Error("stream error")) });
+    const deps = makeDeps();
+    await expect(replayStreamEvents(redis as never, deps, "test-bot")).resolves.toBeUndefined();
+    expect(deps.askClaude).not.toHaveBeenCalled();
+  });
+
+  it("continues gracefully when get throws (uses default last-id '0')", async () => {
+    const redis = makeMockRedis({ get: vi.fn().mockRejectedValue(new Error("Redis down")) });
+    const deps = makeDeps();
+    await replayStreamEvents(redis as never, deps, "test-bot");
+
+    expect(redis.xread).toHaveBeenCalledWith("COUNT", 20, "STREAMS", "cca:event-stream", "0");
+  });
+
+  it("skips malformed stream entries without crashing", async () => {
+    const badEntry: [string, string[]] = [
+      "111-0",
+      ["jobId", "job-bad", "status", "done", "title", "t", "repoUrl", "u",
+       "lastLines", "NOT_JSON", "timestamp", "0"],
+    ];
+    const xreadResult: Array<[string, Array<[string, string[]]>]> = [
+      ["cca:event-stream", [badEntry]],
+    ];
+    const redis = makeMockRedis({ xread: vi.fn().mockResolvedValue(xreadResult) });
+    const deps = makeDeps();
+    await expect(replayStreamEvents(redis as never, deps, "test-bot")).resolves.toBeUndefined();
+    expect(deps.askClaude).not.toHaveBeenCalled();
+    // last-id still updated even for skipped entries
+    expect(redis.set).toHaveBeenCalledWith("cca:event-stream:last-id:test-bot", "111-0");
   });
 });

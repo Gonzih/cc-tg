@@ -15,6 +15,8 @@ import { readFileSync } from "fs";
 import { join } from "path";
 import { Redis } from "ioredis";
 import TelegramBot from "node-telegram-bot-api";
+
+const STREAM_KEY = "cca:event-stream";
 import { ClaudeProcess, extractText } from "./claude.js";
 
 export interface JobEvent {
@@ -378,6 +380,37 @@ export async function handleJobEvent(
     log("warn", "Failed to read coordinator plan:", (err as Error).message);
   }
 
+  // Fast path: coordinator plan has explicit next step — spawn directly, no Claude needed
+  // This eliminates JSON truncation issues when Claude regenerates long task strings.
+  if (coordinatorPlan?.nextStep) {
+    log("info", `Fast path: coordinator plan nextStep found for job ${event.jobId}`);
+    const { repo_url, task } = coordinatorPlan.nextStep;
+    let fpChatIds: number[] = [];
+    try {
+      fpChatIds = await deps.getActiveChatIds();
+    } catch (err) {
+      log("warn", "Fast path: failed to get active chat IDs:", (err as Error).message);
+    }
+    try {
+      await deps.spawnFollowupAgent(repo_url, task);
+    } catch (err) {
+      log("error", "Fast path: spawnFollowupAgent failed:", (err as Error).message);
+    }
+    if (fpChatIds.length > 0) {
+      const scoreStr = event.score !== undefined ? ` (score: ${event.score})` : "";
+      const repoShort = repo_url.split("/").pop() ?? repo_url;
+      const msg = `✓ ${event.title} done${scoreStr}\n→ spawned: ${repoShort}`;
+      for (const chatId of fpChatIds) {
+        try {
+          await deps.sendTelegramMessage(chatId, msg);
+        } catch (err) {
+          log("error", "Fast path: sendTelegramMessage failed:", (err as Error).message);
+        }
+      }
+    }
+    return;
+  }
+
   let decision: DecisionResult;
   let rawResponse = "";
   try {
@@ -441,6 +474,90 @@ export async function handleJobEvent(
   }
 }
 
+/** Parse flat key-value field array from a Redis Stream entry into a record. */
+export function parseStreamFields(fields: string[]): Record<string, string> {
+  const obj: Record<string, string> = {};
+  for (let i = 0; i + 1 < fields.length; i += 2) {
+    obj[fields[i]] = fields[i + 1];
+  }
+  return obj;
+}
+
+/** Convert stream entry fields to a JobEvent JSON string for handleJobEvent. */
+export function streamEntryToMessage(fields: Record<string, string>): string | null {
+  try {
+    const score =
+      fields["score"] !== undefined && fields["score"] !== ""
+        ? Number(fields["score"])
+        : undefined;
+    const event: JobEvent = {
+      jobId: fields["jobId"] ?? "",
+      status: (fields["status"] ?? "done") as JobEvent["status"],
+      title: fields["title"] ?? "",
+      repoUrl: fields["repoUrl"] ?? "",
+      lastLines: JSON.parse(fields["lastLines"] ?? "[]") as string[],
+      score,
+      timestamp: Number(fields["timestamp"] ?? Date.now()),
+    };
+    return JSON.stringify(event);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Replay events from the Redis Stream that were missed since last-seen ID.
+ * Uses `cca:event-stream:last-id:{botName}` in Redis to track position.
+ * Exported for testability — pass a real or mock Redis instance.
+ */
+export async function replayStreamEvents(
+  redis: Redis,
+  deps: HandlerDeps,
+  botName?: string
+): Promise<void> {
+  const name = botName ?? (process.env.CC_TG_BOT_NAME ?? "cc-tg");
+  const lastIdKey = `cca:event-stream:last-id:${name}`;
+
+  let lastId = "0";
+  try {
+    lastId = (await redis.get(lastIdKey)) ?? "0";
+  } catch (err) {
+    log("warn", "replayStreamEvents: failed to read last-id:", (err as Error).message);
+  }
+
+  type XReadResult = Array<[string, Array<[string, string[]]>]> | null;
+  let results: XReadResult = null;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    results = (await (redis as any).xread("COUNT", 20, "STREAMS", STREAM_KEY, lastId)) as XReadResult;
+  } catch (err) {
+    log("warn", "replayStreamEvents: xread failed:", (err as Error).message);
+    return;
+  }
+
+  if (!results || results.length === 0) return;
+
+  log("info", `Replaying missed stream events from last-id=${lastId}`);
+
+  for (const [, entries] of results) {
+    for (const [id, fields] of entries) {
+      const message = streamEntryToMessage(parseStreamFields(fields));
+      if (message) {
+        await handleJobEvent(message, deps).catch((err: Error) => {
+          log("error", `replayStreamEvents: handleJobEvent error for entry ${id}:`, err.message);
+        });
+      }
+      try {
+        await redis.set(lastIdKey, id);
+      } catch (err) {
+        log("warn", "replayStreamEvents: failed to update last-id:", (err as Error).message);
+      }
+    }
+  }
+
+  log("info", "Stream replay complete.");
+}
+
 function makeDefaultDeps(): HandlerDeps {
   return {
     askClaude: defaultAskClaude,
@@ -471,10 +588,19 @@ export async function connectEventSubscriber(): Promise<void> {
 
 async function connectWithBackoff(attempt: number): Promise<void> {
   const delay = Math.min(5_000 * Math.pow(2, attempt), 60_000);
+  const redisUrl = process.env.REDIS_URL || "redis://localhost:6379";
+  const botName = process.env.CC_TG_BOT_NAME ?? "cc-tg";
+  const lastIdKey = `cca:event-stream:last-id:${botName}`;
 
-  const sub = new Redis(process.env.REDIS_URL || "redis://localhost:6379", {
+  // Pub/sub subscriber client — enters subscriber mode after subscribe()
+  const sub = new Redis(redisUrl, {
     lazyConnect: true,
     enableOfflineQueue: false,
+  });
+  // Regular command client — stays in normal mode for xread/get/set
+  const reg = new Redis(redisUrl, {
+    lazyConnect: true,
+    enableOfflineQueue: true,
   });
 
   subscriberClient = sub;
@@ -482,7 +608,12 @@ async function connectWithBackoff(attempt: number): Promise<void> {
   sub.on("error", (err: Error) => {
     log("warn", "subscriber error, reconnecting...", err.message);
     try { sub.disconnect(); } catch {}
+    try { reg.disconnect(); } catch {}
     setTimeout(() => connectWithBackoff(0), 5_000);
+  });
+
+  reg.on("error", (err: Error) => {
+    log("warn", "regular client error (non-fatal):", err.message);
   });
 
   try {
@@ -494,11 +625,35 @@ async function connectWithBackoff(attempt: number): Promise<void> {
     return;
   }
 
+  // Connect regular client (best-effort — stream replay is non-critical)
+  try {
+    await reg.connect();
+  } catch (err) {
+    log("warn", "Regular Redis client connect failed (stream replay skipped):", (err as Error).message);
+  }
+
   const deps = makeDefaultDeps();
+
+  // Replay events missed during downtime, then mark current time as last-id
+  // Must happen BEFORE sub.subscribe() because subscribe() puts sub in subscriber mode
+  try {
+    await replayStreamEvents(reg, deps, botName);
+  } catch (err) {
+    log("warn", "Stream replay failed, continuing:", (err as Error).message);
+  }
+  // Mark current timestamp so next restart only replays events after now
+  try {
+    await reg.set(lastIdKey, `${Date.now()}-0`);
+  } catch {
+    // Non-fatal
+  }
 
   sub.on("message", (channel: string, message: string) => {
     if (channel !== "cca:events") return;
-    handleJobEvent(message, deps).catch((err: Error) => {
+    handleJobEvent(message, deps).then(() => {
+      // Advance stream last-id so next restart doesn't re-replay this event
+      reg.set(lastIdKey, `${Date.now()}-0`).catch(() => {});
+    }).catch((err: Error) => {
       log("error", "handleJobEvent uncaught:", err.message);
     });
   });
@@ -509,6 +664,7 @@ async function connectWithBackoff(attempt: number): Promise<void> {
   } catch (err) {
     log("warn", "subscribe failed, retrying...", (err as Error).message);
     try { sub.disconnect(); } catch {}
+    try { reg.disconnect(); } catch {}
     setTimeout(() => connectWithBackoff(attempt + 1), delay);
     return;
   }
@@ -518,6 +674,7 @@ async function connectWithBackoff(attempt: number): Promise<void> {
     try {
       await sub.unsubscribe("cca:events");
       sub.disconnect();
+      reg.disconnect();
     } catch {}
   };
 
