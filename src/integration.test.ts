@@ -11,9 +11,27 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { EventEmitter } from 'events';
+import { PassThrough } from 'stream';
+
+// ---------------------------------------------------------------------------
+// Mock spawn so ClaudeProcess never spawns a real subprocess
+// (the fake-binary integration suite restores realSpawn in its beforeEach)
+// ---------------------------------------------------------------------------
+const claudeMocks = vi.hoisted(() => ({
+  spawnMock: vi.fn(),
+  realSpawn: undefined as unknown as (...args: unknown[]) => unknown,
+}));
+
+vi.mock('child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('child_process')>();
+  claudeMocks.realSpawn = actual.spawn as unknown as (...args: unknown[]) => unknown;
+  return { ...actual, spawn: claudeMocks.spawnMock, execFileSync: vi.fn() };
+});
 
 import { ClaudeProcess, extractText, type ClaudeMessage, type UsageEvent } from './claude.js';
 import { detectUsageLimit } from './usage-limit.js';
+import { CronManager, type CronJob } from './cron.js';
 
 // ─── ClaudeProcess: real subprocess stream parsing ───────────────────────────
 //
@@ -28,9 +46,15 @@ describe('ClaudeProcess integration (fake claude binary)', () => {
   beforeEach(() => {
     tmpDir = mkdtempSync(join(tmpdir(), 'cc-tg-claude-test-'));
     originalPath = process.env.PATH;
+    // Use the real child_process.spawn for these tests — they write an actual
+    // Node.js script to disk and need a genuine subprocess.
+    claudeMocks.spawnMock.mockImplementation(
+      (...args: unknown[]) => claudeMocks.realSpawn(...args)
+    );
   });
 
   afterEach(() => {
+    claudeMocks.spawnMock.mockReset();
     process.env.PATH = originalPath;
     rmSync(tmpDir, { recursive: true, force: true });
   });
@@ -556,5 +580,325 @@ describe('detectUsageLimit + token rotation integration', () => {
     expect(signal.humanMessage).toContain('Will auto-resume at');
     // Should contain a UTC date string from toUTCString()
     expect(signal.humanMessage).toMatch(/\w{3},\s+\d{2}\s+\w{3}\s+\d{4}/);
+  });
+});
+describe('CronManager — real filesystem integration', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    dir = mkdtempSync(join(tmpdir(), 'cc-tg-cron-test-'));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('persists a job to disk and a new instance reloads it', () => {
+    const fire = vi.fn();
+    const mgr = new CronManager(dir, fire);
+    const job = mgr.add(42, 'every 1h', 'run diagnostics')!;
+    expect(job).not.toBeNull();
+
+    // The .cc-tg/crons.json file must exist now
+    const storePath = join(dir, '.cc-tg', 'crons.json');
+    expect(existsSync(storePath)).toBe(true);
+
+    // A freshly-created instance with the same directory should reload the job
+    const mgr2 = new CronManager(dir, fire);
+    const reloaded = mgr2.list(42);
+    expect(reloaded).toHaveLength(1);
+    expect(reloaded[0].id).toBe(job.id);
+    expect(reloaded[0].prompt).toBe('run diagnostics');
+    expect(reloaded[0].schedule).toBe('every 1h');
+    expect(reloaded[0].intervalMs).toBe(3_600_000);
+    expect(reloaded[0].chatId).toBe(42);
+
+    // Clean up timers from both managers
+    mgr.clearAll(42);
+    mgr2.clearAll(42);
+  });
+
+  it('persists multiple jobs across chats and reloads all of them', () => {
+    const fire = vi.fn();
+    const mgr = new CronManager(dir, fire);
+    mgr.add(42, 'every 30m', 'check logs');
+    mgr.add(42, 'every 2h', 'weekly report');
+    mgr.add(99, 'every 1d', 'backup');
+
+    const mgr2 = new CronManager(dir, fire);
+    expect(mgr2.list(42)).toHaveLength(2);
+    expect(mgr2.list(99)).toHaveLength(1);
+    expect(mgr2.list(99)[0].prompt).toBe('backup');
+
+    mgr.clearAll(42);
+    mgr.clearAll(99);
+    mgr2.clearAll(42);
+    mgr2.clearAll(99);
+  });
+
+  it('removal is reflected on disk — a new instance sees the updated list', () => {
+    const fire = vi.fn();
+    const mgr = new CronManager(dir, fire);
+    const a = mgr.add(42, 'every 1h', 'job A')!;
+    const b = mgr.add(42, 'every 2h', 'job B')!;
+
+    mgr.remove(42, a.id);
+
+    const mgr2 = new CronManager(dir, fire);
+    const jobs = mgr2.list(42);
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0].id).toBe(b.id);
+
+    mgr.clearAll(42);
+    mgr2.clearAll(42);
+  });
+
+  it('clearAll removes all entries from disk', () => {
+    const fire = vi.fn();
+    const mgr = new CronManager(dir, fire);
+    mgr.add(42, 'every 1h', 'A');
+    mgr.add(42, 'every 2h', 'B');
+    mgr.clearAll(42);
+
+    const storePath = join(dir, '.cc-tg', 'crons.json');
+    const data: CronJob[] = JSON.parse(readFileSync(storePath, 'utf8'));
+    expect(data).toHaveLength(0);
+  });
+
+  it('update is persisted and visible to a new instance', () => {
+    const fire = vi.fn();
+    const mgr = new CronManager(dir, fire);
+    const job = mgr.add(42, 'every 1h', 'original prompt')!;
+    mgr.update(42, job.id, { prompt: 'updated prompt', schedule: 'every 2h' });
+
+    const mgr2 = new CronManager(dir, fire);
+    const reloaded = mgr2.list(42)[0];
+    expect(reloaded.prompt).toBe('updated prompt');
+    expect(reloaded.schedule).toBe('every 2h');
+    expect(reloaded.intervalMs).toBe(2 * 3_600_000);
+
+    mgr.clearAll(42);
+    mgr2.clearAll(42);
+  });
+
+  it('reloaded jobs fire their callbacks when the timer elapses', () => {
+    const fire = vi.fn().mockImplementation((_chatId, _prompt, _jobId, done) => done());
+
+    // Populate disk with a job using a first instance, then let it go out of scope
+    // without clearing (clearAll would erase the persisted data)
+    const mgr = new CronManager(dir, fire);
+    const job = mgr.add(42, 'every 1m', 'ping')!;
+
+    // Second instance loads from disk — it must also schedule the timer
+    const mgr2 = new CronManager(dir, fire);
+    expect(mgr2.list(42)[0].id).toBe(job.id);
+
+    // Advance time: both mgr and mgr2 have timers, so fire is called at least twice.
+    // The important thing is that mgr2's reloaded timer fires correctly.
+    vi.advanceTimersByTime(60_000);
+    expect(fire).toHaveBeenCalledWith(42, 'ping', expect.any(String), expect.any(Function));
+    expect(fire.mock.calls.length).toBeGreaterThanOrEqual(1);
+
+    mgr.clearAll(42);
+    mgr2.clearAll(42);
+  });
+
+  it('fires repeatedly on each interval tick', () => {
+    const fired: number[] = [];
+    const mgr = new CronManager(dir, (_c, _p, _id, done) => {
+      fired.push(Date.now());
+      done();
+    });
+    mgr.add(1, 'every 1h', 'repeat task');
+
+    vi.advanceTimersByTime(3_600_000 * 3);
+    expect(fired).toHaveLength(3);
+  });
+
+  it('skips a tick while previous invocation is still running', () => {
+    let pendingDone: (() => void) | null = null;
+    const fired: number[] = [];
+    const mgr = new CronManager(dir, (_c, _p, _id, done) => {
+      fired.push(Date.now());
+      pendingDone = done; // hold — simulates slow async work
+    });
+    mgr.add(1, 'every 1h', 'slow task');
+
+    vi.advanceTimersByTime(3_600_000); // fires → pendingDone is set
+    expect(fired).toHaveLength(1);
+
+    vi.advanceTimersByTime(3_600_000); // tick while still running → skipped
+    expect(fired).toHaveLength(1);
+
+    pendingDone!(); // mark done
+    vi.advanceTimersByTime(3_600_000); // next tick fires normally
+    expect(fired).toHaveLength(2);
+  });
+});
+
+// ─── ClaudeProcess stream parsing integration ────────────────────────────
+
+interface FakeProcess extends EventEmitter {
+  stdin: PassThrough;
+  stdout: PassThrough;
+  stderr: PassThrough;
+  kill: ReturnType<typeof vi.fn>;
+}
+
+function makeFakeProcess(): FakeProcess {
+  const proc = new EventEmitter() as FakeProcess;
+  proc.stdin = new PassThrough();
+  proc.stdout = new PassThrough();
+  proc.stderr = new PassThrough();
+  proc.kill = vi.fn(() => proc.emit('exit', null));
+  return proc;
+}
+
+function jsonLine(obj: Record<string, unknown>): string {
+  return JSON.stringify(obj) + '\n';
+}
+
+describe('ClaudeProcess stream parsing integration', () => {
+  let fakeProc: FakeProcess;
+  let claude: ClaudeProcess;
+
+  beforeEach(() => {
+    fakeProc = makeFakeProcess();
+    claudeMocks.spawnMock.mockReturnValue(fakeProc);
+    claude = new ClaudeProcess({ cwd: '/tmp' });
+  });
+
+  afterEach(() => {
+    fakeProc.emit('exit', 0);
+  });
+
+  it('emits a message event for a result-type JSON line', () => {
+    const messages: ClaudeMessage[] = [];
+    claude.on('message', (m) => messages.push(m));
+
+    fakeProc.stdout.push(jsonLine({ type: 'result', session_id: 's1', result: 'Hello' }));
+
+    expect(messages).toHaveLength(1);
+    expect(messages[0].type).toBe('result');
+    expect(messages[0].payload.result).toBe('Hello');
+  });
+
+  it('handles multiple JSON messages arriving in one chunk', () => {
+    const messages: ClaudeMessage[] = [];
+    claude.on('message', (m) => messages.push(m));
+
+    const chunk =
+      jsonLine({ type: 'system', session_id: 's1', content: 'init' }) +
+      jsonLine({ type: 'assistant', session_id: 's1', message: { content: 'hi' } }) +
+      jsonLine({ type: 'result', session_id: 's1', result: 'done' });
+
+    fakeProc.stdout.push(chunk);
+
+    expect(messages).toHaveLength(3);
+    expect(messages.map((m) => m.type)).toEqual(['system', 'assistant', 'result']);
+  });
+
+  it('reassembles a JSON message split across two chunks', () => {
+    const messages: ClaudeMessage[] = [];
+    claude.on('message', (m) => messages.push(m));
+
+    const full = JSON.stringify({ type: 'result', result: 'chunked' });
+    const half = Math.floor(full.length / 2);
+    fakeProc.stdout.push(full.slice(0, half));
+    expect(messages).toHaveLength(0); // incomplete line
+
+    fakeProc.stdout.push(full.slice(half) + '\n');
+    expect(messages).toHaveLength(1);
+    expect(messages[0].payload.result).toBe('chunked');
+  });
+
+  it('silently ignores non-JSON startup noise', () => {
+    const messages: ClaudeMessage[] = [];
+    const errors: Error[] = [];
+    claude.on('message', (m) => messages.push(m));
+    claude.on('error', (e) => errors.push(e));
+
+    fakeProc.stdout.push('Claude Code v1.2.3\nsome startup noise\n');
+    fakeProc.stdout.push(jsonLine({ type: 'result', result: 'ok' }));
+
+    expect(errors).toHaveLength(0);
+    expect(messages).toHaveLength(1);
+  });
+
+  it('emits usage events from message_start', () => {
+    const usageEvents: UsageEvent[] = [];
+    claude.on('usage', (u) => usageEvents.push(u));
+
+    fakeProc.stdout.push(
+      jsonLine({
+        type: 'message_start',
+        message: {
+          usage: {
+            input_tokens: 500,
+            cache_read_input_tokens: 100,
+            cache_creation_input_tokens: 50,
+          },
+        },
+      }),
+    );
+
+    expect(usageEvents).toHaveLength(1);
+    expect(usageEvents[0].inputTokens).toBe(500);
+    expect(usageEvents[0].cacheReadTokens).toBe(100);
+    expect(usageEvents[0].cacheWriteTokens).toBe(50);
+    expect(usageEvents[0].outputTokens).toBe(0);
+  });
+
+  it('emits usage events from message_delta (output tokens)', () => {
+    const usageEvents: UsageEvent[] = [];
+    claude.on('usage', (u) => usageEvents.push(u));
+
+    fakeProc.stdout.push(jsonLine({ type: 'message_delta', usage: { output_tokens: 250 } }));
+
+    expect(usageEvents).toHaveLength(1);
+    expect(usageEvents[0].outputTokens).toBe(250);
+    expect(usageEvents[0].inputTokens).toBe(0);
+  });
+
+  it('marks process as exited and throws on sendPrompt after exit', () => {
+    expect(claude.exited).toBe(false);
+    fakeProc.emit('exit', 0);
+    expect(claude.exited).toBe(true);
+    expect(() => claude.sendPrompt('hello')).toThrow('Claude process has exited');
+  });
+
+  it('extractText pipeline: parses assistant content-array end-to-end', () => {
+    const messages: ClaudeMessage[] = [];
+    claude.on('message', (m) => messages.push(m));
+
+    fakeProc.stdout.push(
+      jsonLine({
+        type: 'assistant',
+        message: {
+          content: [
+            { type: 'text', text: 'Hello ' },
+            { type: 'tool_use', id: 't1', name: 'Bash', input: {} },
+            { type: 'text', text: 'world' },
+          ],
+        },
+      }),
+    );
+
+    expect(messages).toHaveLength(1);
+    expect(extractText(messages[0])).toBe('Hello world');
+  });
+
+  it('stdin write is forwarded correctly for sendPrompt', () => {
+    const written: string[] = [];
+    fakeProc.stdin.on('data', (chunk: Buffer) => written.push(chunk.toString()));
+
+    claude.sendPrompt('what is 2+2?');
+
+    expect(written).toHaveLength(1);
+    const parsed = JSON.parse(written[0].trim()) as Record<string, unknown>;
+    expect(parsed.type).toBe('user');
+    expect((parsed.message as Record<string, unknown>).content).toBe('what is 2+2?');
   });
 });

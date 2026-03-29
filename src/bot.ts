@@ -17,6 +17,7 @@ import { formatForTelegram, splitLongMessage } from "./formatter.js";
 import { detectUsageLimit } from "./usage-limit.js";
 import { getCurrentToken, rotateToken, getTokenIndex, getTokenCount } from "./tokens.js";
 import { writeChatLog, type ChatMessage } from "./notifier.js";
+import { CronManager } from "./cron.js";
 
 const BOT_COMMANDS: Array<{ command: string; description: string }> = [
   { command: "start", description: "Reset session and start fresh" },
@@ -32,6 +33,7 @@ const BOT_COMMANDS: Array<{ command: string; description: string }> = [
   { command: "get_file", description: "Send a file from the server to this chat" },
   { command: "cost", description: "Show session token usage and cost" },
   { command: "skills", description: "List available Claude skills with descriptions" },
+  { command: "cron", description: "Manage cron jobs — add/list/edit/remove/clear" },
 ];
 
 export interface BotOptions {
@@ -211,6 +213,7 @@ export class CcTgBot {
   private redis?: Redis;
   private namespace: string;
   private lastActiveChatId?: number;
+  private cron: CronManager;
 
   constructor(opts: BotOptions) {
     this.opts = opts;
@@ -227,6 +230,10 @@ export class CcTgBot {
     }).catch((err: Error) => console.error("[tg] getMe failed:", err.message));
 
     this.costStore = new CostStore(opts.cwd ?? process.cwd());
+
+    this.cron = new CronManager(opts.cwd ?? process.cwd(), (chatId, prompt, _jobId, done) => {
+      this.runCronTask(chatId, prompt, done);
+    });
 
     this.registerBotCommands();
 
@@ -421,6 +428,12 @@ export class CcTgBot {
     // /restart — restart the bot process in-place
     if (text === "/restart") {
       await this.handleRestart(chatId, threadId);
+      return;
+    }
+
+    // /cron <schedule> <prompt> | /cron list | /cron clear | /cron remove <id>
+    if (text.startsWith("/cron")) {
+      await this.handleCron(chatId, text, threadId);
       return;
     }
 
@@ -1099,6 +1112,74 @@ export class CcTgBot {
 
     await new Promise(resolve => setTimeout(resolve, 200));
     process.exit(0);
+  }
+
+  private async handleCron(chatId: number, text: string, threadId?: number): Promise<void> {
+    const args = text.slice("/cron".length).trim();
+
+    if (args === "list" || args === "") {
+      const jobs = this.cron.list(chatId);
+      if (!jobs.length) {
+        await this.replyToChat(chatId, "No cron jobs.", threadId);
+        return;
+      }
+      const lines = jobs.map((j, i) => {
+        const short = j.prompt.length > 50 ? j.prompt.slice(0, 50) + "…" : j.prompt;
+        return `#${i + 1} ${j.schedule} — "${short}"`;
+      });
+      await this.replyToChat(chatId, `Cron jobs (${jobs.length}):\n${lines.join("\n")}`, threadId);
+      return;
+    }
+
+    if (args === "clear") {
+      const n = this.cron.clearAll(chatId);
+      await this.replyToChat(chatId, `Cleared ${n} cron job(s).`, threadId);
+      return;
+    }
+
+    if (args.startsWith("remove ")) {
+      const id = args.slice("remove ".length).trim();
+      const ok = this.cron.remove(chatId, id);
+      await this.replyToChat(chatId, ok ? `Removed ${id}.` : `Not found: ${id}`, threadId);
+      return;
+    }
+
+    const scheduleMatch = args.match(/^(every\s+\d+[mhd])\s+(.+)$/i);
+    if (!scheduleMatch) {
+      await this.replyToChat(
+        chatId,
+        "Usage:\n/cron every 1h <prompt>\n/cron list\n/cron remove <id>\n/cron clear",
+        threadId
+      );
+      return;
+    }
+
+    const schedule = scheduleMatch[1];
+    const prompt = scheduleMatch[2];
+    const job = this.cron.add(chatId, schedule, prompt);
+    if (!job) {
+      await this.replyToChat(chatId, "Invalid schedule. Use: every 30m / every 2h / every 1d", threadId);
+      return;
+    }
+    await this.replyToChat(chatId, `Cron set [${job.id}]: ${schedule} — "${prompt}"`, threadId);
+  }
+
+  private runCronTask(chatId: number, prompt: string, done: () => void = () => {}): void {
+    const cronProcess = new ClaudeProcess({ cwd: this.opts.cwd ?? process.cwd() });
+    cronProcess.sendPrompt(prompt);
+    cronProcess.on("message", (msg: ClaudeMessage) => {
+      const result = extractText(msg);
+      if (result) {
+        const formatted = formatForTelegram(`🕐 ${result}`);
+        const chunks = splitLongMessage(formatted);
+        for (const chunk of chunks) {
+          this.replyToChat(chatId, chunk).catch((err: Error) =>
+            console.error("[cron] send failed:", err.message)
+          );
+        }
+      }
+    });
+    cronProcess.on("exit", () => done());
   }
 
   private async handleGetFile(chatId: number, text: string, threadId?: number): Promise<void> {
