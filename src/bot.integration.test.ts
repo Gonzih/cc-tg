@@ -27,11 +27,6 @@ const mocks = vi.hoisted(() => ({
   tgGetMe: vi.fn().mockResolvedValue({ id: 999, username: 'testbot' }),
   /** Mutable ref: the ClaudeProcess instance created by the current session */
   claudeInstance: null as ClaudeStub | null,
-  cronList: vi.fn().mockReturnValue([]),
-  cronAdd: vi.fn().mockReturnValue({ id: 'j1', schedule: 'every 1h', prompt: 'p', chatId: 42, intervalMs: 3_600_000, createdAt: '' }),
-  cronRemove: vi.fn().mockReturnValue(true),
-  cronClearAll: vi.fn().mockReturnValue(0),
-  cronUpdate: vi.fn(),
   existsSyncMock: vi.fn().mockReturnValue(false),
   statSyncMock: vi.fn().mockReturnValue({ size: 1024, isFile: () => true }),
   execSyncMock: vi.fn().mockReturnValue(''),
@@ -83,18 +78,6 @@ vi.mock('./claude.js', () => ({
         .join('');
     }
     return '';
-  }),
-}));
-
-vi.mock('./cron.js', () => ({
-  CronManager: vi.fn(function MockCronManager() {
-    return {
-      list: mocks.cronList,
-      add: mocks.cronAdd,
-      remove: mocks.cronRemove,
-      clearAll: mocks.cronClearAll,
-      update: mocks.cronUpdate,
-    };
   }),
 }));
 

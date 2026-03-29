@@ -139,6 +139,48 @@ describe("startNotifier", () => {
     expect(handleUserMessage).toHaveBeenCalledWith(111, "extracted content");
   });
 
+  it("passes retryStrategy to duplicated subscriber for backoff reconnect", () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+
+    let capturedOpts: { retryStrategy?: (times: number) => number } | undefined;
+    mockDuplicate.mockImplementation((opts: unknown) => {
+      capturedOpts = opts as typeof capturedOpts;
+      return {
+        subscribe: mockSubscribe,
+        on: mockOn,
+        lpush: mockLpush,
+        ltrim: mockLtrim,
+        publish: mockPublish,
+      };
+    });
+
+    startNotifier(bot as never, 123, "default", redis as never);
+
+    expect(capturedOpts?.retryStrategy).toBeTypeOf("function");
+    // Verify exponential backoff: 1s, 2s, 4s, ..., capped at 30s
+    const s = capturedOpts!.retryStrategy!;
+    expect(s(1)).toBe(1000);
+    expect(s(2)).toBe(2000);
+    expect(s(3)).toBe(4000);
+    expect(s(10)).toBe(30_000); // capped
+  });
+
+  it("registers a close handler that does not throw", () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+
+    let closeHandler: (() => void) | undefined;
+    mockOn.mockImplementation((event: string, handler: unknown) => {
+      if (event === "close") closeHandler = handler as () => void;
+    });
+
+    startNotifier(bot as never, 123, "default", redis as never);
+
+    expect(closeHandler).toBeDefined();
+    expect(() => closeHandler!()).not.toThrow();
+  });
+
   it("ignores messages on unrecognized channels", () => {
     const bot = makeBot();
     const redis = makeRedis();

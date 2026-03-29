@@ -26,13 +26,6 @@ const mocks = vi.hoisted(() => ({
   claudeKill: vi.fn(),
   /** Handlers the bot registers on each ClaudeProcess instance, by event name. */
   claudeHandlers: {} as Record<string, Function>,
-  cronList: vi.fn().mockReturnValue([]),
-  cronAdd: vi.fn().mockReturnValue({
-    id: 'job-1', schedule: 'every 1h', prompt: 'test', chatId: 42, intervalMs: 3_600_000, createdAt: '',
-  }),
-  cronRemove: vi.fn().mockReturnValue(true),
-  cronClearAll: vi.fn().mockReturnValue(0),
-  cronUpdate: vi.fn(),
   existsSyncMock: vi.fn().mockReturnValue(false),
   statSyncMock: vi.fn().mockReturnValue({ size: 1024, isFile: () => true }),
   execSyncMock: vi.fn().mockReturnValue(''),
@@ -86,18 +79,6 @@ vi.mock('./claude.js', () => ({
         .join('');
     }
     return '';
-  }),
-}));
-
-vi.mock('./cron.js', () => ({
-  CronManager: vi.fn(function MockCronManager() {
-    return {
-      list: mocks.cronList,
-      add: mocks.cronAdd,
-      remove: mocks.cronRemove,
-      clearAll: mocks.cronClearAll,
-      update: mocks.cronUpdate,
-    };
   }),
 }));
 
@@ -164,8 +145,6 @@ describe('Bot → Claude → Telegram response pipeline', () => {
     mocks.tgSendMessage.mockResolvedValue({});
     mocks.tgSendChatAction.mockResolvedValue({});
     mocks.tgSetMyCommands.mockResolvedValue({});
-    mocks.cronList.mockReturnValue([]);
-    mocks.cronClearAll.mockReturnValue(0);
     mocks.existsSyncMock.mockReturnValue(false);
     // Clear captured Claude handlers
     for (const k of Object.keys(mocks.claudeHandlers)) {
