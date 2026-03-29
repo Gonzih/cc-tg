@@ -210,6 +210,7 @@ export class CcTgBot {
   private botId = 0;
   private redis?: Redis;
   private namespace: string;
+  private lastActiveChatId?: number;
 
   constructor(opts: BotOptions) {
     this.opts = opts;
@@ -251,6 +252,11 @@ export class CcTgBot {
       chatId,
     };
     writeChatLog(this.redis, this.namespace, msg);
+  }
+
+  /** Returns the last chatId that sent a message — used by the chat bridge when no fixed chatId is configured. */
+  public getLastActiveChatId(): number | undefined {
+    return this.lastActiveChatId;
   }
 
   /** Session key: "chatId:threadId" for topics, "chatId:main" for DMs/non-topic groups */
@@ -306,6 +312,9 @@ export class CcTgBot {
       await this.replyToChat(chatId, "Not authorized.", threadId);
       return;
     }
+
+    // Track the last chat that sent us a message for the chat bridge
+    this.lastActiveChatId = chatId;
 
     // Group chat handling
     const isGroup = msg.chat.type === "group" || msg.chat.type === "supergroup";

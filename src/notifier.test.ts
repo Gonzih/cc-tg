@@ -197,6 +197,66 @@ describe("startNotifier", () => {
     messageHandler!("some:other:channel", "noise");
     expect(bot.sendMessage).not.toHaveBeenCalled();
   });
+
+  it("uses getActiveChatId when chatId is null (dynamic chat bridge mode)", () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+    const handleUserMessage = vi.fn();
+    const getActiveChatId = vi.fn().mockReturnValue(42);
+
+    let messageHandler: ((channel: string, message: string) => void) | undefined;
+    mockOn.mockImplementation((event: string, handler: unknown) => {
+      if (event === "message") {
+        messageHandler = handler as (channel: string, message: string) => void;
+      }
+    });
+
+    startNotifier(bot as never, null, "dyn", redis as never, handleUserMessage, getActiveChatId);
+
+    messageHandler!("cca:chat:incoming:dyn", "hello dynamic");
+
+    expect(getActiveChatId).toHaveBeenCalled();
+    expect(bot.sendMessage).toHaveBeenCalledWith(42, "📱 [from UI]: hello dynamic");
+    expect(handleUserMessage).toHaveBeenCalledWith(42, "hello dynamic");
+  });
+
+  it("skips notify channel message when chatId is null", () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+
+    let messageHandler: ((channel: string, message: string) => void) | undefined;
+    mockOn.mockImplementation((event: string, handler: unknown) => {
+      if (event === "message") {
+        messageHandler = handler as (channel: string, message: string) => void;
+      }
+    });
+
+    startNotifier(bot as never, null, "dyn", redis as never);
+
+    messageHandler!("cca:notify:dyn", "Job done");
+    expect(bot.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("does not call handleUserMessage when getActiveChatId returns undefined", () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+    const handleUserMessage = vi.fn();
+    const getActiveChatId = vi.fn().mockReturnValue(undefined);
+
+    let messageHandler: ((channel: string, message: string) => void) | undefined;
+    mockOn.mockImplementation((event: string, handler: unknown) => {
+      if (event === "message") {
+        messageHandler = handler as (channel: string, message: string) => void;
+      }
+    });
+
+    startNotifier(bot as never, null, "dyn", redis as never, handleUserMessage, getActiveChatId);
+
+    messageHandler!("cca:chat:incoming:dyn", "orphaned message");
+
+    expect(bot.sendMessage).not.toHaveBeenCalled();
+    expect(handleUserMessage).not.toHaveBeenCalled();
+  });
 });
 
 describe("writeChatLog", () => {
