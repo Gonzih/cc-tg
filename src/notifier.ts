@@ -120,9 +120,11 @@ export function startNotifier(
 
     if (channel === incomingChannel) {
       let content = message;
+      let originalTimestamp: string | undefined;
       try {
-        const parsed = JSON.parse(message) as { content?: string };
+        const parsed = JSON.parse(message) as { content?: string; timestamp?: string };
         if (parsed.content) content = parsed.content;
+        if (parsed.timestamp) originalTimestamp = parsed.timestamp;
       } catch {
         // raw string message — use as-is
       }
@@ -136,13 +138,14 @@ export function startNotifier(
           log("warn", "sendMessage (UI echo) failed:", err.message);
         });
 
-        // Log the incoming message
+        // Log the incoming message — preserve original timestamp from UI if present
         const inMsg: ChatMessage = {
           id: `ui-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-          source: "ui",
+          source: "ui", // 'ui' distinguishes this from telegram/claude messages
           role: "user",
           content,
-          timestamp: new Date().toISOString(),
+          // ISO 8601 — matches cc-agent-ui /chat/send format; preserve original if present
+          timestamp: originalTimestamp ?? new Date().toISOString(),
           chatId: targetChatId,
         };
         writeChatLog(redis, namespace, inMsg);
