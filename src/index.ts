@@ -136,6 +136,12 @@ sharedRedis.on("error", (err: Error) => {
   // Non-fatal — Redis features (chat bridge, ops) degrade gracefully
   console.warn("[redis] connection error:", err.message);
 });
+sharedRedis.once("ready", () => {
+  sharedRedis.set("cca:meta:cc-tg:version", pkg.version).catch((err: Error) => {
+    console.warn("[redis] failed to write version:", err.message);
+  });
+  console.log(`[cc-tg] version:reported ${pkg.version}`);
+});
 
 const bot = new CcTgBot({
   telegramToken,
