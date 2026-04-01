@@ -107,10 +107,13 @@ export function startNotifier(
     const incomingChannel = `cca:chat:incoming:${namespace}`;
 
     if (channel === notifyChannel) {
-      if (chatId !== null) {
-        bot.sendMessage(chatId, message).catch((err: Error) => {
+      const targetId = chatId ?? getActiveChatId?.();
+      if (targetId != null) {
+        bot.sendMessage(targetId, message).catch((err: Error) => {
           log("warn", "sendMessage failed:", err.message);
         });
+      } else {
+        log("warn", "notify: no chatId available, dropping notification");
       }
       return;
     }
