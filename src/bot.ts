@@ -518,6 +518,7 @@ export class CcTgBot {
       const session = this.getOrCreateSession(chatId, threadId, threadName);
       try {
         const prompt = buildPromptWithReplyContext(transcript, msg);
+        this.writeChatMessage("user", "telegram", transcript, chatId);
         session.currentPrompt = prompt;
         session.claude.sendPrompt(prompt);
         this.startTyping(chatId, session);
