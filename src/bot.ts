@@ -645,7 +645,7 @@ export class CcTgBot {
             this.writeChatMessage(
               "tool",
               "cc-tg",
-              `[tool] ${name}: ${JSON.stringify(input ?? {}).slice(0, 120)}`,
+              `[tool] ${name}: ${JSON.stringify(input ?? {})}`,
               chatId
             );
           }
