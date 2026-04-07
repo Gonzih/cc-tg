@@ -642,12 +642,31 @@ export class CcTgBot {
           errors.push(`${fileId}: empty transcription`);
         }
       } catch (err) {
+        const errMsg = (err as Error).message;
         failed++;
-        errors.push(`${fileId}: ${(err as Error).message}`);
+        errors.push(`${fileId}: ${errMsg}`);
+        // Permanently unretryable (expired Telegram link) — remove from voice:pending
+        if (errMsg.includes("Bad Request") || errMsg.includes("file_id")) {
+          const matchPending = pendingRaw.find((r) => r.includes(`"${fileId}"`));
+          if (matchPending) await this.redis.lrem("voice:pending", 0, matchPending).catch(() => {});
+        }
       }
     }
 
-    const lines = [`Voice retry complete: ${succeeded} succeeded, ${failed} failed.`];
+    // Purge stale entries from voice:pending older than 48h
+    const staleThreshold = 48 * 60 * 60 * 1000;
+    let purged = 0;
+    for (const raw of pendingRaw) {
+      try {
+        const entry = JSON.parse(raw) as { timestamp?: number };
+        if (entry.timestamp && Date.now() - entry.timestamp > staleThreshold) {
+          await this.redis.lrem("voice:pending", 0, raw).catch(() => {});
+          purged++;
+        }
+      } catch { /* skip malformed entries */ }
+    }
+
+    const lines = [`Voice retry complete: ${succeeded} succeeded, ${failed} failed, ${purged} stale entries purged.`];
     if (errors.length > 0) lines.push(...errors.map((e) => `• ${e}`));
     await this.replyToChat(chatId, lines.join("\n"), threadId);
   }
