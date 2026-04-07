@@ -1163,4 +1163,43 @@ describe('handleVoiceRetry', () => {
       'No pending voice messages to retry.'
     );
   });
+
+  it('purges stale voice:pending entries older than 48h', async () => {
+    const staleTimestamp = Date.now() - (49 * 60 * 60 * 1000);
+    const staleEntry = JSON.stringify({ file_id: 'stale-voice-001', chat_id: 42, message_id: 10, timestamp: staleTimestamp });
+    mockRedis.lrange.mockImplementation((key: string) =>
+      key === 'voice:pending' ? Promise.resolve([staleEntry]) : Promise.resolve([])
+    );
+    mocks.tgGetFileLink.mockResolvedValue('https://example.com/voice.ogg');
+    mocks.transcribeVoiceMock.mockResolvedValue('hello');
+
+    const bot = makeBotWithRedis();
+    await (bot as any).handleVoiceRetry(42);
+    bot.stop();
+
+    // Stale entry should be purged via lrem
+    expect(mockRedis.lrem).toHaveBeenCalledWith('voice:pending', 0, staleEntry);
+
+    const calls = mocks.tgSendMessage.mock.calls as [number, string][];
+    const lastCall = calls[calls.length - 1];
+    expect(lastCall[1]).toContain('1 stale entries purged');
+  });
+
+  it('removes permanently expired Telegram link (Bad Request) from voice:pending', async () => {
+    const entry = JSON.stringify({ file_id: 'expired-voice-002', chat_id: 42, message_id: 11, timestamp: Date.now() });
+    mockRedis.lrange.mockImplementation((key: string) =>
+      key === 'voice:pending' ? Promise.resolve([entry]) : Promise.resolve([])
+    );
+    mocks.tgGetFileLink.mockRejectedValue(new Error('Bad Request: invalid file_id'));
+
+    const bot = makeBotWithRedis();
+    await (bot as any).handleVoiceRetry(42);
+    bot.stop();
+
+    expect(mockRedis.lrem).toHaveBeenCalledWith('voice:pending', 0, entry);
+
+    const calls = mocks.tgSendMessage.mock.calls as [number, string][];
+    const lastCall = calls[calls.length - 1];
+    expect(lastCall[1]).toContain('1 failed');
+  });
 });
