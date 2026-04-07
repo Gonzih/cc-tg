@@ -28,6 +28,7 @@ const mocks = vi.hoisted(() => ({
   statSyncMock: vi.fn().mockReturnValue({ size: 1024, isFile: () => true }),
   execSyncMock: vi.fn().mockReturnValue(''),
   writeChatLog: vi.fn(),
+  transcribeVoiceMock: vi.fn().mockResolvedValue('transcribed text'),
 }));
 
 vi.mock('node-telegram-bot-api', () => ({
@@ -76,7 +77,7 @@ vi.mock('./cron.js', () => ({
 
 vi.mock('./voice.js', () => ({
   isVoiceAvailable: vi.fn().mockReturnValue(false),
-  transcribeVoice: vi.fn().mockResolvedValue('transcribed text'),
+  transcribeVoice: (...args: unknown[]) => mocks.transcribeVoiceMock(...args),
 }));
 
 vi.mock('fs', async (importOriginal) => {
@@ -934,6 +935,232 @@ describe('CcTgBot chat bridge', () => {
         source: 'cc-tg',
         content: expect.stringContaining('[tool] Bash:'),
       })
+    );
+  });
+});
+
+describe('handleVoice Redis tracking', () => {
+  const mockRedis = {
+    lpush: vi.fn().mockResolvedValue(1),
+    rpush: vi.fn().mockResolvedValue(1),
+    lrem: vi.fn().mockResolvedValue(1),
+    lrange: vi.fn().mockResolvedValue([]),
+    ltrim: vi.fn().mockResolvedValue('OK'),
+    publish: vi.fn().mockResolvedValue(1),
+    expire: vi.fn().mockResolvedValue(1),
+  };
+
+  function makeBotWithRedis() {
+    return new CcTgBot({ telegramToken: 'test-token', redis: mockRedis as never, namespace: 'test-ns' });
+  }
+
+  function makeVoiceMsg(overrides: Record<string, unknown> = {}) {
+    return {
+      chat: { id: 42 },
+      from: { id: 100 },
+      message_id: 7,
+      voice: { file_id: 'voice-file-001' },
+      ...overrides,
+    };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({});
+    mocks.tgSendChatAction.mockResolvedValue({});
+    mocks.tgSetMyCommands.mockResolvedValue({});
+    mocks.tgGetFileLink.mockResolvedValue('https://example.com/voice.ogg');
+    mocks.transcribeVoiceMock.mockResolvedValue('hello world');
+    mocks.existsSyncMock.mockReturnValue(false);
+    mockRedis.rpush.mockResolvedValue(1);
+    mockRedis.lrem.mockResolvedValue(1);
+    mockRedis.lrange.mockResolvedValue([]);
+    mockRedis.expire.mockResolvedValue(1);
+  });
+
+  it('pushes pending entry to voice:pending before transcription', async () => {
+    const bot = makeBotWithRedis();
+    await (bot as any).handleVoice(42, makeVoiceMsg());
+    bot.stop();
+
+    expect(mockRedis.rpush).toHaveBeenCalledWith(
+      'voice:pending',
+      expect.stringContaining('"file_id":"voice-file-001"')
+    );
+  });
+
+  it('removes entry from voice:pending on successful transcription', async () => {
+    const bot = makeBotWithRedis();
+    await (bot as any).handleVoice(42, makeVoiceMsg());
+    bot.stop();
+
+    expect(mockRedis.lrem).toHaveBeenCalledWith(
+      'voice:pending',
+      0,
+      expect.stringContaining('"file_id":"voice-file-001"')
+    );
+  });
+
+  it('pushes to voice:failed and sets TTL on transcription error', async () => {
+    mocks.transcribeVoiceMock.mockRejectedValue(new Error('whisper-cpp not found — install with: brew install whisper-cpp'));
+    const bot = makeBotWithRedis();
+    await (bot as any).handleVoice(42, makeVoiceMsg());
+    // allow microtasks for the fire-and-forget redis chain
+    await new Promise((r) => setTimeout(r, 0));
+    bot.stop();
+
+    expect(mockRedis.rpush).toHaveBeenCalledWith(
+      'voice:failed',
+      expect.stringContaining('"file_id":"voice-file-001"')
+    );
+    expect(mockRedis.expire).toHaveBeenCalledWith('voice:failed', 48 * 60 * 60);
+  });
+
+  it('sends friendly error when whisper not installed', async () => {
+    mocks.transcribeVoiceMock.mockRejectedValue(new Error('whisper-cpp not found — install with: brew install whisper-cpp'));
+    const bot = makeBotWithRedis();
+    await (bot as any).handleVoice(42, makeVoiceMsg());
+    bot.stop();
+
+    expect(mocks.tgSendMessage).toHaveBeenCalledWith(
+      42,
+      'Voice transcription unavailable — whisper-cpp not installed'
+    );
+  });
+
+  it('sends friendly error when no whisper model found', async () => {
+    mocks.transcribeVoiceMock.mockRejectedValue(new Error('No whisper model found — run: whisper-cpp-download-ggml-model small.en'));
+    const bot = makeBotWithRedis();
+    await (bot as any).handleVoice(42, makeVoiceMsg());
+    bot.stop();
+
+    expect(mocks.tgSendMessage).toHaveBeenCalledWith(
+      42,
+      'Voice transcription unavailable — no whisper model found'
+    );
+  });
+
+  it('sends friendly error when download fails', async () => {
+    mocks.transcribeVoiceMock.mockRejectedValue(new Error('HTTP 403 downloading https://api.telegram.org/file/...'));
+    const bot = makeBotWithRedis();
+    await (bot as any).handleVoice(42, makeVoiceMsg());
+    bot.stop();
+
+    expect(mocks.tgSendMessage).toHaveBeenCalledWith(
+      42,
+      'Could not download voice file from Telegram'
+    );
+  });
+
+  it('sends generic error for unknown failures', async () => {
+    mocks.transcribeVoiceMock.mockRejectedValue(new Error('some unexpected error'));
+    const bot = makeBotWithRedis();
+    await (bot as any).handleVoice(42, makeVoiceMsg());
+    bot.stop();
+
+    expect(mocks.tgSendMessage).toHaveBeenCalledWith(
+      42,
+      'Voice transcription failed: some unexpected error'
+    );
+  });
+});
+
+describe('handleVoiceRetry', () => {
+  const mockRedis = {
+    lpush: vi.fn().mockResolvedValue(1),
+    rpush: vi.fn().mockResolvedValue(1),
+    lrem: vi.fn().mockResolvedValue(1),
+    lrange: vi.fn().mockResolvedValue([]),
+    ltrim: vi.fn().mockResolvedValue('OK'),
+    publish: vi.fn().mockResolvedValue(1),
+    expire: vi.fn().mockResolvedValue(1),
+  };
+
+  function makeBotWithRedis() {
+    return new CcTgBot({ telegramToken: 'test-token', redis: mockRedis as never, namespace: 'test-ns' });
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({});
+    mocks.tgSendChatAction.mockResolvedValue({});
+    mocks.tgSetMyCommands.mockResolvedValue({});
+    mocks.tgGetFileLink.mockResolvedValue('https://example.com/voice.ogg');
+    mocks.transcribeVoiceMock.mockResolvedValue('retried transcript');
+    mocks.existsSyncMock.mockReturnValue(false);
+    mockRedis.lrange.mockResolvedValue([]);
+    mockRedis.lrem.mockResolvedValue(1);
+  });
+
+  it('replies with no-redis message when Redis not configured', async () => {
+    const bot = new CcTgBot({ telegramToken: 'test-token' });
+    await (bot as any).handleVoiceRetry(42);
+    bot.stop();
+
+    expect(mocks.tgSendMessage).toHaveBeenCalledWith(
+      42,
+      'Redis not configured — voice retry unavailable.'
+    );
+  });
+
+  it('replies with nothing-to-retry when both lists empty', async () => {
+    mockRedis.lrange.mockResolvedValue([]);
+    const bot = makeBotWithRedis();
+    await (bot as any).handleVoiceRetry(42);
+    bot.stop();
+
+    expect(mocks.tgSendMessage).toHaveBeenCalledWith(
+      42,
+      'No pending voice messages to retry.'
+    );
+  });
+
+  it('retries entries from voice:pending and removes on success', async () => {
+    const entry = JSON.stringify({ file_id: 'voice-abc', chat_id: 42, message_id: 5, timestamp: Date.now() });
+    mockRedis.lrange.mockImplementation((key: string) =>
+      key === 'voice:pending' ? Promise.resolve([entry]) : Promise.resolve([])
+    );
+
+    const bot = makeBotWithRedis();
+    await (bot as any).handleVoiceRetry(42);
+    bot.stop();
+
+    expect(mocks.tgGetFileLink).toHaveBeenCalledWith('voice-abc');
+    expect(mocks.claudeSendPrompt).toHaveBeenCalledWith('retried transcript');
+    expect(mockRedis.lrem).toHaveBeenCalledWith('voice:pending', 0, entry);
+  });
+
+  it('reports failure when transcription throws during retry', async () => {
+    const entry = JSON.stringify({ file_id: 'voice-xyz', chat_id: 42, message_id: 8, timestamp: Date.now() });
+    mockRedis.lrange.mockImplementation((key: string) =>
+      key === 'voice:failed' ? Promise.resolve([entry]) : Promise.resolve([])
+    );
+    mocks.transcribeVoiceMock.mockRejectedValue(new Error('whisper not available'));
+
+    const bot = makeBotWithRedis();
+    await (bot as any).handleVoiceRetry(42);
+    bot.stop();
+
+    const calls = mocks.tgSendMessage.mock.calls as [number, string][];
+    const lastCall = calls[calls.length - 1];
+    expect(lastCall[0]).toBe(42);
+    expect(lastCall[1]).toContain('1 failed');
+  });
+
+  it('/voice_retry command dispatches to handleVoiceRetry', async () => {
+    mockRedis.lrange.mockResolvedValue([]);
+    const bot = makeBotWithRedis();
+    await (bot as any).handleTelegram({
+      chat: { id: 42, type: 'private' },
+      from: { id: 100 },
+      text: '/voice_retry',
+      message_id: 1,
+    });
+    bot.stop();
+
+    expect(mocks.tgSendMessage).toHaveBeenCalledWith(
+      42,
+      'No pending voice messages to retry.'
     );
   });
 });

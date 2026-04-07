@@ -34,6 +34,7 @@ const BOT_COMMANDS: Array<{ command: string; description: string }> = [
   { command: "cost", description: "Show session token usage and cost" },
   { command: "skills", description: "List available Claude skills with descriptions" },
   { command: "cron", description: "Manage cron jobs — add/list/edit/remove/clear" },
+  { command: "voice_retry", description: "Retry failed voice message transcriptions" },
 ];
 
 export interface BotOptions {
@@ -465,6 +466,12 @@ export class CcTgBot {
       return;
     }
 
+    // /voice_retry — retry failed voice message transcriptions
+    if (text === "/voice_retry") {
+      await this.handleVoiceRetry(chatId, threadId);
+      return;
+    }
+
     const session = this.getOrCreateSession(chatId, threadId, threadName);
     try {
       const enriched = await enrichPromptWithUrls(text);
@@ -504,10 +511,30 @@ export class CcTgBot {
     console.log(`[voice:${chatId}] received voice message, transcribing...`);
     this.bot.sendChatAction(chatId, "typing", threadId !== undefined ? { message_thread_id: threadId } : undefined).catch(() => {});
 
+    // Store in Redis before transcription so we can retry on failure
+    const pendingEntry = JSON.stringify({
+      file_id: fileId,
+      chat_id: chatId,
+      message_id: msg.message_id,
+      timestamp: Date.now(),
+    });
+    if (this.redis) {
+      await this.redis.rpush("voice:pending", pendingEntry).catch((err: Error) =>
+        console.warn("[voice] redis rpush voice:pending failed:", err.message)
+      );
+    }
+
     try {
       const fileLink = await this.bot.getFileLink(fileId);
       const transcript = await transcribeVoice(fileLink);
       console.log(`[voice:${chatId}] transcribed: ${transcript}`);
+
+      // Remove from pending on success
+      if (this.redis) {
+        await this.redis.lrem("voice:pending", 0, pendingEntry).catch((err: Error) =>
+          console.warn("[voice] redis lrem voice:pending failed:", err.message)
+        );
+      }
 
       if (!transcript || transcript === "[empty transcription]") {
         await this.replyToChat(chatId, "Could not transcribe voice message.", threadId);
@@ -527,9 +554,102 @@ export class CcTgBot {
         this.killSession(chatId, true, threadId);
       }
     } catch (err) {
-      console.error(`[voice:${chatId}] error:`, (err as Error).message);
-      await this.replyToChat(chatId, `Voice transcription failed: ${(err as Error).message}`, threadId);
+      const errMsg = (err as Error).message;
+      console.error(`[voice:${chatId}] error:`, errMsg);
+
+      // Push to voice:failed on failure (entry stays in voice:pending for retry)
+      if (this.redis) {
+        const failedEntry = JSON.stringify({
+          file_id: fileId,
+          chat_id: chatId,
+          message_id: msg.message_id,
+          timestamp: Date.now(),
+          error: errMsg,
+          failed_at: Date.now(),
+        });
+        this.redis.rpush("voice:failed", failedEntry)
+          .then(() => this.redis!.expire("voice:failed", 48 * 60 * 60))
+          .catch((redisErr: Error) =>
+            console.warn("[voice] redis write voice:failed failed:", redisErr.message)
+          );
+      }
+
+      // User-friendly error messages
+      let userMsg: string;
+      if (errMsg.includes("whisper-cpp not found") || errMsg.includes("whisper not found")) {
+        userMsg = "Voice transcription unavailable — whisper-cpp not installed";
+      } else if (errMsg.includes("No whisper model found")) {
+        userMsg = "Voice transcription unavailable — no whisper model found";
+      } else if (errMsg.includes("HTTP") && errMsg.includes("downloading")) {
+        userMsg = "Could not download voice file from Telegram";
+      } else {
+        userMsg = `Voice transcription failed: ${errMsg}`;
+      }
+      await this.replyToChat(chatId, userMsg, threadId);
     }
+  }
+
+  private async handleVoiceRetry(chatId: number, threadId?: number): Promise<void> {
+    if (!this.redis) {
+      await this.replyToChat(chatId, "Redis not configured — voice retry unavailable.", threadId);
+      return;
+    }
+
+    const [pendingRaw, failedRaw] = await Promise.all([
+      this.redis.lrange("voice:pending", 0, -1).catch(() => [] as string[]),
+      this.redis.lrange("voice:failed", 0, -1).catch(() => [] as string[]),
+    ]);
+
+    // Deduplicate by file_id across both lists
+    const allEntries = new Map<string, { file_id: string; chat_id: number; message_id: number; timestamp: number }>();
+    for (const raw of [...pendingRaw, ...failedRaw]) {
+      try {
+        const entry = JSON.parse(raw) as { file_id: string; chat_id: number; message_id: number; timestamp: number };
+        if (entry.file_id) allEntries.set(entry.file_id, entry);
+      } catch { /* skip malformed entries */ }
+    }
+
+    if (allEntries.size === 0) {
+      await this.replyToChat(chatId, "No pending voice messages to retry.", threadId);
+      return;
+    }
+
+    await this.replyToChat(chatId, `Retrying ${allEntries.size} voice message(s)...`, threadId);
+
+    let succeeded = 0;
+    let failed = 0;
+    const errors: string[] = [];
+
+    for (const [fileId, entry] of allEntries) {
+      try {
+        const fileLink = await this.bot.getFileLink(fileId);
+        const transcript = await transcribeVoice(fileLink);
+
+        if (transcript && transcript !== "[empty transcription]") {
+          const session = this.getOrCreateSession(entry.chat_id, threadId, undefined);
+          session.claude.sendPrompt(transcript);
+          this.writeChatMessage("user", "telegram", transcript, entry.chat_id);
+
+          // Remove from both lists
+          const matchPending = pendingRaw.find((r) => r.includes(`"${fileId}"`));
+          const matchFailed = failedRaw.find((r) => r.includes(`"${fileId}"`));
+          if (matchPending) await this.redis.lrem("voice:pending", 0, matchPending).catch(() => {});
+          if (matchFailed) await this.redis.lrem("voice:failed", 0, matchFailed).catch(() => {});
+
+          succeeded++;
+        } else {
+          failed++;
+          errors.push(`${fileId}: empty transcription`);
+        }
+      } catch (err) {
+        failed++;
+        errors.push(`${fileId}: ${(err as Error).message}`);
+      }
+    }
+
+    const lines = [`Voice retry complete: ${succeeded} succeeded, ${failed} failed.`];
+    if (errors.length > 0) lines.push(...errors.map((e) => `• ${e}`));
+    await this.replyToChat(chatId, lines.join("\n"), threadId);
   }
 
   private async handlePhoto(chatId: number, msg: TelegramBot.Message, threadId?: number, threadName?: string): Promise<void> {
