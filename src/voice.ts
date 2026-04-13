@@ -6,7 +6,7 @@
 import { execFile } from "child_process";
 import { promisify } from "util";
 import { existsSync, mkdirSync } from "fs";
-import { unlink } from "fs/promises";
+import { unlink, readFile } from "fs/promises";
 import { tmpdir } from "os";
 import { join } from "path";
 import https from "https";
@@ -103,16 +103,34 @@ export async function transcribeVoice(fileUrl: string): Promise<string> {
     ]);
 
     // 3. Run whisper-cpp
-    const { stdout } = await execFileAsync(whisperBin, [
-      "-m", model,
-      "-f", wavPath,
-      "--no-timestamps",
-      "-l", "auto",
-      "--output-txt",
-    ]);
+    // --output-txt writes to ${wavPath}.txt (NOT stdout)
+    // -l auto fails with .en models — detect and use -l en instead
+    const isEnModel = model.includes(".en.");
+    const langArgs = isEnModel ? ["-l", "en"] : ["-l", "auto"];
 
-    // whisper outputs to stdout — strip leading/trailing whitespace and [BLANK_AUDIO] artifacts
-    const text = stdout
+    try {
+      await execFileAsync(whisperBin, [
+        "-m", model,
+        "-f", wavPath,
+        "--no-timestamps",
+        ...langArgs,
+        "--output-txt",   // writes to wavPath + ".txt"
+      ]);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new Error(`whisper-cpp failed: ${msg}`);
+    }
+
+    // Read the output file whisper-cpp wrote
+    const txtPath = `${wavPath}.txt`;
+    let raw = "";
+    try {
+      raw = await readFile(txtPath, "utf-8");
+    } catch {
+      throw new Error("whisper-cpp ran but produced no output file");
+    }
+
+    const text = raw
       .replace(/\[BLANK_AUDIO\]/gi, "")
       .replace(/\[.*?\]/g, "")  // remove timestamp artifacts
       .trim();
