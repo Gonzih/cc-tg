@@ -25,6 +25,7 @@ const mocks = vi.hoisted(() => {
     existsSyncMock: vi.fn().mockReturnValue(false),
     createWriteStreamMock: vi.fn(),
     unlinkMock: vi.fn().mockResolvedValue(undefined),
+    readFileMock: vi.fn().mockResolvedValue('transcribed'),
     execFileMock,
     execFileAsyncMock,
     httpsGetMock: vi.fn(),
@@ -44,6 +45,7 @@ vi.mock('fs', async (importOriginal) => {
 
 vi.mock('fs/promises', () => ({
   unlink: mocks.unlinkMock,
+  readFile: mocks.readFileMock,
 }));
 
 vi.mock('child_process', async (importOriginal) => {
@@ -180,7 +182,8 @@ describe('transcribeVoice', () => {
     vi.clearAllMocks();
     mocks.existsSyncMock.mockReturnValue(false);
     mocks.unlinkMock.mockResolvedValue(undefined);
-    mocks.execFileAsyncMock.mockResolvedValue({ stdout: 'hello world', stderr: '' });
+    mocks.readFileMock.mockResolvedValue('transcribed');
+    mocks.execFileAsyncMock.mockResolvedValue({ stdout: '', stderr: '' });
   });
 
   // -------------------------------------------------------------------------
@@ -213,32 +216,26 @@ describe('transcribeVoice', () => {
       setAllToolsAvailable();
     });
 
-    it('returns trimmed transcribed text from whisper stdout', async () => {
-      mocks.execFileAsyncMock.mockResolvedValue({ stdout: '  hello world  ', stderr: '' });
+    it('returns trimmed transcribed text from whisper txt file', async () => {
+      mocks.readFileMock.mockResolvedValue('  hello world  ');
       setupHttpsDownload();
       expect(await transcribeVoice('https://example.com/voice.ogg')).toBe('hello world');
     });
 
     it('strips [BLANK_AUDIO] artifacts from whisper output', async () => {
-      mocks.execFileAsyncMock.mockResolvedValue({
-        stdout: '[BLANK_AUDIO] actual speech [BLANK_AUDIO]',
-        stderr: '',
-      });
+      mocks.readFileMock.mockResolvedValue('[BLANK_AUDIO] actual speech [BLANK_AUDIO]');
       setupHttpsDownload();
       expect(await transcribeVoice('https://example.com/voice.ogg')).toBe('actual speech');
     });
 
     it('strips bracket timestamp artifacts from whisper output', async () => {
-      mocks.execFileAsyncMock.mockResolvedValue({
-        stdout: '[00:00.000 --> 00:03.500] useful speech here',
-        stderr: '',
-      });
+      mocks.readFileMock.mockResolvedValue('[00:00.000 --> 00:03.500] useful speech here');
       setupHttpsDownload();
       expect(await transcribeVoice('https://example.com/voice.ogg')).toBe('useful speech here');
     });
 
     it('returns "[empty transcription]" when output is blank after artifact removal', async () => {
-      mocks.execFileAsyncMock.mockResolvedValue({ stdout: '  [BLANK_AUDIO]  ', stderr: '' });
+      mocks.readFileMock.mockResolvedValue('  [BLANK_AUDIO]  ');
       setupHttpsDownload();
       expect(await transcribeVoice('https://example.com/voice.ogg')).toBe('[empty transcription]');
     });
@@ -274,17 +271,48 @@ describe('transcribeVoice', () => {
       expect(mocks.execFileAsyncMock).toHaveBeenCalledTimes(2);
     });
 
+    it('uses -l en for .en models (not -l auto)', async () => {
+      // MODEL_PATH = '.../ggml-small.en.bin' — contains '.en.' — should use '-l en'
+      setupHttpsDownload();
+      await transcribeVoice('https://example.com/voice.ogg');
+
+      const [, args] = mocks.execFileAsyncMock.mock.calls[1] as [string, string[]];
+      const lIdx = args.indexOf('-l');
+      expect(lIdx).toBeGreaterThan(-1);
+      expect(args[lIdx + 1]).toBe('en');
+    });
+
+    it('throws "whisper-cpp failed" when whisper-cpp exits with an error', async () => {
+      mocks.execFileAsyncMock
+        .mockResolvedValueOnce({ stdout: '', stderr: '' }) // ffmpeg succeeds
+        .mockRejectedValueOnce(new Error('exit code 1'));   // whisper fails
+      setupHttpsDownload();
+
+      await expect(transcribeVoice('https://example.com/voice.ogg'))
+        .rejects.toThrow('whisper-cpp failed: exit code 1');
+    });
+
+    it('throws when whisper ran but produced no output file', async () => {
+      // whisper succeeds but readFile throws (no txt file written)
+      mocks.readFileMock.mockRejectedValue(new Error('ENOENT'));
+      setupHttpsDownload();
+
+      await expect(transcribeVoice('https://example.com/voice.ogg'))
+        .rejects.toThrow('whisper-cpp ran but produced no output file');
+    });
+
     // -----------------------------------------------------------------------
     // Temp file cleanup
     // -----------------------------------------------------------------------
 
-    it('deletes ogg and wav temp files after successful transcription', async () => {
+    it('deletes ogg, wav, and txt temp files after successful transcription', async () => {
       setupHttpsDownload();
       await transcribeVoice('https://example.com/voice.ogg');
 
       const deleted = mocks.unlinkMock.mock.calls.map(([p]: [string]) => p);
       expect(deleted.some((p: string) => p.endsWith('.ogg'))).toBe(true);
       expect(deleted.some((p: string) => p.endsWith('.wav'))).toBe(true);
+      expect(deleted.some((p: string) => p.endsWith('.wav.txt'))).toBe(true);
     });
 
     it('still cleans up temp files when ffmpeg throws', async () => {
