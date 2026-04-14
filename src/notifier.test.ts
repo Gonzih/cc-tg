@@ -11,6 +11,7 @@ const mockDuplicate = vi.fn();
 const mockLpush = vi.fn().mockResolvedValue(1);
 const mockLtrim = vi.fn().mockResolvedValue("OK");
 const mockPublish = vi.fn().mockResolvedValue(1);
+const mockGet = vi.fn().mockResolvedValue(null);
 
 vi.mock("ioredis", () => {
   function MockRedis(this: Record<string, unknown>) {
@@ -20,6 +21,7 @@ vi.mock("ioredis", () => {
     this.lpush = mockLpush;
     this.ltrim = mockLtrim;
     this.publish = mockPublish;
+    this.get = mockGet;
   }
   return { Redis: MockRedis };
 });
@@ -37,6 +39,7 @@ function makeRedis(): ReturnType<typeof makeBot> & {
   lpush: typeof mockLpush;
   ltrim: typeof mockLtrim;
   publish: typeof mockPublish;
+  get: typeof mockGet;
 } {
   const sub = {
     subscribe: mockSubscribe,
@@ -44,6 +47,7 @@ function makeRedis(): ReturnType<typeof makeBot> & {
     lpush: mockLpush,
     ltrim: mockLtrim,
     publish: mockPublish,
+    get: mockGet,
   };
   mockDuplicate.mockReturnValue(sub);
   return {
@@ -54,18 +58,21 @@ function makeRedis(): ReturnType<typeof makeBot> & {
     lpush: mockLpush,
     ltrim: mockLtrim,
     publish: mockPublish,
+    get: mockGet,
   };
 }
 
 describe("startNotifier", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockGet.mockResolvedValue(null); // default: no meta-agent running
     const sub = {
       subscribe: mockSubscribe,
       on: mockOn,
       lpush: mockLpush,
       ltrim: mockLtrim,
       publish: mockPublish,
+      get: mockGet,
     };
     mockDuplicate.mockReturnValue(sub);
   });
@@ -99,7 +106,7 @@ describe("startNotifier", () => {
     expect(bot.sendMessage).toHaveBeenCalledWith(456, "Job done: my-task");
   });
 
-  it("echoes UI messages to Telegram and calls handleUserMessage", () => {
+  it("echoes UI messages to Telegram and calls handleUserMessage", async () => {
     const bot = makeBot();
     const redis = makeRedis();
     const handleUserMessage = vi.fn();
@@ -115,11 +122,13 @@ describe("startNotifier", () => {
 
     messageHandler!("cca:chat:incoming:ns1", "hello from UI");
 
+    await new Promise((r) => setTimeout(r, 0));
+
     expect(bot.sendMessage).toHaveBeenCalledWith(789, "📱 [from UI]: hello from UI");
     expect(handleUserMessage).toHaveBeenCalledWith(789, "hello from UI");
   });
 
-  it("parses JSON content from incoming UI message", () => {
+  it("parses JSON content from incoming UI message", async () => {
     const bot = makeBot();
     const redis = makeRedis();
     const handleUserMessage = vi.fn();
@@ -134,6 +143,8 @@ describe("startNotifier", () => {
     startNotifier(bot as never, 111, "x", redis as never, handleUserMessage);
 
     messageHandler!("cca:chat:incoming:x", JSON.stringify({ content: "extracted content" }));
+
+    await new Promise((r) => setTimeout(r, 0));
 
     expect(bot.sendMessage).toHaveBeenCalledWith(111, "📱 [from UI]: extracted content");
     expect(handleUserMessage).toHaveBeenCalledWith(111, "extracted content");
@@ -198,7 +209,7 @@ describe("startNotifier", () => {
     expect(bot.sendMessage).not.toHaveBeenCalled();
   });
 
-  it("uses getActiveChatId when chatId is null (dynamic chat bridge mode)", () => {
+  it("uses getActiveChatId when chatId is null (dynamic chat bridge mode)", async () => {
     const bot = makeBot();
     const redis = makeRedis();
     const handleUserMessage = vi.fn();
@@ -214,6 +225,8 @@ describe("startNotifier", () => {
     startNotifier(bot as never, null, "dyn", redis as never, handleUserMessage, getActiveChatId);
 
     messageHandler!("cca:chat:incoming:dyn", "hello dynamic");
+
+    await new Promise((r) => setTimeout(r, 0));
 
     expect(getActiveChatId).toHaveBeenCalled();
     expect(bot.sendMessage).toHaveBeenCalledWith(42, "📱 [from UI]: hello dynamic");
@@ -235,6 +248,87 @@ describe("startNotifier", () => {
 
     messageHandler!("cca:notify:dyn", "Job done");
     expect(bot.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("routes to meta-agent input queue when meta-agent is running", async () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+    const handleUserMessage = vi.fn();
+
+    mockGet.mockResolvedValue(JSON.stringify({ status: "running" }));
+
+    let messageHandler: ((channel: string, message: string) => void) | undefined;
+    mockOn.mockImplementation((event: string, handler: unknown) => {
+      if (event === "message") {
+        messageHandler = handler as (channel: string, message: string) => void;
+      }
+    });
+
+    startNotifier(bot as never, 100, "ns-meta", redis as never, handleUserMessage);
+
+    messageHandler!("cca:chat:incoming:ns-meta", "hello meta");
+
+    // Give the async IIFE time to resolve
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(mockGet).toHaveBeenCalledWith("cca:meta-agent:status:ns-meta");
+    expect(mockLpush).toHaveBeenCalledWith(
+      "cca:meta:ns-meta:input",
+      expect.stringContaining('"content":"hello meta"')
+    );
+    expect(handleUserMessage).not.toHaveBeenCalled();
+    // Still echoes to Telegram
+    expect(bot.sendMessage).toHaveBeenCalledWith(100, "📱 [from UI]: hello meta");
+  });
+
+  it("falls back to handleUserMessage when meta-agent status is not running", async () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+    const handleUserMessage = vi.fn();
+
+    mockGet.mockResolvedValue(JSON.stringify({ status: "idle" }));
+
+    let messageHandler: ((channel: string, message: string) => void) | undefined;
+    mockOn.mockImplementation((event: string, handler: unknown) => {
+      if (event === "message") {
+        messageHandler = handler as (channel: string, message: string) => void;
+      }
+    });
+
+    startNotifier(bot as never, 200, "ns-idle", redis as never, handleUserMessage);
+
+    messageHandler!("cca:chat:incoming:ns-idle", "hello coord");
+
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(handleUserMessage).toHaveBeenCalledWith(200, "hello coord");
+    expect(mockLpush).not.toHaveBeenCalledWith(
+      "cca:meta:ns-idle:input",
+      expect.anything()
+    );
+  });
+
+  it("falls back to handleUserMessage when meta-agent status check throws", async () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+    const handleUserMessage = vi.fn();
+
+    mockGet.mockRejectedValue(new Error("redis connection lost"));
+
+    let messageHandler: ((channel: string, message: string) => void) | undefined;
+    mockOn.mockImplementation((event: string, handler: unknown) => {
+      if (event === "message") {
+        messageHandler = handler as (channel: string, message: string) => void;
+      }
+    });
+
+    startNotifier(bot as never, 300, "ns-err", redis as never, handleUserMessage);
+
+    messageHandler!("cca:chat:incoming:ns-err", "error fallback");
+
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(handleUserMessage).toHaveBeenCalledWith(300, "error fallback");
   });
 
   it("does not call handleUserMessage when getActiveChatId returns undefined", () => {

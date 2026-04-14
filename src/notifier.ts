@@ -150,10 +150,32 @@ export function startNotifier(
         };
         writeChatLog(redis, namespace, inMsg);
 
-        // Feed into active Claude session as if user typed it
-        if (handleUserMessage) {
-          handleUserMessage(targetChatId, content);
-        }
+        // Check if a meta-agent is running for this namespace; if so, route there instead
+        void (async () => {
+          let routedToMetaAgent = false;
+          try {
+            const statusRaw = await redis.get(`cca:meta-agent:status:${namespace}`);
+            if (statusRaw) {
+              const status = JSON.parse(statusRaw) as { status?: string };
+              if (status.status === "running") {
+                const entry = JSON.stringify({
+                  id: crypto.randomUUID(),
+                  content,
+                  timestamp: new Date().toISOString(),
+                });
+                await redis.lpush(`cca:meta:${namespace}:input`, entry);
+                log("info", `cca:chat:incoming: routed to meta-agent for namespace ${namespace}`);
+                routedToMetaAgent = true;
+              }
+            }
+          } catch (err) {
+            log("warn", "meta-agent status check failed, falling back to coordinator:", (err as Error).message);
+          }
+
+          if (!routedToMetaAgent && handleUserMessage) {
+            handleUserMessage(targetChatId, content);
+          }
+        })();
       } else {
         log("warn", "cca:chat:incoming: no active chatId to route message to");
       }
