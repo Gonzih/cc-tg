@@ -102,6 +102,62 @@ export function startNotifier(
     }
   });
 
+  // Poll the cca:notify:{namespace} LIST every 5 seconds.
+  // Jobs push to this list via RPUSH; pub/sub alone won't deliver those messages.
+  const notifyListKey = `cca:notify:${namespace}`;
+  const MAX_PER_CYCLE = 20;
+
+  const pollNotifyList = async (): Promise<void> => {
+    const targetId = chatId ?? getActiveChatId?.();
+    if (targetId == null) return;
+
+    const items: string[] = [];
+    try {
+      for (let i = 0; i < MAX_PER_CYCLE; i++) {
+        const item = await redis.rpop(notifyListKey);
+        if (item === null) break;
+        items.push(item);
+      }
+    } catch (err) {
+      log("warn", "notify list rpop failed:", (err as Error).message);
+      return;
+    }
+
+    if (items.length === 0) return;
+
+    let remaining = 0;
+    if (items.length === MAX_PER_CYCLE) {
+      try {
+        remaining = await redis.llen(notifyListKey);
+      } catch (err) {
+        log("warn", "notify list llen failed:", (err as Error).message);
+      }
+    }
+
+    for (const raw of items) {
+      let text = raw;
+      try {
+        const parsed = JSON.parse(raw) as { text?: string };
+        if (parsed.text) text = parsed.text;
+      } catch {
+        // not JSON — use raw string as-is
+      }
+      bot.sendMessage(targetId, text).catch((err: Error) => {
+        log("warn", "notify list sendMessage failed:", err.message);
+      });
+    }
+
+    if (remaining > 0) {
+      bot.sendMessage(targetId, `...and ${remaining} more notifications`).catch((err: Error) => {
+        log("warn", "notify list summary sendMessage failed:", err.message);
+      });
+    }
+  };
+
+  setInterval(() => {
+    void pollNotifyList();
+  }, 5_000);
+
   sub.on("message", (channel: string, message: string) => {
     const notifyChannel = `cca:notify:${namespace}`;
     const incomingChannel = `cca:chat:incoming:${namespace}`;

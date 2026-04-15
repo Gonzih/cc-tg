@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { startNotifier, writeChatLog, type ChatMessage } from "./notifier.js";
 
 // ---- ioredis mock ----
@@ -12,6 +12,8 @@ const mockLpush = vi.fn().mockResolvedValue(1);
 const mockLtrim = vi.fn().mockResolvedValue("OK");
 const mockPublish = vi.fn().mockResolvedValue(1);
 const mockGet = vi.fn().mockResolvedValue(null);
+const mockRpop = vi.fn().mockResolvedValue(null);
+const mockLlen = vi.fn().mockResolvedValue(0);
 
 vi.mock("ioredis", () => {
   function MockRedis(this: Record<string, unknown>) {
@@ -22,6 +24,8 @@ vi.mock("ioredis", () => {
     this.ltrim = mockLtrim;
     this.publish = mockPublish;
     this.get = mockGet;
+    this.rpop = mockRpop;
+    this.llen = mockLlen;
   }
   return { Redis: MockRedis };
 });
@@ -40,6 +44,8 @@ function makeRedis(): ReturnType<typeof makeBot> & {
   ltrim: typeof mockLtrim;
   publish: typeof mockPublish;
   get: typeof mockGet;
+  rpop: typeof mockRpop;
+  llen: typeof mockLlen;
 } {
   const sub = {
     subscribe: mockSubscribe,
@@ -59,6 +65,8 @@ function makeRedis(): ReturnType<typeof makeBot> & {
     ltrim: mockLtrim,
     publish: mockPublish,
     get: mockGet,
+    rpop: mockRpop,
+    llen: mockLlen,
   };
 }
 
@@ -66,6 +74,8 @@ describe("startNotifier", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockGet.mockResolvedValue(null); // default: no meta-agent running
+    mockRpop.mockResolvedValue(null); // default: empty list
+    mockLlen.mockResolvedValue(0);
     const sub = {
       subscribe: mockSubscribe,
       on: mockOn,
@@ -350,6 +360,156 @@ describe("startNotifier", () => {
 
     expect(bot.sendMessage).not.toHaveBeenCalled();
     expect(handleUserMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe("notify list poller", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    mockGet.mockResolvedValue(null);
+    mockRpop.mockResolvedValue(null);
+    mockLlen.mockResolvedValue(0);
+    const sub = {
+      subscribe: mockSubscribe,
+      on: mockOn,
+      lpush: mockLpush,
+      ltrim: mockLtrim,
+      publish: mockPublish,
+      get: mockGet,
+    };
+    mockDuplicate.mockReturnValue(sub);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("does not send anything when the list is empty", async () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+    mockRpop.mockResolvedValue(null);
+
+    startNotifier(bot as never, 123, "ns-poll", redis as never);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(bot.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("drains list items and sends them to Telegram", async () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+
+    // Two items then empty
+    mockRpop
+      .mockResolvedValueOnce(JSON.stringify({ text: "First notification" }))
+      .mockResolvedValueOnce(JSON.stringify({ text: "Second notification" }))
+      .mockResolvedValue(null);
+
+    startNotifier(bot as never, 555, "ns-drain", redis as never);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(bot.sendMessage).toHaveBeenCalledWith(555, "First notification");
+    expect(bot.sendMessage).toHaveBeenCalledWith(555, "Second notification");
+    expect(bot.sendMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it("sends raw string when item is not JSON", async () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+
+    mockRpop
+      .mockResolvedValueOnce("plain text notification")
+      .mockResolvedValue(null);
+
+    startNotifier(bot as never, 777, "ns-raw", redis as never);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(bot.sendMessage).toHaveBeenCalledWith(777, "plain text notification");
+  });
+
+  it("sends '...and N more' summary when list exceeds 20 items", async () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+
+    // Return 20 items then null to fill the cycle, leaving 5 more in the list
+    const items = Array.from({ length: 20 }, (_, i) => JSON.stringify({ text: `msg ${i + 1}` }));
+    mockRpop.mockImplementation(() => {
+      const item = items.shift();
+      return Promise.resolve(item ?? null);
+    });
+    mockLlen.mockResolvedValue(5);
+
+    startNotifier(bot as never, 888, "ns-overflow", redis as never);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    // 20 messages + 1 summary
+    expect(bot.sendMessage).toHaveBeenCalledTimes(21);
+    expect(bot.sendMessage).toHaveBeenLastCalledWith(888, "...and 5 more notifications");
+  });
+
+  it("does not send summary when exactly 20 items and list is now empty", async () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+
+    const items = Array.from({ length: 20 }, (_, i) => JSON.stringify({ text: `msg ${i + 1}` }));
+    mockRpop.mockImplementation(() => {
+      const item = items.shift();
+      return Promise.resolve(item ?? null);
+    });
+    mockLlen.mockResolvedValue(0);
+
+    startNotifier(bot as never, 999, "ns-exact20", redis as never);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(bot.sendMessage).toHaveBeenCalledTimes(20);
+    expect(bot.sendMessage).not.toHaveBeenCalledWith(999, expect.stringContaining("more notifications"));
+  });
+
+  it("skips polling when no chatId is available", async () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+
+    mockRpop.mockResolvedValueOnce(JSON.stringify({ text: "hello" })).mockResolvedValue(null);
+
+    startNotifier(bot as never, null, "ns-noid", redis as never, undefined, () => undefined);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(bot.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("uses getActiveChatId when chatId is null", async () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+
+    mockRpop
+      .mockResolvedValueOnce(JSON.stringify({ text: "dynamic notify" }))
+      .mockResolvedValue(null);
+
+    startNotifier(bot as never, null, "ns-dynamic", redis as never, undefined, () => 42);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(bot.sendMessage).toHaveBeenCalledWith(42, "dynamic notify");
+  });
+
+  it("continues gracefully when rpop throws", async () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+
+    mockRpop.mockRejectedValue(new Error("connection lost"));
+
+    startNotifier(bot as never, 123, "ns-err", redis as never);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(bot.sendMessage).not.toHaveBeenCalled();
   });
 });
 
