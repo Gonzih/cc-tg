@@ -431,6 +431,59 @@ describe('CcTgBot', () => {
       });
     });
 
+    describe('/drivers command', () => {
+      it('lists drivers from MCP and marks default', async () => {
+        vi.spyOn(bot as any, 'callCcAgentTool').mockResolvedValue(JSON.stringify(['claude', 'openrouter']));
+        const origDriver = process.env.CC_AGENT_DEFAULT_DRIVER;
+        process.env.CC_AGENT_DEFAULT_DRIVER = 'claude';
+        await sendCommand('/drivers');
+        process.env.CC_AGENT_DEFAULT_DRIVER = origDriver;
+
+        expect(mocks.tgSendMessage).toHaveBeenCalledOnce();
+        const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+        expect(msg).toContain('claude (default)');
+        expect(msg).toContain('openrouter');
+      });
+
+      it('falls back to raw text when MCP returns non-JSON', async () => {
+        vi.spyOn(bot as any, 'callCcAgentTool').mockResolvedValue('claude\nopenrouter');
+        await sendCommand('/drivers');
+
+        const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+        expect(msg).toContain('claude');
+        expect(msg).toContain('openrouter');
+      });
+
+      it('replies with no-drivers message when MCP returns null', async () => {
+        vi.spyOn(bot as any, 'callCcAgentTool').mockResolvedValue(null);
+        await sendCommand('/drivers');
+
+        expect(mocks.tgSendMessage).toHaveBeenCalledWith(42, 'No drivers available or cc-agent did not respond.');
+      });
+
+      it('replies with error message when MCP throws', async () => {
+        vi.spyOn(bot as any, 'callCcAgentTool').mockRejectedValue(new Error('tool not found'));
+        await sendCommand('/drivers');
+
+        const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+        expect(msg).toContain('Failed to list drivers');
+        expect(msg).toContain('tool not found');
+      });
+
+      it('/drivers marks non-claude driver as default when CC_AGENT_DEFAULT_DRIVER is set', async () => {
+        vi.spyOn(bot as any, 'callCcAgentTool').mockResolvedValue(JSON.stringify(['claude', 'openrouter', 'openai']));
+        const origDriver = process.env.CC_AGENT_DEFAULT_DRIVER;
+        process.env.CC_AGENT_DEFAULT_DRIVER = 'openrouter';
+        await sendCommand('/drivers');
+        process.env.CC_AGENT_DEFAULT_DRIVER = origDriver;
+
+        const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+        expect(msg).toContain('openrouter (default)');
+        expect(msg).toContain('claude');
+        expect(msg).not.toContain('claude (default)');
+      });
+    });
+
   });
 
   describe('trackWrittenFiles', () => {

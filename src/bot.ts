@@ -35,6 +35,7 @@ const BOT_COMMANDS: Array<{ command: string; description: string }> = [
   { command: "skills", description: "List available Claude skills with descriptions" },
   { command: "cron", description: "Manage cron jobs — add/list/edit/remove/clear" },
   { command: "voice_retry", description: "Retry failed voice message transcriptions" },
+  { command: "drivers", description: "List available agent drivers" },
 ];
 
 export interface BotOptions {
@@ -469,6 +470,12 @@ export class CcTgBot {
     // /voice_retry — retry failed voice message transcriptions
     if (text === "/voice_retry") {
       await this.handleVoiceRetry(chatId, threadId);
+      return;
+    }
+
+    // /drivers — list available agent drivers via cc-agent MCP
+    if (text === "/drivers") {
+      await this.handleDrivers(chatId, threadId);
       return;
     }
 
@@ -1365,7 +1372,42 @@ export class CcTgBot {
     await this.bot.sendDocument(chatId, filePath, docOpts);
   }
 
+  private async handleDrivers(chatId: number, threadId?: number): Promise<void> {
+    try {
+      const raw = await this.callCcAgentTool("list_drivers");
+      if (!raw) {
+        await this.replyToChat(chatId, "No drivers available or cc-agent did not respond.", threadId);
+        return;
+      }
+      // Try to pretty-print JSON array/object, fall back to raw string
+      let reply: string;
+      try {
+        const data = JSON.parse(raw) as unknown;
+        if (Array.isArray(data)) {
+          const current = process.env.CC_AGENT_DEFAULT_DRIVER || "claude";
+          const lines = (data as string[]).map((d) => d === current ? `• ${d} (default)` : `• ${d}`);
+          reply = `Available drivers:\n${lines.join("\n")}`;
+        } else {
+          reply = `Available drivers:\n${raw}`;
+        }
+      } catch {
+        reply = `Available drivers:\n${raw}`;
+      }
+      await this.replyToChat(chatId, reply, threadId);
+    } catch (err) {
+      await this.replyToChat(chatId, `Failed to list drivers: ${(err as Error).message}`, threadId);
+    }
+  }
+
   private callCcAgentTool(toolName: string, args: Record<string, unknown> = {}): Promise<string | null> {
+    // For spawn tools, pass through the configured driver and model
+    const spawnTools = new Set(["spawn_agent", "spawn_from_profile"]);
+    if (spawnTools.has(toolName)) {
+      const driver = process.env.CC_AGENT_DEFAULT_DRIVER || "claude";
+      const model = process.env.CC_AGENT_DEFAULT_MODEL || undefined;
+      args = { agent_driver: driver, ...(model ? { agent_model: model } : {}), ...args };
+    }
+
     return new Promise((resolve) => {
       let settled = false;
       const done = (val: string | null) => {
