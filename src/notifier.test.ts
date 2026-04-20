@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { startNotifier, writeChatLog, type ChatMessage } from "./notifier.js";
+import { startNotifier, writeChatLog, parseNotification, type ChatMessage } from "./notifier.js";
 
 // ---- ioredis mock ----
 const mockSubscribe = vi.fn().mockImplementation((_channel: string, cb?: (err: Error | null) => void) => {
@@ -510,6 +510,64 @@ describe("notify list poller", () => {
     await vi.advanceTimersByTimeAsync(5_000);
 
     expect(bot.sendMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe("parseNotification", () => {
+  it("returns raw string when input is not JSON", () => {
+    expect(parseNotification("plain text")).toBe("plain text");
+  });
+
+  it("extracts text field from JSON", () => {
+    expect(parseNotification(JSON.stringify({ text: "Job done" }))).toBe("Job done");
+  });
+
+  it("adds no badge when driver is 'claude'", () => {
+    expect(parseNotification(JSON.stringify({ text: "Job done", driver: "claude" }))).toBe("Job done");
+  });
+
+  it("adds no badge when driver is absent", () => {
+    expect(parseNotification(JSON.stringify({ text: "Job done" }))).toBe("Job done");
+  });
+
+  it("appends model badge when driver is non-claude and model is set", () => {
+    expect(
+      parseNotification(JSON.stringify({ text: "Job done", driver: "openrouter", model: "qwen2.5-72b" }))
+    ).toBe("Job done [qwen2.5-72b]");
+  });
+
+  it("appends driver badge when driver is non-claude and model is absent", () => {
+    expect(
+      parseNotification(JSON.stringify({ text: "Job done", driver: "openai" }))
+    ).toBe("Job done [openai]");
+  });
+
+  it("appends driver badge when driver is non-claude and model is empty string", () => {
+    expect(
+      parseNotification(JSON.stringify({ text: "Job done", driver: "openai", model: "" }))
+    ).toBe("Job done [openai]");
+  });
+
+  it("returns raw string when JSON has no text field", () => {
+    expect(parseNotification(JSON.stringify({ foo: "bar" }))).toBe(JSON.stringify({ foo: "bar" }));
+  });
+
+  it("pub/sub handler uses parseNotification — JSON badge appears in sent message", () => {
+    // This is an integration check through the message handler
+    const bot = makeBot();
+    const redis = makeRedis();
+
+    let messageHandler: ((channel: string, message: string) => void) | undefined;
+    mockOn.mockImplementation((event: string, handler: unknown) => {
+      if (event === "message") {
+        messageHandler = handler as (channel: string, message: string) => void;
+      }
+    });
+
+    startNotifier(bot as never, 42, "ns", redis as never);
+    messageHandler!("cca:notify:ns", JSON.stringify({ text: "Task done", driver: "openrouter", model: "qwen2.5-72b" }));
+
+    expect(bot.sendMessage).toHaveBeenCalledWith(42, "Task done [qwen2.5-72b]");
   });
 });
 

@@ -28,6 +28,34 @@ function log(level: "info" | "warn" | "error", ...args: unknown[]): void {
 }
 
 /**
+ * Parse a notification payload and return the display text.
+ * Appends a [model] or [driver] badge if the driver is non-claude.
+ *
+ * Payload format (JSON): { text: string, driver?: string, model?: string }
+ * Falls back to raw string if not valid JSON.
+ */
+export function parseNotification(raw: string): string {
+  let text = raw;
+  let driver: string | undefined;
+  let model: string | undefined;
+  try {
+    const parsed = JSON.parse(raw) as { text?: string; driver?: string; model?: string };
+    if (parsed.text) text = parsed.text;
+    driver = parsed.driver;
+    model = parsed.model;
+  } catch {
+    // not JSON — use raw string as-is, no badge
+    return text;
+  }
+
+  // Only show badge if driver is present and not 'claude'
+  if (!driver || driver === "claude") return text;
+
+  const badge = model && model.trim() ? model.trim() : driver;
+  return `${text} [${badge}]`;
+}
+
+/**
  * Write a message to the chat log in Redis.
  * Fire-and-forget — errors are logged but not thrown.
  */
@@ -135,13 +163,7 @@ export function startNotifier(
     }
 
     for (const raw of items) {
-      let text = raw;
-      try {
-        const parsed = JSON.parse(raw) as { text?: string };
-        if (parsed.text) text = parsed.text;
-      } catch {
-        // not JSON — use raw string as-is
-      }
+      const text = parseNotification(raw);
       bot.sendMessage(targetId, text).catch((err: Error) => {
         log("warn", "notify list sendMessage failed:", err.message);
       });
@@ -165,7 +187,8 @@ export function startNotifier(
     if (channel === notifyChannel) {
       const targetId = chatId ?? getActiveChatId?.();
       if (targetId != null) {
-        bot.sendMessage(targetId, message).catch((err: Error) => {
+        const text = parseNotification(message);
+        bot.sendMessage(targetId, text).catch((err: Error) => {
           log("warn", "sendMessage failed:", err.message);
         });
       } else {
