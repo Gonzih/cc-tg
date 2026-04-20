@@ -28,31 +28,51 @@ function log(level: "info" | "warn" | "error", ...args: unknown[]): void {
 }
 
 /**
+ * Shorten a model name for display in a badge.
+ * - Strips driver prefix (e.g. "claude-sonnet-4-6" with driver "claude" → "sonnet-4-6")
+ * - Strips vendor/ prefix for openrouter-style names (e.g. "openai/gpt-4o" → "gpt-4o")
+ * - Returns empty string when model is absent.
+ */
+function shortenModelName(model: string, driver: string): string {
+  if (!model.trim()) return "";
+  const pfx = driver.toLowerCase() + "-";
+  if (model.toLowerCase().startsWith(pfx)) return model.slice(pfx.length);
+  const slashIdx = model.indexOf("/");
+  if (slashIdx >= 0) return model.slice(slashIdx + 1);
+  return model;
+}
+
+/**
  * Parse a notification payload and return the display text.
- * Appends a [model] or [driver] badge if the driver is non-claude.
+ * Appends a [driver] or [driver:model] badge whenever the driver field is present.
+ * Appends " cost: $X.XXX" if a numeric cost field is present.
  *
- * Payload format (JSON): { text: string, driver?: string, model?: string }
+ * Payload format (JSON): { text: string, driver?: string, model?: string, cost?: number }
  * Falls back to raw string if not valid JSON.
  */
 export function parseNotification(raw: string): string {
   let text = raw;
   let driver: string | undefined;
   let model: string | undefined;
+  let cost: number | undefined;
   try {
-    const parsed = JSON.parse(raw) as { text?: string; driver?: string; model?: string };
+    const parsed = JSON.parse(raw) as { text?: string; driver?: string; model?: string; cost?: number };
     if (parsed.text) text = parsed.text;
     driver = parsed.driver;
     model = parsed.model;
+    if (typeof parsed.cost === "number") cost = parsed.cost;
   } catch {
     // not JSON — use raw string as-is, no badge
     return text;
   }
 
-  // Only show badge if driver is present and not 'claude'
-  if (!driver || driver === "claude") return text;
+  // Show badge whenever driver field is present
+  if (!driver) return text;
 
-  const badge = model && model.trim() ? model.trim() : driver;
-  return `${text} [${badge}]`;
+  const shortModel = shortenModelName(model ?? "", driver);
+  const badge = shortModel ? `${driver}:${shortModel}` : driver;
+  const costStr = cost != null ? ` cost: $${cost.toFixed(3)}` : "";
+  return `${text}\n[${badge}]${costStr}`;
 }
 
 /**

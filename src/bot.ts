@@ -36,6 +36,7 @@ const BOT_COMMANDS: Array<{ command: string; description: string }> = [
   { command: "cron", description: "Manage cron jobs — add/list/edit/remove/clear" },
   { command: "voice_retry", description: "Retry failed voice message transcriptions" },
   { command: "drivers", description: "List available agent drivers" },
+  { command: "agents", description: "Show running meta-agents and their live status" },
 ];
 
 export interface BotOptions {
@@ -124,21 +125,28 @@ function formatAgentCostSummary(text: string): string {
   try {
     const data = JSON.parse(text) as Record<string, unknown>;
     const totalCost = ((data.total_cost_usd ?? data.total_cost ?? 0) as number);
-    const totalJobs = ((data.total_jobs ?? data.job_count ?? 0) as number);
     const byRepo = (data.by_repo ?? []) as Array<Record<string, unknown>>;
-    const lines = [
-      "🤖 Agent jobs (all time)",
-      `Total: $${totalCost.toFixed(2)} across ${totalJobs} jobs`,
-    ];
+
+    if (byRepo.length === 0) {
+      return "No cost data available yet.";
+    }
+
+    const lines = ["💰 Cost Summary", ""];
+
+    // Align repo names with right-padded costs
+    const maxLen = Math.max(...byRepo.map((e) => ((e.repo ?? e.repository ?? "unknown") as string).length));
     for (const entry of byRepo) {
       const repo = (entry.repo ?? entry.repository ?? "unknown") as string;
       const cost = ((entry.cost_usd ?? entry.cost ?? 0) as number);
-      const jobs = ((entry.job_count ?? entry.jobs ?? 0) as number);
-      lines.push(`  ${repo}: $${cost.toFixed(2)} (${jobs} jobs)`);
+      const pad = " ".repeat(maxLen - repo.length + 3);
+      lines.push(`${repo}${pad}$${cost.toFixed(2)}`);
     }
+
+    lines.push("");
+    lines.push(`Total: $${totalCost.toFixed(2)}`);
     return lines.join("\n");
   } catch {
-    return `🤖 Agent jobs (all time)\n${text}`;
+    return `💰 Cost Summary\n${text}`;
   }
 }
 
@@ -476,6 +484,12 @@ export class CcTgBot {
     // /drivers — list available agent drivers via cc-agent MCP
     if (text === "/drivers") {
       await this.handleDrivers(chatId, threadId);
+      return;
+    }
+
+    // /agents — show running meta-agents and their live status
+    if (text === "/agents") {
+      await this.handleAgents(chatId, threadId);
       return;
     }
 
@@ -1396,6 +1410,82 @@ export class CcTgBot {
       await this.replyToChat(chatId, reply, threadId);
     } catch (err) {
       await this.replyToChat(chatId, `Failed to list drivers: ${(err as Error).message}`, threadId);
+    }
+  }
+
+  private async handleAgents(chatId: number, threadId?: number): Promise<void> {
+    if (!this.redis) {
+      await this.replyToChat(chatId, "Redis not configured — agents status unavailable.", threadId);
+      return;
+    }
+
+    try {
+      // Scan for all meta-agent status keys
+      const keys: string[] = [];
+      let cursor = "0";
+      do {
+        const [nextCursor, found] = await this.redis.scan(cursor, "MATCH", "cca:meta-agent:status:*", "COUNT", 100);
+        cursor = nextCursor;
+        keys.push(...found);
+      } while (cursor !== "0");
+
+      if (keys.length === 0) {
+        await this.replyToChat(chatId, "No active meta-agents.", threadId);
+        return;
+      }
+
+      const statuses = await Promise.all(
+        keys.sort().map(async (key) => ({ key, raw: await this.redis!.get(key) }))
+      );
+
+      const lines = ["🤖 Active Agents", ""];
+      for (const { key, raw } of statuses) {
+        const namespace = key.replace("cca:meta-agent:status:", "");
+        if (!raw) {
+          lines.push(`${namespace} — status unknown`);
+          continue;
+        }
+        try {
+          const status = JSON.parse(raw) as {
+            status?: string;
+            current_tool?: string;
+            turn?: number;
+            turn_count?: number;
+            last_activity?: string;
+            updated_at?: string;
+          };
+
+          const state = status.status ?? "unknown";
+          const turns = status.turn ?? status.turn_count ?? 0;
+          const tool = status.current_tool;
+          const lastActivity = status.last_activity ?? status.updated_at;
+
+          let ageStr = "";
+          if (lastActivity) {
+            const ageSec = Math.floor((Date.now() - new Date(lastActivity).getTime()) / 1000);
+            if (ageSec < 60) ageStr = `${ageSec}s ago`;
+            else if (ageSec < 3600) ageStr = `${Math.floor(ageSec / 60)}m ago`;
+            else ageStr = `${Math.floor(ageSec / 3600)}h ago`;
+          }
+
+          let statusDesc: string;
+          if (state === "running" && tool) {
+            statusDesc = `typing... (turn ${turns})`;
+          } else if (state === "running") {
+            statusDesc = `running (turn ${turns}${ageStr ? `, ${ageStr}` : ""})`;
+          } else {
+            statusDesc = `idle (turn ${turns}${ageStr ? `, ${ageStr}` : ""})`;
+          }
+
+          lines.push(`${namespace} — ${statusDesc}`);
+        } catch {
+          lines.push(`${namespace} — status unknown`);
+        }
+      }
+
+      await this.replyToChat(chatId, lines.join("\n"), threadId);
+    } catch (err) {
+      await this.replyToChat(chatId, `Failed to get agents status: ${(err as Error).message}`, threadId);
     }
   }
 
