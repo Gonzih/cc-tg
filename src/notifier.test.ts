@@ -522,30 +522,61 @@ describe("parseNotification", () => {
     expect(parseNotification(JSON.stringify({ text: "Job done" }))).toBe("Job done");
   });
 
-  it("adds no badge when driver is 'claude'", () => {
-    expect(parseNotification(JSON.stringify({ text: "Job done", driver: "claude" }))).toBe("Job done");
+  it("adds [claude] badge when driver is 'claude'", () => {
+    expect(parseNotification(JSON.stringify({ text: "Job done", driver: "claude" }))).toBe("Job done\n[claude]");
+  });
+
+  it("strips driver prefix from model in claude badge", () => {
+    expect(
+      parseNotification(JSON.stringify({ text: "Job done", driver: "claude", model: "claude-sonnet-4-6" }))
+    ).toBe("Job done\n[claude:sonnet-4-6]");
   });
 
   it("adds no badge when driver is absent", () => {
     expect(parseNotification(JSON.stringify({ text: "Job done" }))).toBe("Job done");
   });
 
-  it("appends model badge when driver is non-claude and model is set", () => {
+  it("appends [driver:model] badge when driver and model are set", () => {
     expect(
       parseNotification(JSON.stringify({ text: "Job done", driver: "openrouter", model: "qwen2.5-72b" }))
-    ).toBe("Job done [qwen2.5-72b]");
+    ).toBe("Job done\n[openrouter:qwen2.5-72b]");
   });
 
-  it("appends driver badge when driver is non-claude and model is absent", () => {
+  it("appends driver-only badge when model is absent", () => {
     expect(
       parseNotification(JSON.stringify({ text: "Job done", driver: "openai" }))
-    ).toBe("Job done [openai]");
+    ).toBe("Job done\n[openai]");
   });
 
-  it("appends driver badge when driver is non-claude and model is empty string", () => {
+  it("appends driver-only badge when model is empty string", () => {
     expect(
       parseNotification(JSON.stringify({ text: "Job done", driver: "openai", model: "" }))
-    ).toBe("Job done [openai]");
+    ).toBe("Job done\n[openai]");
+  });
+
+  it("strips vendor/ prefix from model name", () => {
+    expect(
+      parseNotification(JSON.stringify({ text: "Job done", driver: "openrouter", model: "openai/gpt-4o" }))
+    ).toBe("Job done\n[openrouter:gpt-4o]");
+  });
+
+  it("appends cost when cost field is present", () => {
+    expect(
+      parseNotification(JSON.stringify({ text: "Job done", driver: "claude", model: "claude-sonnet-4-6", cost: 1.234 }))
+    ).toBe("Job done\n[claude:sonnet-4-6] cost: $1.234");
+  });
+
+  it("appends cost without badge when driver is absent but cost is present", () => {
+    // driver absent → no badge; cost not shown either (no driver = raw text path)
+    expect(
+      parseNotification(JSON.stringify({ text: "Job done", cost: 0.5 }))
+    ).toBe("Job done");
+  });
+
+  it("formats cost to 3 decimal places", () => {
+    expect(
+      parseNotification(JSON.stringify({ text: "Done", driver: "openai", cost: 0.04 }))
+    ).toBe("Done\n[openai] cost: $0.040");
   });
 
   it("returns raw string when JSON has no text field", () => {
@@ -567,7 +598,24 @@ describe("parseNotification", () => {
     startNotifier(bot as never, 42, "ns", redis as never);
     messageHandler!("cca:notify:ns", JSON.stringify({ text: "Task done", driver: "openrouter", model: "qwen2.5-72b" }));
 
-    expect(bot.sendMessage).toHaveBeenCalledWith(42, "Task done [qwen2.5-72b]");
+    expect(bot.sendMessage).toHaveBeenCalledWith(42, "Task done\n[openrouter:qwen2.5-72b]");
+  });
+
+  it("pub/sub handler includes cost badge", () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+
+    let messageHandler: ((channel: string, message: string) => void) | undefined;
+    mockOn.mockImplementation((event: string, handler: unknown) => {
+      if (event === "message") {
+        messageHandler = handler as (channel: string, message: string) => void;
+      }
+    });
+
+    startNotifier(bot as never, 42, "ns2", redis as never);
+    messageHandler!("cca:notify:ns2", JSON.stringify({ text: "✅ done", driver: "claude", model: "claude-sonnet-4-6", cost: 1.23 }));
+
+    expect(bot.sendMessage).toHaveBeenCalledWith(42, "✅ done\n[claude:sonnet-4-6] cost: $1.230");
   });
 });
 

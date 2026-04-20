@@ -1,42 +1,43 @@
-# Plan: Multi-Agent Driver Pass-Through + /drivers Command
+# Plan: /cost, driver+cost badges, /agents command
 
 ## Task restatement
-cc-agent is gaining a driver abstraction layer (supporting non-Claude LLMs like qwen, openai, etc.).
-cc-tg needs to:
-1. Read `CC_AGENT_DEFAULT_DRIVER` and `CC_AGENT_DEFAULT_MODEL` env vars
-2. Pass `agent_driver` / `agent_model` through to any `spawn_agent` / `spawn_from_profile` MCP calls
-3. Display a driver badge in job status notifications if driver is non-claude
-4. Add a `/drivers` Telegram command that calls the new `list_drivers` MCP tool
+1. `/cost` — reformat `formatAgentCostSummary` to cleaner "💰 Cost Summary" layout
+2. Job completion notifications — always show driver badge (including 'claude'), add cost if present
+3. `/drivers` — already implemented, no changes needed
+4. `/agents` — new command reading Redis `cca:meta-agent:status:*` keys
 
-## Approaches considered
+## Approaches
 
-### A. Env-var injection only
-Just set CC_AGENT_DEFAULT_DRIVER in the process environment and rely on cc-agent to read it.
-Pro: zero code changes. Con: cc-tg doesn't control what args Claude Code passes to spawn_agent.
+### Change 1: /cost format
+- Update `formatAgentCostSummary` in `bot.ts` to use new heading, aligned repo costs, "No cost data available yet." fallback
+- Keep existing session cost section (📊)
 
-### B. callCcAgentTool auto-injection (chosen for spawn calls)
-When cc-tg's own `callCcAgentTool` calls `spawn_agent` or `spawn_from_profile`, automatically
-merge `agent_driver` / `agent_model` into the args. ClaudeProcess already inherits all process.env
-so Claude Code (the coordinator) sees the env vars too — both paths covered.
+### Change 2: Notification badge + cost
+- `parseNotification` in `notifier.ts`: always show badge when `driver` field is present (remove claude exception)
+- Badge format: `[driver:shortmodel]` where shortmodel strips driver prefix or vendor/ prefix
+- Add `cost: $X.XXX` suffix if `cost` field present in JSON payload
+- Update separator from space to `\n` for multi-line friendliness
+- Update affected tests in `notifier.test.ts`
 
-### C. Intercept Claude tool events and rewrite args
-Hook into the `assistant` message stream and rewrite spawn_agent args before forwarding.
-Too invasive — Claude Code formats these calls internally.
+### Change 3: /drivers
+- Already implemented (verified: `handleDrivers` at bot.ts:1375, BOT_COMMANDS entry at line 38)
+- No changes needed
 
-## Chosen approach: B
-- `callCcAgentTool`: auto-merge driver/model args for spawn tools
-- ClaudeProcess env: already inherits `process.env` (including CC_AGENT_DEFAULT_DRIVER/MODEL)
-- Notification badge: parse JSON payload in notifier, append `[model]` badge if driver != 'claude'
-- `/drivers` command: call `list_drivers` via `callCcAgentTool` and format the text result
+### Change 4: /agents
+- Add `BOT_COMMANDS` entry
+- Add `/agents` case in `handleTelegram`
+- Implement `handleAgents`: SCAN `cca:meta-agent:status:*`, GET each, format namespace+status+turns+age
+- Handle missing Redis gracefully
+- Add tests in `bot.test.ts` with mocked Redis
 
 ## Files to touch
-- `src/bot.ts` — BOT_COMMANDS, callCcAgentTool driver injection, /drivers handler
-- `src/notifier.ts` — driver badge in notification text
-- `src/bot.test.ts` — /drivers command test
-- `src/notifier.test.ts` — badge parsing test
+- `src/bot.ts` — formatAgentCostSummary, BOT_COMMANDS, handleTelegram, handleAgents
+- `src/notifier.ts` — parseNotification (badge always shown, cost support, shortenModelName helper)
+- `src/bot.test.ts` — add /agents tests
+- `src/notifier.test.ts` — update badge tests for new behavior, add cost tests
 
 ## Risks / unknowns
-- `list_drivers` MCP tool may return raw text or JSON — handle both gracefully
-- Notification JSON format with `driver`/`model` fields is assumed (cc-agent side); badge only
-  shown if fields are present and driver != 'claude'
-- No existing spawn_agent calls in cc-tg code; callCcAgentTool injection is forward-looking
+- ioredis SCAN return type: `Promise<[string, string[]]>` in ioredis v5 — should be fine
+- Cost field format from cc-agent: assuming `cost?: number` in the JSON payload
+- Redis SCAN cursor: must drain until cursor === "0"
+- `parseNotification` badge change affects existing passing tests — must update them

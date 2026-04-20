@@ -1256,3 +1256,142 @@ describe('handleVoiceRetry', () => {
     expect(lastCall[1]).toContain('1 failed');
   });
 });
+
+describe('handleAgents', () => {
+  const mockScan = vi.fn();
+  const mockGet = vi.fn();
+
+  const mockRedis = {
+    scan: mockScan,
+    get: mockGet,
+    lpush: vi.fn().mockResolvedValue(1),
+    ltrim: vi.fn().mockResolvedValue('OK'),
+    publish: vi.fn().mockResolvedValue(1),
+  };
+
+  function makeBotWithRedis() {
+    return new CcTgBot({ telegramToken: 'test-token', redis: mockRedis as never });
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({});
+    mocks.tgSetMyCommands.mockResolvedValue({});
+    mocks.existsSyncMock.mockReturnValue(false);
+    // Default: empty scan result
+    mockScan.mockResolvedValue(['0', []]);
+    mockGet.mockResolvedValue(null);
+  });
+
+  it('replies with no-redis message when Redis not configured', async () => {
+    const bot = new CcTgBot({ telegramToken: 'test-token' });
+    await (bot as any).handleAgents(42);
+    bot.stop();
+
+    expect(mocks.tgSendMessage).toHaveBeenCalledWith(42, 'Redis not configured — agents status unavailable.');
+  });
+
+  it('replies with no-agents message when no keys found', async () => {
+    mockScan.mockResolvedValue(['0', []]);
+    const bot = makeBotWithRedis();
+    await (bot as any).handleAgents(42);
+    bot.stop();
+
+    expect(mocks.tgSendMessage).toHaveBeenCalledWith(42, 'No active meta-agents.');
+  });
+
+  it('shows running agent with typing status', async () => {
+    mockScan.mockResolvedValue(['0', ['cca:meta-agent:status:money-brain']]);
+    mockGet.mockResolvedValue(JSON.stringify({
+      status: 'running',
+      current_tool: 'Bash',
+      turn: 42,
+    }));
+
+    const bot = makeBotWithRedis();
+    await (bot as any).handleAgents(42);
+    bot.stop();
+
+    const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+    expect(msg).toContain('🤖 Active Agents');
+    expect(msg).toContain('money-brain');
+    expect(msg).toContain('typing...');
+    expect(msg).toContain('turn 42');
+  });
+
+  it('shows idle agent with turn count and age', async () => {
+    const lastActivity = new Date(Date.now() - 3 * 60 * 1000).toISOString(); // 3 minutes ago
+    mockScan.mockResolvedValue(['0', ['cca:meta-agent:status:simorgh']]);
+    mockGet.mockResolvedValue(JSON.stringify({
+      status: 'idle',
+      turn: 8,
+      last_activity: lastActivity,
+    }));
+
+    const bot = makeBotWithRedis();
+    await (bot as any).handleAgents(42);
+    bot.stop();
+
+    const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+    expect(msg).toContain('simorgh');
+    expect(msg).toContain('idle');
+    expect(msg).toContain('turn 8');
+    expect(msg).toContain('3m ago');
+  });
+
+  it('shows multiple agents', async () => {
+    mockScan.mockResolvedValue(['0', [
+      'cca:meta-agent:status:alpha',
+      'cca:meta-agent:status:beta',
+    ]]);
+    mockGet
+      .mockResolvedValueOnce(JSON.stringify({ status: 'running', turn: 5 }))
+      .mockResolvedValueOnce(JSON.stringify({ status: 'idle', turn: 1 }));
+
+    const bot = makeBotWithRedis();
+    await (bot as any).handleAgents(42);
+    bot.stop();
+
+    const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+    expect(msg).toContain('alpha');
+    expect(msg).toContain('beta');
+  });
+
+  it('handles malformed status JSON gracefully', async () => {
+    mockScan.mockResolvedValue(['0', ['cca:meta-agent:status:broken']]);
+    mockGet.mockResolvedValue('not-valid-json{{{');
+
+    const bot = makeBotWithRedis();
+    await (bot as any).handleAgents(42);
+    bot.stop();
+
+    const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+    expect(msg).toContain('broken');
+    expect(msg).toContain('status unknown');
+  });
+
+  it('handles redis scan error gracefully', async () => {
+    mockScan.mockRejectedValue(new Error('redis unavailable'));
+    const bot = makeBotWithRedis();
+    await (bot as any).handleAgents(42);
+    bot.stop();
+
+    const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+    expect(msg).toContain('Failed to get agents status');
+    expect(msg).toContain('redis unavailable');
+  });
+
+  it('/agents command dispatches to handleAgents', async () => {
+    mockScan.mockResolvedValue(['0', []]);
+    const bot = makeBotWithRedis();
+    await (bot as any).handleTelegram({
+      chat: { id: 42, type: 'private' },
+      from: { id: 100 },
+      text: '/agents',
+      message_id: 1,
+    });
+    bot.stop();
+
+    expect(mocks.tgSendMessage).toHaveBeenCalledWith(42, 'No active meta-agents.');
+  });
+});
