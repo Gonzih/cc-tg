@@ -4,6 +4,7 @@
  * Channels:
  *   cca:notify:{namespace}       — job completion notifications from cc-agent → forward to Telegram
  *   cca:chat:incoming:{namespace} — messages from the web UI → echo to Telegram + feed into Claude session
+ *   cca:chat:outgoing:*          — meta-agent stdout lines (source=claude) → buffer+debounce → Telegram
  *
  * All messages (Telegram incoming, Claude responses) are also written to:
  *   cca:chat:log:{namespace}     — LPUSH + LTRIM 0 499 (last 500 messages)
@@ -12,6 +13,7 @@
 
 import { Redis } from "ioredis";
 import TelegramBot from "node-telegram-bot-api";
+import { splitLongMessage } from "./formatter.js";
 
 export interface ChatMessage {
   id: string;
@@ -40,6 +42,12 @@ function shortenModelName(model: string, driver: string): string {
   const slashIdx = model.indexOf("/");
   if (slashIdx >= 0) return model.slice(slashIdx + 1);
   return model;
+}
+
+/** Strip ANSI escape sequences from a string before sending to Telegram. */
+function stripAnsi(text: string): string {
+  // eslint-disable-next-line no-control-regex
+  return text.replace(/\x1B\[[0-9;]*[mGKHF]/g, "");
 }
 
 /**
@@ -148,6 +156,68 @@ export function startNotifier(
     } else {
       log("info", `subscribed to cca:chat:incoming:${namespace}`);
     }
+  });
+
+  // cca:chat:outgoing:* — meta-agent stdout lines (source=claude) → buffer+debounce → Telegram
+  // Using psubscribe so we catch all namespaces (money-brain, isoc-nevada, etc.)
+  sub.psubscribe("cca:chat:outgoing:*", (err) => {
+    if (err) {
+      log("error", "psubscribe cca:chat:outgoing:* failed:", err.message);
+    } else {
+      log("info", "psubscribed to cca:chat:outgoing:*");
+    }
+  });
+
+  // Per-namespace debounce buffer: accumulate streaming lines, flush after 1.5s silence
+  const metaAgentBuffers = new Map<string, { text: string; timer: ReturnType<typeof setTimeout> | null }>();
+
+  function flushMetaAgentBuffer(ns: string, targetChatId: number): void {
+    const buf = metaAgentBuffers.get(ns);
+    if (!buf || !buf.text.trim()) return;
+    const text = stripAnsi(buf.text.trim());
+    buf.text = "";
+    buf.timer = null;
+    const chunks = splitLongMessage(text);
+    for (const chunk of chunks) {
+      bot.sendMessage(targetChatId, chunk).catch((err: Error) => {
+        log("warn", `meta-agent flush sendMessage failed (ns=${ns}):`, err.message);
+      });
+    }
+  }
+
+  sub.on("pmessage", (pattern: string, channel: string, message: string) => {
+    void pattern; // used only as a type guard
+    const ns = channel.replace("cca:chat:outgoing:", "");
+
+    let parsed: { source?: string; content?: string } | null = null;
+    try {
+      parsed = JSON.parse(message) as { source?: string; content?: string };
+    } catch {
+      return; // non-JSON line — skip
+    }
+
+    // Only forward messages from the meta-agent (source=claude).
+    // cc-tg itself publishes to this channel with source "cc-tg"/"telegram"/"ui" — skip those.
+    if (parsed.source !== "claude") return;
+
+    const content = parsed.content;
+    if (!content) return;
+
+    const targetChatId = chatId ?? getActiveChatId?.();
+    if (targetChatId == null) {
+      log("warn", `meta-agent output: no chatId for namespace=${ns}, dropping line`);
+      return;
+    }
+
+    // Accumulate into per-namespace buffer and (re-)arm debounce timer
+    let buf = metaAgentBuffers.get(ns);
+    if (!buf) {
+      buf = { text: "", timer: null };
+      metaAgentBuffers.set(ns, buf);
+    }
+    buf.text += (buf.text ? "\n" : "") + content;
+    if (buf.timer) clearTimeout(buf.timer);
+    buf.timer = setTimeout(() => flushMetaAgentBuffer(ns, targetChatId), 1500);
   });
 
   // Poll the cca:notify:{namespace} LIST every 5 seconds.

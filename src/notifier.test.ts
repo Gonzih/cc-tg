@@ -6,6 +6,10 @@ const mockSubscribe = vi.fn().mockImplementation((_channel: string, cb?: (err: E
   if (cb) cb(null);
   return Promise.resolve(1);
 });
+const mockPsubscribe = vi.fn().mockImplementation((_pattern: string, cb?: (err: Error | null) => void) => {
+  if (cb) cb(null);
+  return Promise.resolve(1);
+});
 const mockOn = vi.fn();
 const mockDuplicate = vi.fn();
 const mockLpush = vi.fn().mockResolvedValue(1);
@@ -18,6 +22,7 @@ const mockLlen = vi.fn().mockResolvedValue(0);
 vi.mock("ioredis", () => {
   function MockRedis(this: Record<string, unknown>) {
     this.subscribe = mockSubscribe;
+    this.psubscribe = mockPsubscribe;
     this.on = mockOn;
     this.duplicate = mockDuplicate;
     this.lpush = mockLpush;
@@ -38,6 +43,7 @@ function makeBot() {
 
 function makeRedis(): ReturnType<typeof makeBot> & {
   subscribe: typeof mockSubscribe;
+  psubscribe: typeof mockPsubscribe;
   on: typeof mockOn;
   duplicate: typeof mockDuplicate;
   lpush: typeof mockLpush;
@@ -49,6 +55,7 @@ function makeRedis(): ReturnType<typeof makeBot> & {
 } {
   const sub = {
     subscribe: mockSubscribe,
+    psubscribe: mockPsubscribe,
     on: mockOn,
     lpush: mockLpush,
     ltrim: mockLtrim,
@@ -59,6 +66,7 @@ function makeRedis(): ReturnType<typeof makeBot> & {
   return {
     sendMessage: vi.fn(),
     subscribe: mockSubscribe,
+    psubscribe: mockPsubscribe,
     on: mockOn,
     duplicate: mockDuplicate,
     lpush: mockLpush,
@@ -78,6 +86,7 @@ describe("startNotifier", () => {
     mockLlen.mockResolvedValue(0);
     const sub = {
       subscribe: mockSubscribe,
+      psubscribe: mockPsubscribe,
       on: mockOn,
       lpush: mockLpush,
       ltrim: mockLtrim,
@@ -87,7 +96,7 @@ describe("startNotifier", () => {
     mockDuplicate.mockReturnValue(sub);
   });
 
-  it("subscribes to cca:notify and cca:chat:incoming channels", () => {
+  it("subscribes to cca:notify and cca:chat:incoming channels, psubscribes to cca:chat:outgoing:*", () => {
     const bot = makeBot();
     const redis = makeRedis();
     startNotifier(bot as never, 123, "default", redis as never);
@@ -95,6 +104,7 @@ describe("startNotifier", () => {
     expect(mockDuplicate).toHaveBeenCalled();
     expect(mockSubscribe).toHaveBeenCalledWith("cca:notify:default", expect.any(Function));
     expect(mockSubscribe).toHaveBeenCalledWith("cca:chat:incoming:default", expect.any(Function));
+    expect(mockPsubscribe).toHaveBeenCalledWith("cca:chat:outgoing:*", expect.any(Function));
   });
 
   it("forwards notify channel messages to Telegram", () => {
@@ -169,6 +179,7 @@ describe("startNotifier", () => {
       capturedOpts = opts as typeof capturedOpts;
       return {
         subscribe: mockSubscribe,
+        psubscribe: mockPsubscribe,
         on: mockOn,
         lpush: mockLpush,
         ltrim: mockLtrim,
@@ -363,6 +374,203 @@ describe("startNotifier", () => {
   });
 });
 
+describe("meta-agent outgoing (pmessage)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    mockGet.mockResolvedValue(null);
+    mockRpop.mockResolvedValue(null);
+    mockLlen.mockResolvedValue(0);
+    const sub = {
+      subscribe: mockSubscribe,
+      psubscribe: mockPsubscribe,
+      on: mockOn,
+      lpush: mockLpush,
+      ltrim: mockLtrim,
+      publish: mockPublish,
+      get: mockGet,
+    };
+    mockDuplicate.mockReturnValue(sub);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function capturePmessageHandler(): (pattern: string, channel: string, message: string) => void {
+    let handler: ((pattern: string, channel: string, message: string) => void) | undefined;
+    mockOn.mockImplementation((event: string, h: unknown) => {
+      if (event === "pmessage") handler = h as typeof handler;
+    });
+    return (...args) => {
+      if (!handler) throw new Error("pmessage handler not registered");
+      handler(...args);
+    };
+  }
+
+  it("buffers source=claude lines and flushes after 1.5s debounce", async () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+    const pmessage = capturePmessageHandler();
+
+    startNotifier(bot as never, 42, "ns", redis as never);
+
+    const line1 = JSON.stringify({ source: "claude", content: "Hello", role: "assistant" });
+    const line2 = JSON.stringify({ source: "claude", content: "World", role: "assistant" });
+    pmessage("cca:chat:outgoing:*", "cca:chat:outgoing:ns", line1);
+    pmessage("cca:chat:outgoing:*", "cca:chat:outgoing:ns", line2);
+
+    // Before debounce fires — no message yet
+    expect(bot.sendMessage).not.toHaveBeenCalled();
+
+    // Advance past debounce
+    await vi.advanceTimersByTimeAsync(1500);
+
+    expect(bot.sendMessage).toHaveBeenCalledTimes(1);
+    expect(bot.sendMessage).toHaveBeenCalledWith(42, "Hello\nWorld");
+  });
+
+  it("filters out non-claude sources (echo guard)", async () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+    const pmessage = capturePmessageHandler();
+
+    startNotifier(bot as never, 42, "ns", redis as never);
+
+    // These should all be ignored
+    pmessage("cca:chat:outgoing:*", "cca:chat:outgoing:ns",
+      JSON.stringify({ source: "cc-tg", content: "loop!" }));
+    pmessage("cca:chat:outgoing:*", "cca:chat:outgoing:ns",
+      JSON.stringify({ source: "telegram", content: "echo" }));
+    pmessage("cca:chat:outgoing:*", "cca:chat:outgoing:ns",
+      JSON.stringify({ source: "ui", content: "from ui" }));
+
+    await vi.advanceTimersByTimeAsync(1500);
+
+    expect(bot.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("ignores non-JSON lines silently", async () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+    const pmessage = capturePmessageHandler();
+
+    startNotifier(bot as never, 42, "ns", redis as never);
+
+    pmessage("cca:chat:outgoing:*", "cca:chat:outgoing:ns", "not json at all");
+
+    await vi.advanceTimersByTimeAsync(1500);
+
+    expect(bot.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("extracts namespace from channel name (multi-namespace)", async () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+    const pmessage = capturePmessageHandler();
+
+    startNotifier(bot as never, 99, "money-brain", redis as never);
+
+    // Message from a different namespace — isoc-nevada
+    pmessage("cca:chat:outgoing:*", "cca:chat:outgoing:isoc-nevada",
+      JSON.stringify({ source: "claude", content: "isoc response" }));
+
+    await vi.advanceTimersByTimeAsync(1500);
+
+    expect(bot.sendMessage).toHaveBeenCalledWith(99, "isoc response");
+  });
+
+  it("resets debounce timer when new line arrives within 1.5s", async () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+    const pmessage = capturePmessageHandler();
+
+    startNotifier(bot as never, 42, "ns", redis as never);
+
+    pmessage("cca:chat:outgoing:*", "cca:chat:outgoing:ns",
+      JSON.stringify({ source: "claude", content: "line 1" }));
+
+    // Advance 1000ms (within debounce window) — no flush yet
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(bot.sendMessage).not.toHaveBeenCalled();
+
+    // New line resets timer
+    pmessage("cca:chat:outgoing:*", "cca:chat:outgoing:ns",
+      JSON.stringify({ source: "claude", content: "line 2" }));
+
+    // Advance another 1000ms — still within new 1.5s window
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(bot.sendMessage).not.toHaveBeenCalled();
+
+    // Advance remaining 500ms to complete the 1.5s debounce
+    await vi.advanceTimersByTimeAsync(500);
+    expect(bot.sendMessage).toHaveBeenCalledTimes(1);
+    expect(bot.sendMessage).toHaveBeenCalledWith(42, "line 1\nline 2");
+  });
+
+  it("uses getActiveChatId when chatId is null", async () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+    const getActiveChatId = vi.fn().mockReturnValue(77);
+    const pmessage = capturePmessageHandler();
+
+    startNotifier(bot as never, null, "ns", redis as never, undefined, getActiveChatId);
+
+    pmessage("cca:chat:outgoing:*", "cca:chat:outgoing:ns",
+      JSON.stringify({ source: "claude", content: "dynamic chat" }));
+
+    await vi.advanceTimersByTimeAsync(1500);
+
+    expect(bot.sendMessage).toHaveBeenCalledWith(77, "dynamic chat");
+  });
+
+  it("drops message when no chatId is available", async () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+    const getActiveChatId = vi.fn().mockReturnValue(undefined);
+    const pmessage = capturePmessageHandler();
+
+    startNotifier(bot as never, null, "ns", redis as never, undefined, getActiveChatId);
+
+    pmessage("cca:chat:outgoing:*", "cca:chat:outgoing:ns",
+      JSON.stringify({ source: "claude", content: "orphaned" }));
+
+    await vi.advanceTimersByTimeAsync(1500);
+
+    expect(bot.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("strips ANSI escape codes before sending", async () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+    const pmessage = capturePmessageHandler();
+
+    startNotifier(bot as never, 42, "ns", redis as never);
+
+    pmessage("cca:chat:outgoing:*", "cca:chat:outgoing:ns",
+      JSON.stringify({ source: "claude", content: "\x1B[32mgreen text\x1B[0m" }));
+
+    await vi.advanceTimersByTimeAsync(1500);
+
+    expect(bot.sendMessage).toHaveBeenCalledWith(42, "green text");
+  });
+
+  it("skips lines with empty content", async () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+    const pmessage = capturePmessageHandler();
+
+    startNotifier(bot as never, 42, "ns", redis as never);
+
+    pmessage("cca:chat:outgoing:*", "cca:chat:outgoing:ns",
+      JSON.stringify({ source: "claude", content: "" }));
+
+    await vi.advanceTimersByTimeAsync(1500);
+
+    expect(bot.sendMessage).not.toHaveBeenCalled();
+  });
+});
+
 describe("notify list poller", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -372,6 +580,7 @@ describe("notify list poller", () => {
     mockLlen.mockResolvedValue(0);
     const sub = {
       subscribe: mockSubscribe,
+      psubscribe: mockPsubscribe,
       on: mockOn,
       lpush: mockLpush,
       ltrim: mockLtrim,
