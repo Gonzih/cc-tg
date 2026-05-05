@@ -1,43 +1,25 @@
-# Plan: /cost, driver+cost badges, /agents command
+# Plan: Relay meta-agent responses from cca:chat:outgoing to Telegram
 
-## Task restatement
-1. `/cost` — reformat `formatAgentCostSummary` to cleaner "💰 Cost Summary" layout
-2. Job completion notifications — always show driver badge (including 'claude'), add cost if present
-3. `/drivers` — already implemented, no changes needed
-4. `/agents` — new command reading Redis `cca:meta-agent:status:*` keys
+## Task restated
+Meta-agent stdout lines are published per-line to `cca:chat:outgoing:{ns}` with `source: "claude"`.
+cc-tg currently never subscribes to this channel. Result: the meta-agent response is silently dropped —
+Telegram gets nothing after the coordinator returns `{ok: true}`.
 
-## Approaches
+## Approach
+Use `psubscribe("cca:chat:outgoing:*")` + `pmessage` handler in `startNotifier`:
+- Pattern subscription covers all namespaces (isoc-nevada, money-brain, etc.)
+- Filter `source === "claude"` to avoid echo loop (cc-tg also publishes to same channel with source "cc-tg"/"telegram"/"ui")
+- Per-namespace buffer + 1.5s debounce → entire streaming response arrives as one Telegram message
+- Use `splitLongMessage` from formatter.ts for >4096 char responses
+- Strip ANSI escape codes before sending
 
-### Change 1: /cost format
-- Update `formatAgentCostSummary` in `bot.ts` to use new heading, aligned repo costs, "No cost data available yet." fallback
-- Keep existing session cost section (📊)
-
-### Change 2: Notification badge + cost
-- `parseNotification` in `notifier.ts`: always show badge when `driver` field is present (remove claude exception)
-- Badge format: `[driver:shortmodel]` where shortmodel strips driver prefix or vendor/ prefix
-- Add `cost: $X.XXX` suffix if `cost` field present in JSON payload
-- Update separator from space to `\n` for multi-line friendliness
-- Update affected tests in `notifier.test.ts`
-
-### Change 3: /drivers
-- Already implemented (verified: `handleDrivers` at bot.ts:1375, BOT_COMMANDS entry at line 38)
-- No changes needed
-
-### Change 4: /agents
-- Add `BOT_COMMANDS` entry
-- Add `/agents` case in `handleTelegram`
-- Implement `handleAgents`: SCAN `cca:meta-agent:status:*`, GET each, format namespace+status+turns+age
-- Handle missing Redis gracefully
-- Add tests in `bot.test.ts` with mocked Redis
+Keep existing `subscribe` + `message` handler intact for notify/incoming channels.
 
 ## Files to touch
-- `src/bot.ts` — formatAgentCostSummary, BOT_COMMANDS, handleTelegram, handleAgents
-- `src/notifier.ts` — parseNotification (badge always shown, cost support, shortenModelName helper)
-- `src/bot.test.ts` — add /agents tests
-- `src/notifier.test.ts` — update badge tests for new behavior, add cost tests
+- `src/notifier.ts` — add psubscribe, pmessage handler, buffer logic, ANSI strip, splitLongMessage import
+- `src/notifier.test.ts` — add mockPsubscribe to mock, tests for pmessage filtering/buffering/debounce
 
-## Risks / unknowns
-- ioredis SCAN return type: `Promise<[string, string[]]>` in ioredis v5 — should be fine
-- Cost field format from cc-agent: assuming `cost?: number` in the JSON payload
-- Redis SCAN cursor: must drain until cursor === "0"
-- `parseNotification` badge change affects existing passing tests — must update them
+## Risks
+- Timer-based debounce tests need `vi.useFakeTimers()` + `vi.advanceTimersByTimeAsync(1500)`
+- The `sub` mock must expose `psubscribe` or tests will throw
+- Must not break existing 411 tests
