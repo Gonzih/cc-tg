@@ -1248,14 +1248,8 @@ export class CcTgBot {
   }
 
   private async handleRestart(chatId: number, threadId?: number): Promise<void> {
-    await this.replyToChat(chatId, "Clearing cache and restarting... brb.", threadId);
+    await this.replyToChat(chatId, "Restarting... brb.", threadId);
     await new Promise(resolve => setTimeout(resolve, 300));
-
-    // Clear npm caches before restart so launchd brings up fresh version
-    const home = process.env.HOME ?? "/tmp";
-    for (const dir of [`${home}/.npm/_npx`, `${home}/.npm/cache`]) {
-      try { execSync(`rm -rf "${dir}"`, { shell: "/bin/sh" }); } catch {}
-    }
 
     // Kill all active Claude sessions cleanly
     for (const session of this.sessions.values()) {
