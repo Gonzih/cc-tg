@@ -1040,17 +1040,6 @@ export class CcTgBot {
     }
   }
 
-  private isSensitiveFile(filePath: string): boolean {
-    const name = basename(filePath).toLowerCase();
-    const sensitivePatterns = [
-      /credential/i, /secret/i, /password/i, /passwd/i, /\.env/i,
-      /api[_-]?key/i, /token/i, /private[_-]?key/i, /id_rsa/i,
-      /\.pem$/i, /\.key$/i, /\.pfx$/i, /\.p12$/i,
-      /gmail/i, /oauth/i, /\bauth\b/i,
-    ];
-    return sensitivePatterns.some((p) => p.test(name));
-  }
-
   private uploadMentionedFiles(chatId: number, resultText: string, session: Session): void {
     // Extract file path candidates from result text
     // Match: /absolute/path/file.ext or relative like ./foo/bar.csv or just foo.pdf
@@ -1103,13 +1092,8 @@ export class CcTgBot {
       }
     }
 
-    // Deduplicate and filter sensitive files
     const unique = [...new Set(toUpload)];
     for (const filePath of unique) {
-      if (this.isSensitiveFile(filePath)) {
-        console.log(`[claude:files] skipping sensitive file: ${filePath}`);
-        continue;
-      }
       let fileSize: number;
       try {
         fileSize = statSync(filePath).size;
@@ -1366,11 +1350,6 @@ export class CcTgBot {
 
     if (!statSync(filePath).isFile()) {
       await this.replyToChat(chatId, `Not a file: ${filePath}`, threadId);
-      return;
-    }
-
-    if (this.isSensitiveFile(filePath)) {
-      await this.replyToChat(chatId, "Access denied: sensitive file", threadId);
       return;
     }
 
