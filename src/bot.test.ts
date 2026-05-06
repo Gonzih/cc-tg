@@ -101,7 +101,7 @@ vi.mock('./notifier.js', () => ({
   writeChatLog: mocks.writeChatLog,
 }));
 
-import { CcTgBot, splitMessage, enrichPromptWithUrls, listSkills } from './bot.js';
+import { CcTgBot, splitMessage, enrichPromptWithUrls, listSkills, stampPrompt } from './bot.js';
 
 function makeMsg(overrides: Record<string, unknown> = {}) {
   return {
@@ -150,6 +150,30 @@ describe('splitMessage', () => {
   it('respects custom maxLen', () => {
     const chunks = splitMessage('hello world', 5);
     expect(chunks).toEqual(['hello', ' worl', 'd']);
+  });
+});
+
+describe('stampPrompt', () => {
+  it('prepends [MM-DD HH:mm] to the text', () => {
+    const now = new Date(2026, 4, 6, 7, 9); // May 6 2026 07:09
+    expect(stampPrompt('hello', now)).toBe('[05-06 07:09] hello');
+  });
+
+  it('zero-pads single-digit month and day', () => {
+    const now = new Date(2026, 0, 3, 8, 5); // Jan 3 2026 08:05
+    expect(stampPrompt('test', now)).toBe('[01-03 08:05] test');
+  });
+
+  it('uses current time when no date provided', () => {
+    const before = new Date();
+    const result = stampPrompt('msg');
+    const after = new Date();
+    // result must start with [MM-DD HH:mm] matching some moment in [before, after]
+    expect(result).toMatch(/^\[\d{2}-\d{2} \d{2}:\d{2}\] msg$/);
+    // The timestamp string can match any minute in [before, after]
+    const mm = String(before.getMonth() + 1).padStart(2, '0');
+    const dd = String(before.getDate()).padStart(2, '0');
+    expect(result).toContain(`[${mm}-${dd}`);
   });
 });
 
@@ -266,7 +290,7 @@ describe('CcTgBot', () => {
 
     it('sends text message to Claude', async () => {
       await sendCommand('Hello Claude');
-      expect(mocks.claudeSendPrompt).toHaveBeenCalledWith('Hello Claude');
+      expect(mocks.claudeSendPrompt).toHaveBeenCalledWith(expect.stringMatching(/^\[\d{2}-\d{2} \d{2}:\d{2}\] Hello Claude$/));
     });
 
     describe('/get_file', () => {
@@ -638,7 +662,7 @@ describe('CcTgBot', () => {
       // (replyToChat with threadId defined)
       // Verify sendMessage was called (session created → startTyping → no reply yet from Claude, but error path won't trigger)
       // At minimum, sendChatAction should have been called
-      expect(mocks.claudeSendPrompt).toHaveBeenCalledWith('Hello');
+      expect(mocks.claudeSendPrompt).toHaveBeenCalledWith(expect.stringMatching(/^\[\d{2}-\d{2} \d{2}:\d{2}\] Hello$/));
     });
 
     it('typing indicator is sent to the correct thread', async () => {
@@ -878,6 +902,38 @@ describe('CcTgBot chat bridge', () => {
       mockRedis,
       'test-ns',
       expect.objectContaining({ role: 'user', source: 'ui', content: 'UI message' })
+    );
+  });
+
+  it('stamps sendPrompt but not writeChatLog for Telegram messages', async () => {
+    const bot = makeBotWithRedis();
+    await (bot as any).handleTelegram(makeMsg({ text: 'stamp me' }));
+    bot.stop();
+
+    // sendPrompt receives the stamped version
+    const promptArg = mocks.claudeSendPrompt.mock.calls[0][0] as string;
+    expect(promptArg).toMatch(/^\[\d{2}-\d{2} \d{2}:\d{2}\] stamp me$/);
+
+    // writeChatLog receives the original text (no timestamp)
+    expect(mocks.writeChatLog).toHaveBeenCalledWith(
+      mockRedis,
+      'test-ns',
+      expect.objectContaining({ content: 'stamp me' })
+    );
+  });
+
+  it('stamps sendPrompt but not writeChatLog for UI messages', async () => {
+    const bot = makeBotWithRedis();
+    await bot.handleUserMessage(42, 'ui stamp me');
+    bot.stop();
+
+    const promptArg = mocks.claudeSendPrompt.mock.calls[0][0] as string;
+    expect(promptArg).toMatch(/^\[\d{2}-\d{2} \d{2}:\d{2}\] ui stamp me$/);
+
+    expect(mocks.writeChatLog).toHaveBeenCalledWith(
+      mockRedis,
+      'test-ns',
+      expect.objectContaining({ content: 'ui stamp me' })
     );
   });
 
@@ -1124,7 +1180,7 @@ describe('handleVoiceRetry', () => {
     bot.stop();
 
     expect(mocks.tgGetFileLink).toHaveBeenCalledWith('voice-abc');
-    expect(mocks.claudeSendPrompt).toHaveBeenCalledWith('retried transcript');
+    expect(mocks.claudeSendPrompt).toHaveBeenCalledWith(expect.stringMatching(/^\[\d{2}-\d{2} \d{2}:\d{2}\] retried transcript$/));
     expect(mockRedis.lrem).toHaveBeenCalledWith('voice:pending', 0, entry);
   });
 
