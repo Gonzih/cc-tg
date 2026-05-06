@@ -1,5 +1,7 @@
 # cc-tg
 
+<img src="assets/logo.png" alt="AMAI" width="120">
+
 [![npm version](https://img.shields.io/npm/v/@gonzih/cc-tg)](https://www.npmjs.com/package/@gonzih/cc-tg)
 
 Claude Code Telegram bot. Chat with Claude Code from Telegram — text, voice, images, files, scheduled prompts, and bot management commands.
