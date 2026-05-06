@@ -426,7 +426,7 @@ describe('CcTgBot integration — message pipeline', () => {
       await vi.advanceTimersByTimeAsync(65 * 60 * 1000);
 
       // A new Claude session should have been created for the retry
-      expect(mocks.claudeInstance!.sendPrompt).toHaveBeenCalledWith('will hit limit');
+      expect(mocks.claudeInstance!.sendPrompt).toHaveBeenCalledWith(expect.stringMatching(/^\[\d{2}-\d{2} \d{2}:\d{2}\] will hit limit$/));
     } finally {
       Object.assign(process.env, origEnv);
       tokensModule.loadTokens();
@@ -760,7 +760,7 @@ describe('CcTgBot integration — voice message handling', () => {
 
     expect(mocks.tgGetFileLink).toHaveBeenCalledWith('voice-123');
     expect(vi.mocked(transcribeVoice)).toHaveBeenCalledWith('https://example.com/voice.ogg');
-    expect(mocks.claudeInstance!.sendPrompt).toHaveBeenCalledWith('transcribed voice text');
+    expect(mocks.claudeInstance!.sendPrompt).toHaveBeenCalledWith(expect.stringMatching(/^\[\d{2}-\d{2} \d{2}:\d{2}\] transcribed voice text$/));
   });
 
   it('sends error message when transcription returns empty result', async () => {

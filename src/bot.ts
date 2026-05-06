@@ -100,6 +100,15 @@ function computeCostUsd(usage: UsageEvent): number {
   );
 }
 
+/** Prepend [MM-DD HH:mm] so Claude knows when the message was received. Not shown in Telegram. */
+export function stampPrompt(text: string, now = new Date()): string {
+  const mm = String(now.getMonth() + 1).padStart(2, "0");
+  const dd = String(now.getDate()).padStart(2, "0");
+  const hh = String(now.getHours()).padStart(2, "0");
+  const min = String(now.getMinutes()).padStart(2, "0");
+  return `[${mm}-${dd} ${hh}:${min}] ${text}`;
+}
+
 function formatTokens(n: number): string {
   if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
   return String(n);
@@ -498,7 +507,7 @@ export class CcTgBot {
       const enriched = await enrichPromptWithUrls(text);
       const prompt = buildPromptWithReplyContext(enriched, msg);
       session.currentPrompt = prompt;
-      session.claude.sendPrompt(prompt);
+      session.claude.sendPrompt(stampPrompt(prompt));
       this.startTyping(chatId, session);
       this.writeChatMessage("user", "telegram", text, chatId);
     } catch (err) {
@@ -516,7 +525,7 @@ export class CcTgBot {
     try {
       const enriched = await enrichPromptWithUrls(text);
       session.currentPrompt = enriched;
-      session.claude.sendPrompt(enriched);
+      session.claude.sendPrompt(stampPrompt(enriched));
       this.startTyping(chatId, session);
       this.writeChatMessage("user", "ui", text, chatId);
     } catch (err) {
@@ -568,7 +577,7 @@ export class CcTgBot {
         const prompt = buildPromptWithReplyContext(transcript, msg);
         this.writeChatMessage("user", "telegram", transcript, chatId);
         session.currentPrompt = prompt;
-        session.claude.sendPrompt(prompt);
+        session.claude.sendPrompt(stampPrompt(prompt));
         this.startTyping(chatId, session);
       } catch (err) {
         await this.replyToChat(chatId, `Error sending to Claude: ${(err as Error).message}`, threadId);
@@ -648,7 +657,7 @@ export class CcTgBot {
 
         if (transcript && transcript !== "[empty transcription]") {
           const session = this.getOrCreateSession(entry.chat_id, threadId, undefined);
-          session.claude.sendPrompt(transcript);
+          session.claude.sendPrompt(stampPrompt(transcript));
           this.writeChatMessage("user", "telegram", transcript, entry.chat_id);
 
           // Remove from both lists
@@ -706,7 +715,7 @@ export class CcTgBot {
       const imageData = await fetchAsBase64(fileLink);
       // Telegram photos are always JPEG
       const session = this.getOrCreateSession(chatId, threadId, threadName);
-      session.claude.sendImage(imageData, "image/jpeg", caption);
+      session.claude.sendImage(imageData, "image/jpeg", stampPrompt(caption ?? ""));
       this.startTyping(chatId, session);
     } catch (err) {
       console.error(`[photo:${chatId}] error:`, (err as Error).message);
@@ -737,7 +746,7 @@ export class CcTgBot {
         : `ATTACHMENTS: [${fileName}](${destPath})`;
 
       const session = this.getOrCreateSession(chatId, threadId, threadName);
-      session.claude.sendPrompt(prompt);
+      session.claude.sendPrompt(stampPrompt(prompt));
       this.startTyping(chatId, session);
     } catch (err) {
       console.error(`[doc:${chatId}] error:`, (err as Error).message);
@@ -875,7 +884,7 @@ export class CcTgBot {
           const retrySession = this.getOrCreateSession(chatId, threadId);
           retrySession.currentPrompt = lastPrompt;
           retrySession.isRetry = true;
-          retrySession.claude.sendPrompt(lastPrompt);
+          retrySession.claude.sendPrompt(stampPrompt(lastPrompt));
           this.startTyping(chatId, retrySession);
         } catch (err) {
           this.replyToChat(chatId, `❌ Failed to retry with rotated token: ${(err as Error).message}`, threadId).catch(() => {});
@@ -896,7 +905,7 @@ export class CcTgBot {
           const retrySession = this.getOrCreateSession(chatId, threadId);
           retrySession.currentPrompt = lastPrompt;
           retrySession.isRetry = true;
-          retrySession.claude.sendPrompt(lastPrompt);
+          retrySession.claude.sendPrompt(stampPrompt(lastPrompt));
           this.startTyping(chatId, retrySession);
         } catch (err) {
           this.replyToChat(chatId, `❌ Failed to retry: ${(err as Error).message}`, threadId).catch(() => {});
