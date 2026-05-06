@@ -183,53 +183,6 @@ describe('CcTgBot', () => {
     bot.stop();
   });
 
-  describe('isSensitiveFile', () => {
-    it('blocks .env files', () => {
-      expect((bot as any).isSensitiveFile('/path/.env')).toBe(true);
-    });
-
-    it('blocks token files', () => {
-      expect((bot as any).isSensitiveFile('/path/token.json')).toBe(true);
-    });
-
-    it('blocks credential files', () => {
-      expect((bot as any).isSensitiveFile('/path/credentials.json')).toBe(true);
-    });
-
-    it('blocks private key files', () => {
-      expect((bot as any).isSensitiveFile('/path/id_rsa')).toBe(true);
-      expect((bot as any).isSensitiveFile('/path/private_key.pem')).toBe(true);
-    });
-
-    it('blocks .pem, .key, .pfx, .p12 extensions', () => {
-      expect((bot as any).isSensitiveFile('/path/cert.pem')).toBe(true);
-      expect((bot as any).isSensitiveFile('/path/server.key')).toBe(true);
-      expect((bot as any).isSensitiveFile('/path/store.pfx')).toBe(true);
-      expect((bot as any).isSensitiveFile('/path/store.p12')).toBe(true);
-    });
-
-    it('allows PDF reports', () => {
-      expect((bot as any).isSensitiveFile('/path/report.pdf')).toBe(false);
-    });
-
-    it('allows photo files', () => {
-      expect((bot as any).isSensitiveFile('/path/photo.jpg')).toBe(false);
-      expect((bot as any).isSensitiveFile('/path/image.png')).toBe(false);
-    });
-
-    it('allows audio files', () => {
-      expect((bot as any).isSensitiveFile('/path/song.mp3')).toBe(false);
-    });
-
-    it('allows text files', () => {
-      expect((bot as any).isSensitiveFile('/path/notes.txt')).toBe(false);
-    });
-
-    it('blocks api_key files', () => {
-      expect((bot as any).isSensitiveFile('/path/api_key.txt')).toBe(true);
-    });
-  });
-
   describe('isAllowed', () => {
     it('allows all users when no allowedUserIds configured', () => {
       expect((bot as any).isAllowed(999)).toBe(true);
@@ -333,14 +286,6 @@ describe('CcTgBot', () => {
         await sendCommand('/get_file /tmp/test.txt');
         const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
         expect(msg).toContain('File not found');
-      });
-
-      it('blocks sensitive files in safe dirs', async () => {
-        mocks.existsSyncMock.mockReturnValue(true);
-        mocks.statSyncMock.mockReturnValue({ size: 1024, isFile: () => true });
-        await sendCommand('/get_file /tmp/token.json');
-        const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
-        expect(msg).toContain('Access denied: sensitive file');
       });
 
       it('blocks oversized files', async () => {

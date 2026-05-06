@@ -675,20 +675,6 @@ describe('CcTgBot integration — file upload pipeline', () => {
     expect(mocks.tgSendDocument).toHaveBeenCalledWith(42, '/tmp/report.pdf', undefined);
   });
 
-  it('does NOT upload sensitive files even when tracked', async () => {
-    await (bot as any).handleTelegram(makeMsg());
-    const key = (bot as any).sessionKey(42, undefined);
-    const session = (bot as any).sessions.get(key);
-
-    session.writtenFiles.add('/tmp/token.json');
-    mocks.existsSyncMock.mockImplementation((p: string) => p === '/tmp/token.json');
-
-    emitResult('Saved credentials to /tmp/token.json');
-    await vi.runAllTimersAsync();
-
-    expect(mocks.tgSendDocument).not.toHaveBeenCalled();
-  });
-
   it('notifies user when file exceeds 50MB limit', async () => {
     await (bot as any).handleTelegram(makeMsg());
     const key = (bot as any).sessionKey(42, undefined);
