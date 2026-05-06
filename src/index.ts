@@ -27,6 +27,7 @@ import { loadTokens, getTokenCount } from "./tokens.js";
 import { Registry, startControlServer } from "@gonzih/agent-ops";
 import { Redis } from "ioredis";
 import { startNotifier } from "./notifier.js";
+import { seedClaudeMd } from "./seed.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -126,6 +127,7 @@ const groupChatIds = process.env.GROUP_CHAT_IDS
   : [];
 
 const cwd = process.env.CWD ?? process.cwd();
+seedClaudeMd(cwd);
 
 // agent-ops / chat bridge — Redis is always initialized so the chat bridge works
 // regardless of whether CC_AGENT_OPS_PORT or CC_AGENT_NOTIFY_CHAT_ID are set.
