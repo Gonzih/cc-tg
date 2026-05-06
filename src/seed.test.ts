@@ -48,13 +48,13 @@ describe("seedClaudeMd", () => {
     expect(mockExistsSync).toHaveBeenCalledWith("/my/cwd/.claude/CLAUDE.md");
   });
 
-  it("written content includes EDGE BOY section", () => {
+  it("written content includes FERAL LIFE Protocol section", () => {
     mockExistsSync.mockReturnValue(false);
 
     seedClaudeMd("/some/project");
 
     const content = mockWriteFileSync.mock.calls[0][1] as string;
-    expect(content).toContain("EDGE BOY");
+    expect(content).toContain("FERAL LIFE Protocol");
     expect(content).toContain("AXIOM");
     expect(content).toContain("Void Operator");
   });
