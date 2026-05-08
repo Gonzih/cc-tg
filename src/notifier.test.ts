@@ -708,6 +708,42 @@ describe("notify list poller", () => {
     expect(bot.sendMessage).toHaveBeenCalledWith(42, "dynamic notify");
   });
 
+  it("calls handleUserMessage for each polled notify item", async () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+    const handleUserMessage = vi.fn();
+
+    mockRpop
+      .mockResolvedValueOnce(JSON.stringify({ text: "Task complete" }))
+      .mockResolvedValueOnce(JSON.stringify({ text: "Another job done" }))
+      .mockResolvedValue(null);
+
+    startNotifier(bot as never, 555, "ns-hum", redis as never, handleUserMessage);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(bot.sendMessage).toHaveBeenCalledWith(555, "Task complete");
+    expect(bot.sendMessage).toHaveBeenCalledWith(555, "Another job done");
+    expect(handleUserMessage).toHaveBeenCalledWith(555, "Task complete");
+    expect(handleUserMessage).toHaveBeenCalledWith(555, "Another job done");
+    expect(handleUserMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not call handleUserMessage when it is undefined (poll path)", async () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+
+    mockRpop
+      .mockResolvedValueOnce(JSON.stringify({ text: "Silent notify" }))
+      .mockResolvedValue(null);
+
+    // No handleUserMessage — should not throw
+    startNotifier(bot as never, 555, "ns-nohum", redis as never);
+
+    await expect(vi.advanceTimersByTimeAsync(5_000)).resolves.not.toThrow();
+    expect(bot.sendMessage).toHaveBeenCalledWith(555, "Silent notify");
+  });
+
   it("continues gracefully when rpop throws", async () => {
     const bot = makeBot();
     const redis = makeRedis();
@@ -790,6 +826,43 @@ describe("parseNotification", () => {
 
   it("returns raw string when JSON has no text field", () => {
     expect(parseNotification(JSON.stringify({ foo: "bar" }))).toBe(JSON.stringify({ foo: "bar" }));
+  });
+
+  it("pub/sub handler calls handleUserMessage with same text sent to Telegram", () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+    const handleUserMessage = vi.fn();
+
+    let messageHandler: ((channel: string, message: string) => void) | undefined;
+    mockOn.mockImplementation((event: string, handler: unknown) => {
+      if (event === "message") {
+        messageHandler = handler as (channel: string, message: string) => void;
+      }
+    });
+
+    startNotifier(bot as never, 456, "myns", redis as never, handleUserMessage);
+
+    messageHandler!("cca:notify:myns", "Job done: my-task");
+    expect(bot.sendMessage).toHaveBeenCalledWith(456, "Job done: my-task");
+    expect(handleUserMessage).toHaveBeenCalledWith(456, "Job done: my-task");
+  });
+
+  it("pub/sub handler does not call handleUserMessage when it is undefined", () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+
+    let messageHandler: ((channel: string, message: string) => void) | undefined;
+    mockOn.mockImplementation((event: string, handler: unknown) => {
+      if (event === "message") {
+        messageHandler = handler as (channel: string, message: string) => void;
+      }
+    });
+
+    // No handleUserMessage passed — should not throw
+    startNotifier(bot as never, 456, "myns", redis as never);
+
+    expect(() => messageHandler!("cca:notify:myns", "Job done")).not.toThrow();
+    expect(bot.sendMessage).toHaveBeenCalledWith(456, "Job done");
   });
 
   it("pub/sub handler uses parseNotification — JSON badge appears in sent message", () => {
