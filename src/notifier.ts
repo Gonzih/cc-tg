@@ -257,6 +257,9 @@ export function startNotifier(
       bot.sendMessage(targetId, text).catch((err: Error) => {
         log("warn", "notify list sendMessage failed:", err.message);
       });
+      if (handleUserMessage) {
+        handleUserMessage(targetId, text);
+      }
     }
 
     if (remaining > 0) {
@@ -281,6 +284,9 @@ export function startNotifier(
         bot.sendMessage(targetId, text).catch((err: Error) => {
           log("warn", "sendMessage failed:", err.message);
         });
+        if (handleUserMessage) {
+          handleUserMessage(targetId, text);
+        }
       } else {
         log("warn", "notify: no chatId available, dropping notification");
       }
