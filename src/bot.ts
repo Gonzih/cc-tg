@@ -18,6 +18,7 @@ import { detectUsageLimit } from "./usage-limit.js";
 import { getCurrentToken, rotateToken, getTokenIndex, getTokenCount } from "./tokens.js";
 import { writeChatLog, type ChatMessage } from "./notifier.js";
 import { CronManager } from "./cron.js";
+import { parseRoutingTag, ensureMetaAgent, routeToMetaAgent } from "./router.js";
 
 const BOT_COMMANDS: Array<{ command: string; description: string }> = [
   { command: "start", description: "Reset session and start fresh" },
@@ -501,6 +502,32 @@ export class CcTgBot {
     if (text === "/agents") {
       await this.handleAgents(chatId, threadId);
       return;
+    }
+
+    // #tag / #org/repo routing — delegate to meta-agent instead of local Claude session
+    if (this.redis) {
+      const routing = parseRoutingTag(text);
+      if (routing) {
+        // Acknowledge routing immediately so user knows the message was delegated
+        await this.replyToChat(chatId, `→ #${routing.namespace}`, threadId);
+        this.writeChatMessage("user", "telegram", text, chatId);
+        try {
+          await ensureMetaAgent(
+            routing.namespace,
+            routing.repoUrl,
+            (toolName, args) => this.callCcAgentTool(toolName, args ?? {}),
+            this.redis
+          );
+          await routeToMetaAgent(routing.namespace, routing.strippedMessage, this.redis);
+        } catch (err) {
+          await this.replyToChat(
+            chatId,
+            `Failed to route to #${routing.namespace}: ${(err as Error).message}`,
+            threadId
+          );
+        }
+        return;
+      }
     }
 
     const session = this.getOrCreateSession(chatId, threadId, threadName);

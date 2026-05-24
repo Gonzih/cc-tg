@@ -1,35 +1,51 @@
-# Protocol Compliance Audit — Plan
+# Plan: Hashtag Meta-Agent Routing
 
-## Task Summary
-Audit cc-tg source against the cc-suite Redis communication protocol and fix every deviation.
-Protocol doc URL returned 404 so working from task spec directly.
+## Task restatement
 
-## Deviations Found
+When a Telegram user sends a message containing `#tag` or `#org/repo`, route it to the
+corresponding cc-agent meta-agent instead of the local Claude session. Auto-create the
+GitHub repo and start the meta-agent if not already running. Reply immediately with
+`→ #namespace` so the user knows the message was delegated.
 
-| # | File | Location | Issue | Fix |
-|---|------|----------|-------|-----|
-| 1 | bot.ts | :273 | `id` uses timestamp+random, not UUID | `crypto.randomUUID()` |
-| 2 | notifier.ts | :318 | `id` uses timestamp+random, not UUID | `crypto.randomUUID()` |
-| 3 | notifier.ts | :98 | LPUSH has no ordering comment | Add "LIFO — newest first" comment |
-| 4 | notifier.ts | :341 | `lpush` to meta-agent input (should be `rpush`) + no timing comment | `rpush` + add latency comment |
-| 5 | bot.ts | :74 | `FLUSH_DELAY_MS` has no descriptive comment | Add behavior comment |
-| 6 | notifier.ts | :220 | 1500ms debounce is a magic number | Extract to `META_AGENT_FLUSH_DELAY_MS` constant + add comment |
-| 7 | tokens.ts | — | No comment about independent rotation from cc-agent pool | Add comment |
-| 8 | docs/ | — | Protocol markdown missing | Create docs/redis-protocol.md |
+## Approach options
 
-## No Deviations (already correct)
-- `writeChatLog()` does dual-write (LPUSH + PUBLISH) ✓
-- `parseNotification()` handles both JSON and plain-string fallback ✓
-- `source` values match spec: 'telegram' | 'ui' | 'claude' | 'cc-tg' ✓
-- `role` values match spec: 'user' | 'assistant' | 'tool' ✓
-- ChatMessage shape has id, source, role, content, timestamp, chatId ✓
+### A. Redis-only approach
+Skip MCP tools entirely. Check `cca:meta-agent:status:{namespace}` directly, use `spawn_agent`
+MCP tool to start, RPUSH to `cca:meta:{namespace}:input` to send.
+- Pro: Known working tools, consistent with notifier.ts patterns
+- Con: `spawn_agent` requires a `task` string — unclear what task makes a "meta-agent"
 
-## Approach
-Direct edits to the 3 source files + new docs/redis-protocol.md.
-No architectural changes needed.
+### B. MCP tool approach (spec-faithful)
+Call `start_meta_agent` and `message_meta_agent` via `callCcAgentTool`, check status via Redis.
+- Pro: Follows task spec, clean separation of concerns
+- Con: These tools may not exist in current cc-agent, returns null on failure
 
-## Files to Touch
-- src/bot.ts
-- src/notifier.ts
-- src/tokens.ts
-- docs/redis-protocol.md (new)
+### C. Hybrid (chosen)
+- Check Redis for `cca:meta-agent:status:{namespace}` directly (known-working pattern from notifier.ts)
+- Call `callCcAgentTool("start_meta_agent", {namespace, repo_url})` to start — throw on null
+- Route messages via Redis RPUSH to `cca:meta:{namespace}:input` (known-working pattern)
+- Use `execSync` for `gh` repo verification/creation (same pattern as bot.ts)
+
+**Why this:** Stays consistent with existing code patterns, is spec-faithful for the start mechanism,
+and uses the reliable Redis RPUSH that notifier.ts already does for routing.
+
+## Files to touch
+
+- `src/router.ts` — new: parseRoutingTag, ensureMetaAgent, routeToMetaAgent
+- `src/router.test.ts` — new: unit tests
+- `src/bot.ts` — add routing check in handleTelegram() before getOrCreateSession()
+
+## Risks
+
+- `start_meta_agent` MCP tool may not exist → error surfaced to user with clear message
+- `gh` CLI may not be installed in the runtime environment → execSync throws, caught and re-thrown
+- strippedMessage may be empty if user sends only `#tag` → routeToMetaAgent is skipped, ensureMetaAgent still runs
+- Regex `#org/repo` might greedily match inside URLs → acceptable; Telegram plain text rarely embeds bare URLs with hash routing syntax
+
+## Key decisions
+
+- Tag parsed anywhere in message (not just start), first match wins
+- Strip tag + normalize whitespace before forwarding
+- If Redis not configured, skip routing entirely (fall through to local Claude)
+- Route BEFORE getOrCreateSession (skips local Claude session entirely)
+- Log the user message to chat log as "user"/"telegram" before routing
