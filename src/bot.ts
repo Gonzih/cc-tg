@@ -48,6 +48,9 @@ export interface BotOptions {
   groupChatIds?: number[];
   redis?: Redis;
   namespace?: string;
+  /** Called when a message is routed to a non-default namespace so the notifier
+   *  can forward the response back to the originating Telegram chat. */
+  registerRoutedChatId?: (namespace: string, chatId: number) => void;
 }
 
 interface Session {
@@ -547,6 +550,8 @@ export class CcTgBot {
         // Acknowledge routing immediately so user knows the message was delegated
         await this.replyToChat(chatId, `→ #${routing.namespace}`, threadId);
         this.writeChatMessage("user", "telegram", text, chatId);
+        // Register the originating chatId so responses come back to this chat
+        this.opts.registerRoutedChatId?.(routing.namespace, chatId);
         try {
           await ensureMetaAgent(
             routing.namespace,
@@ -581,6 +586,8 @@ export class CcTgBot {
           const repoUrl = `https://github.com/${defaultOrg}/${namespace}`;
           await this.replyToChat(chatId, `→ #${namespace} (meta-agent)`, threadId);
           this.writeChatMessage("user", "telegram", text, chatId);
+          // Register the originating chatId so responses come back to this chat
+          this.opts.registerRoutedChatId?.(namespace, chatId);
           try {
             await ensureMetaAgent(
               namespace,

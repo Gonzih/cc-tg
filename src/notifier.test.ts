@@ -575,6 +575,98 @@ describe("meta-agent outgoing (pmessage)", () => {
 
     expect(bot.sendMessage).not.toHaveBeenCalled();
   });
+
+  describe("registerRoutedChatId", () => {
+    it("routes response to registered chatId instead of fixed chatId", async () => {
+      const bot = makeBot();
+      const redis = makeRedis();
+      const pmessage = capturePmessageHandler();
+
+      // Fixed chatId=99 (e.g., money-brain), but we route from chatId=777
+      const notifier = startNotifier(bot as never, 99, "money-brain", redis as never);
+      notifier.registerRoutedChatId("of-stack", 777);
+
+      pmessage("cca:chat:outgoing:*", "cca:chat:outgoing:of-stack",
+        JSON.stringify({ source: "claude", content: "done routing" }));
+
+      await vi.advanceTimersByTimeAsync(1500);
+
+      // Must go to 777 (originating chat), not 99 (fixed chat)
+      expect(bot.sendMessage).toHaveBeenCalledWith(777, "done routing");
+      expect(bot.sendMessage).not.toHaveBeenCalledWith(99, "done routing");
+    });
+
+    it("falls back to fixed chatId when no routing registered for namespace", async () => {
+      const bot = makeBot();
+      const redis = makeRedis();
+      const pmessage = capturePmessageHandler();
+
+      const notifier = startNotifier(bot as never, 99, "money-brain", redis as never);
+      // Register for a different namespace — should not affect of-stack
+      notifier.registerRoutedChatId("other-ns", 888);
+
+      pmessage("cca:chat:outgoing:*", "cca:chat:outgoing:of-stack",
+        JSON.stringify({ source: "claude", content: "unregistered namespace" }));
+
+      await vi.advanceTimersByTimeAsync(1500);
+
+      // Falls back to fixed chatId=99
+      expect(bot.sendMessage).toHaveBeenCalledWith(99, "unregistered namespace");
+    });
+
+    it("last registerRoutedChatId call wins for same namespace", async () => {
+      const bot = makeBot();
+      const redis = makeRedis();
+      const pmessage = capturePmessageHandler();
+
+      const notifier = startNotifier(bot as never, 99, "money-brain", redis as never);
+      notifier.registerRoutedChatId("of-stack", 111);
+      notifier.registerRoutedChatId("of-stack", 222); // overwrites
+
+      pmessage("cca:chat:outgoing:*", "cca:chat:outgoing:of-stack",
+        JSON.stringify({ source: "claude", content: "overwritten" }));
+
+      await vi.advanceTimersByTimeAsync(1500);
+
+      expect(bot.sendMessage).toHaveBeenCalledWith(222, "overwritten");
+    });
+
+    it("falls back to getActiveChatId when no fixed chatId and no routing for namespace", async () => {
+      const bot = makeBot();
+      const redis = makeRedis();
+      const getActiveChatId = vi.fn().mockReturnValue(555);
+      const pmessage = capturePmessageHandler();
+
+      const notifier = startNotifier(bot as never, null, "money-brain", redis as never, undefined, getActiveChatId);
+      // Register for a different namespace — of-stack not registered
+      notifier.registerRoutedChatId("other-ns", 999);
+
+      pmessage("cca:chat:outgoing:*", "cca:chat:outgoing:of-stack",
+        JSON.stringify({ source: "claude", content: "dynamic fallback" }));
+
+      await vi.advanceTimersByTimeAsync(1500);
+
+      // Falls back to getActiveChatId()
+      expect(bot.sendMessage).toHaveBeenCalledWith(555, "dynamic fallback");
+    });
+
+    it("per-namespace registry does not interfere with primary namespace routing", async () => {
+      const bot = makeBot();
+      const redis = makeRedis();
+      const pmessage = capturePmessageHandler();
+
+      const notifier = startNotifier(bot as never, 99, "money-brain", redis as never);
+      notifier.registerRoutedChatId("of-stack", 777);
+
+      // Primary namespace response — should still go to fixed chatId=99
+      pmessage("cca:chat:outgoing:*", "cca:chat:outgoing:money-brain",
+        JSON.stringify({ source: "claude", content: "primary response" }));
+
+      await vi.advanceTimersByTimeAsync(1500);
+
+      expect(bot.sendMessage).toHaveBeenCalledWith(99, "primary response");
+    });
+  });
 });
 
 describe("notify list poller", () => {

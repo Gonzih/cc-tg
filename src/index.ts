@@ -145,6 +145,30 @@ sharedRedis.once("ready", () => {
   console.log(`[cc-tg] version:reported ${pkg.version}`);
 });
 
+// Notifier — always subscribe to cca:notify and cca:chat:incoming channels.
+// CC_AGENT_NOTIFY_CHAT_ID pins a fixed Telegram chatId; without it the last
+// active chatId is used dynamically for the chat bridge.
+// Created before the bot so we can pass registerRoutedChatId into BotOptions.
+// Callbacks are wired via closures that delegate to the bot after it is created.
+const notifyChatId = process.env.CC_AGENT_NOTIFY_CHAT_ID
+  ? Number(process.env.CC_AGENT_NOTIFY_CHAT_ID)
+  : null;
+
+// Mutable placeholder closures — filled in once `bot` is created below.
+let getLastActiveChatIdFn: () => number | undefined = () => undefined;
+let handleUserMessageFn: ((chatId: number, text: string) => void) | undefined;
+
+const notifierBot = new TelegramBot(telegramToken, { polling: false });
+const notifier = startNotifier(
+  notifierBot,
+  notifyChatId,
+  namespace,
+  sharedRedis,
+  (cid, text) => handleUserMessageFn?.(cid, text),
+  () => getLastActiveChatIdFn(),
+);
+console.log(`[notifier] started for namespace=${namespace} chatId=${notifyChatId ?? "dynamic"}`);
+
 const bot = new CcTgBot({
   telegramToken,
   claudeToken,
@@ -153,7 +177,12 @@ const bot = new CcTgBot({
   groupChatIds,
   redis: sharedRedis,
   namespace,
+  registerRoutedChatId: (ns, chatId) => notifier.registerRoutedChatId(ns, chatId),
 });
+
+// Wire closures now that bot is constructed
+getLastActiveChatIdFn = () => bot.getLastActiveChatId();
+handleUserMessageFn = (cid, text) => { void bot.handleUserMessage(cid, text); };
 
 if (process.env.CC_AGENT_OPS_PORT) {
   const botInfo = await bot.getMe();
@@ -177,24 +206,6 @@ if (process.env.CC_AGENT_OPS_PORT) {
   });
   console.log(`[ops] control server on port ${process.env.CC_AGENT_OPS_PORT}`);
 }
-
-// Notifier — always subscribe to cca:notify and cca:chat:incoming channels.
-// CC_AGENT_NOTIFY_CHAT_ID pins a fixed Telegram chatId; without it the last
-// active chatId is used dynamically for the chat bridge.
-const notifyChatId = process.env.CC_AGENT_NOTIFY_CHAT_ID
-  ? Number(process.env.CC_AGENT_NOTIFY_CHAT_ID)
-  : null;
-
-const notifierBot = new TelegramBot(telegramToken, { polling: false });
-startNotifier(
-  notifierBot,
-  notifyChatId,
-  namespace,
-  sharedRedis,
-  (cid, text) => bot.handleUserMessage(cid, text),
-  () => bot.getLastActiveChatId()
-);
-console.log(`[notifier] started for namespace=${namespace} chatId=${notifyChatId ?? "dynamic"}`);
 
 process.on("SIGINT", () => {
   console.log("\nShutting down...");

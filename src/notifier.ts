@@ -107,6 +107,17 @@ export function writeChatLog(
   });
 }
 
+export interface NotifierHandle {
+  /**
+   * Register the originating Telegram chat ID for a routed namespace.
+   * When the meta-agent for `namespace` publishes a response, it will be
+   * forwarded to `chatId` instead of the global fixed/dynamic chatId.
+   * Call this before routing each message to ensure the response returns
+   * to the correct chat.
+   */
+  registerRoutedChatId: (namespace: string, chatId: number) => void;
+}
+
 /**
  * Start the notifier.
  *
@@ -116,6 +127,8 @@ export function writeChatLog(
  * @param redis     - ioredis client in normal mode (will be duplicated for pub/sub)
  * @param handleUserMessage - Optional callback to feed UI messages into the active Claude session
  * @param getActiveChatId   - Optional callback to resolve chatId dynamically (used when chatId is null)
+ *
+ * @returns NotifierHandle with registerRoutedChatId for per-namespace response routing
  */
 export function startNotifier(
   bot: TelegramBot,
@@ -124,7 +137,10 @@ export function startNotifier(
   redis: Redis,
   handleUserMessage?: (chatId: number, text: string) => void,
   getActiveChatId?: () => number | undefined
-): void {
+): NotifierHandle {
+  // Per-namespace chatId registry: when a message is routed to a non-default namespace,
+  // the originating Telegram chatId is registered here so responses go back to the right chat.
+  const routedChatIds = new Map<string, number>();
   const sub = redis.duplicate({
     retryStrategy: (times: number) => {
       const delay = Math.min(1000 * Math.pow(2, times - 1), 30_000);
@@ -206,7 +222,9 @@ export function startNotifier(
     const content = parsed.content;
     if (!content) return;
 
-    const targetChatId = chatId ?? getActiveChatId?.();
+    // Per-namespace chatId wins (set by registerRoutedChatId when a message is routed).
+    // Falls back to the global fixed chatId or the last-active dynamic chatId.
+    const targetChatId = routedChatIds.get(ns) ?? chatId ?? getActiveChatId?.();
     if (targetChatId == null) {
       log("warn", `meta-agent output: no chatId for namespace=${ns}, dropping line`);
       return;
@@ -360,4 +378,10 @@ export function startNotifier(
       }
     }
   });
+
+  return {
+    registerRoutedChatId: (ns: string, cid: number) => {
+      routedChatIds.set(ns, cid);
+    },
+  };
 }
