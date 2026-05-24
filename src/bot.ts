@@ -19,6 +19,7 @@ import { getCurrentToken, rotateToken, getTokenIndex, getTokenCount } from "./to
 import { writeChatLog, type ChatMessage } from "./notifier.js";
 import { CronManager } from "./cron.js";
 import { parseRoutingTag, ensureMetaAgent, routeToMetaAgent } from "./router.js";
+import { VOICE_PENDING_KEY, VOICE_FAILED_KEY, TTL, metaAgentStatusKey } from "@gonzih/cc-wire";
 
 const BOT_COMMANDS: Array<{ command: string; description: string }> = [
   { command: "start", description: "Reset session and start fresh" },
@@ -655,7 +656,7 @@ export class CcTgBot {
       timestamp: Date.now(),
     });
     if (this.redis) {
-      await this.redis.rpush("voice:pending", pendingEntry).catch((err: Error) =>
+      await this.redis.rpush(VOICE_PENDING_KEY, pendingEntry).catch((err: Error) =>
         console.warn("[voice] redis rpush voice:pending failed:", err.message)
       );
     }
@@ -667,7 +668,7 @@ export class CcTgBot {
 
       // Remove from pending on success
       if (this.redis) {
-        await this.redis.lrem("voice:pending", 0, pendingEntry).catch((err: Error) =>
+        await this.redis.lrem(VOICE_PENDING_KEY, 0, pendingEntry).catch((err: Error) =>
           console.warn("[voice] redis lrem voice:pending failed:", err.message)
         );
       }
@@ -703,8 +704,8 @@ export class CcTgBot {
           error: errMsg,
           failed_at: Date.now(),
         });
-        this.redis.rpush("voice:failed", failedEntry)
-          .then(() => this.redis!.expire("voice:failed", 48 * 60 * 60))
+        this.redis.rpush(VOICE_FAILED_KEY, failedEntry)
+          .then(() => this.redis!.expire(VOICE_FAILED_KEY, TTL.VOICE_FAILED_SECONDS))
           .catch((redisErr: Error) =>
             console.warn("[voice] redis write voice:failed failed:", redisErr.message)
           );
@@ -732,8 +733,8 @@ export class CcTgBot {
     }
 
     const [pendingRaw, failedRaw] = await Promise.all([
-      this.redis.lrange("voice:pending", 0, -1).catch(() => [] as string[]),
-      this.redis.lrange("voice:failed", 0, -1).catch(() => [] as string[]),
+      this.redis.lrange(VOICE_PENDING_KEY, 0, -1).catch(() => [] as string[]),
+      this.redis.lrange(VOICE_FAILED_KEY, 0, -1).catch(() => [] as string[]),
     ]);
 
     // Deduplicate by file_id across both lists
@@ -769,8 +770,8 @@ export class CcTgBot {
           // Remove from both lists
           const matchPending = pendingRaw.find((r) => r.includes(`"${fileId}"`));
           const matchFailed = failedRaw.find((r) => r.includes(`"${fileId}"`));
-          if (matchPending) await this.redis.lrem("voice:pending", 0, matchPending).catch(() => {});
-          if (matchFailed) await this.redis.lrem("voice:failed", 0, matchFailed).catch(() => {});
+          if (matchPending) await this.redis.lrem(VOICE_PENDING_KEY, 0, matchPending).catch(() => {});
+          if (matchFailed) await this.redis.lrem(VOICE_FAILED_KEY, 0, matchFailed).catch(() => {});
 
           succeeded++;
         } else {
@@ -784,7 +785,7 @@ export class CcTgBot {
         // Permanently unretryable (expired Telegram link) — remove from voice:pending
         if (errMsg.includes("Bad Request") || errMsg.includes("file_id")) {
           const matchPending = pendingRaw.find((r) => r.includes(`"${fileId}"`));
-          if (matchPending) await this.redis.lrem("voice:pending", 0, matchPending).catch(() => {});
+          if (matchPending) await this.redis.lrem(VOICE_PENDING_KEY, 0, matchPending).catch(() => {});
         }
       }
     }
@@ -796,7 +797,7 @@ export class CcTgBot {
       try {
         const entry = JSON.parse(raw) as { timestamp?: number };
         if (entry.timestamp && Date.now() - entry.timestamp > staleThreshold) {
-          await this.redis.lrem("voice:pending", 0, raw).catch(() => {});
+          await this.redis.lrem(VOICE_PENDING_KEY, 0, raw).catch(() => {});
           purged++;
         }
       } catch { /* skip malformed entries */ }
@@ -1512,7 +1513,7 @@ export class CcTgBot {
       const keys: string[] = [];
       let cursor = "0";
       do {
-        const [nextCursor, found] = await this.redis.scan(cursor, "MATCH", "cca:meta-agent:status:*", "COUNT", 100);
+        const [nextCursor, found] = await this.redis.scan(cursor, "MATCH", metaAgentStatusKey("*"), "COUNT", 100);
         cursor = nextCursor;
         keys.push(...found);
       } while (cursor !== "0");
@@ -1528,7 +1529,7 @@ export class CcTgBot {
 
       const lines = ["🤖 Active Agents", ""];
       for (const { key, raw } of statuses) {
-        const namespace = key.replace("cca:meta-agent:status:", "");
+        const namespace = key.slice(metaAgentStatusKey("").length);
         if (!raw) {
           lines.push(`${namespace} — status unknown`);
           continue;

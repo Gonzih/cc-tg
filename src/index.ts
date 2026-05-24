@@ -28,6 +28,7 @@ import { Registry, startControlServer } from "@gonzih/agent-ops";
 import { Redis } from "ioredis";
 import { startNotifier } from "./notifier.js";
 import { seedClaudeMd } from "./seed.js";
+import { CC_TG_VERSION_KEY } from "@gonzih/cc-wire";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -139,7 +140,7 @@ sharedRedis.on("error", (err: Error) => {
   console.warn("[redis] connection error:", err.message);
 });
 sharedRedis.once("ready", () => {
-  sharedRedis.set("cca:meta:cc-tg:version", pkg.version).catch((err: Error) => {
+  sharedRedis.set(CC_TG_VERSION_KEY, pkg.version).catch((err: Error) => {
     console.warn("[redis] failed to write version:", err.message);
   });
   console.log(`[cc-tg] version:reported ${pkg.version}`);
