@@ -5,7 +5,7 @@
  * the appropriate cc-agent meta-agent instead of the local Claude session.
  *
  * Tag formats:
- *   #repo-name    → namespace=repo-name, repo=https://github.com/{DEFAULT_GITHUB_ORG}/repo-name
+ *   #repo-name    → namespace=repo-name, repo=https://github.com/{DEFAULT_GITHUB_ORG}/repo-name (null if DEFAULT_GITHUB_ORG unset)
  *   #org/repo     → namespace=repo,      repo=https://github.com/org/repo
  */
 
@@ -24,16 +24,17 @@ export interface RoutingTag {
 
 /**
  * Parse the first #tag or #org/repo token from a message.
- * Returns null when no routing tag is present.
+ * Returns null when no routing tag is present, or when the short #repo format is used
+ * without DEFAULT_GITHUB_ORG being set (operators must configure this explicitly).
  *
  * Examples:
- *   "#cc-agent fix the bug"           → { namespace: "cc-agent", repoUrl: "…/gonzih/cc-agent", … }
+ *   "#cc-agent fix the bug"           → null if DEFAULT_GITHUB_ORG unset; { namespace: "cc-agent", repoUrl: "…/{org}/cc-agent", … } if set
  *   "#gonzih/of-stack deploy it"      → { namespace: "of-stack", repoUrl: "…/gonzih/of-stack", … }
  *   "#org/repo do something"          → { namespace: "repo",     repoUrl: "…/org/repo", … }
- *   "please help #of-stack with this" → { namespace: "of-stack", repoUrl: "…/gonzih/of-stack", … }
+ *   "please help #of-stack with this" → null if DEFAULT_GITHUB_ORG unset
  */
 export function parseRoutingTag(text: string): RoutingTag | null {
-  const defaultOrg = process.env.DEFAULT_GITHUB_ORG ?? "gonzih";
+  const defaultOrg = process.env.DEFAULT_GITHUB_ORG;
 
   // Match #word or #org/repo — each segment: starts with alphanumeric, allows ._- inside
   const match = text.match(/#([a-zA-Z0-9][a-zA-Z0-9._-]*)(?:\/([a-zA-Z0-9][a-zA-Z0-9._-]*))?/);
@@ -51,7 +52,8 @@ export function parseRoutingTag(text: string): RoutingTag | null {
     namespace = part2;
     repoUrl = `https://github.com/${part1}/${part2}`;
   } else {
-    // #repo format — use DEFAULT_GITHUB_ORG
+    // #repo format — requires DEFAULT_GITHUB_ORG; return null if unset
+    if (!defaultOrg) return null;
     namespace = part1;
     repoUrl = `https://github.com/${defaultOrg}/${part1}`;
   }
