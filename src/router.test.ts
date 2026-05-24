@@ -169,8 +169,9 @@ describe("ensureMetaAgent", () => {
   });
 
   it("resolves in poll loop when status becomes idle", async () => {
-    // No status on fast path
-    mockGet.mockResolvedValueOnce(null);
+    // Fast path: both keys absent
+    mockGet.mockResolvedValueOnce(null); // status key
+    mockGet.mockResolvedValueOnce(null); // state key
     // Poll: idle on first tick → should resolve immediately
     mockGet.mockResolvedValue(JSON.stringify({ status: "idle" }));
 
@@ -189,10 +190,11 @@ describe("ensureMetaAgent", () => {
   });
 
   it("starts meta-agent when not running (repo already exists)", async () => {
-    // Not running initially
-    mockGet.mockResolvedValueOnce(null);
+    // Fast path: both keys absent
+    mockGet.mockResolvedValueOnce(null); // status key
+    mockGet.mockResolvedValueOnce(null); // state key
     // Poll: idle on first tick → resolves (idle = ready)
-    mockGet.mockResolvedValueOnce(JSON.stringify({ status: "idle" }));
+    mockGet.mockResolvedValueOnce(JSON.stringify({ status: "idle" })); // poll status key
 
     // gh repo view succeeds (repo exists)
     mockExecSync.mockReturnValue("");
@@ -218,8 +220,10 @@ describe("ensureMetaAgent", () => {
   });
 
   it("creates repo when gh repo view fails, then starts meta-agent", async () => {
-    mockGet.mockResolvedValueOnce(null);
-    mockGet.mockResolvedValue(JSON.stringify({ status: "running" }));
+    // Fast path: both keys absent
+    mockGet.mockResolvedValueOnce(null); // status key
+    mockGet.mockResolvedValueOnce(null); // state key
+    mockGet.mockResolvedValue(JSON.stringify({ status: "running" })); // poll
 
     // gh repo view throws (not found), gh repo create succeeds
     mockExecSync
@@ -257,7 +261,7 @@ describe("ensureMetaAgent", () => {
   });
 
   it("throws on timeout when meta-agent never becomes ready", async () => {
-    mockGet.mockResolvedValue(null); // never becomes running
+    mockGet.mockResolvedValue(null); // never becomes running — both status and state keys absent
     mockExecSync.mockReturnValue("");
 
     const callTool = vi.fn().mockResolvedValue("ok");
@@ -273,5 +277,63 @@ describe("ensureMetaAgent", () => {
     const err = await caught;
     expect(err).toBeInstanceOf(Error);
     expect((err as Error).message).toContain("did not become ready within 3000ms");
+  });
+
+  // The root-cause fix: start_meta_agent writes cca:meta:{namespace} (state key) but NOT
+  // cca:meta-agent:status:{namespace} (status key). The poll must check both.
+  it("resolves when state key appears after start_meta_agent (core bug fix)", async () => {
+    // Fast path: both keys absent
+    mockGet.mockResolvedValueOnce(null); // fast path: status key
+    mockGet.mockResolvedValueOnce(null); // fast path: state key
+    // Poll iteration 1: status key absent, state key has idle (written by startMetaAgent)
+    mockGet.mockResolvedValueOnce(null);                                      // poll: status key
+    mockGet.mockResolvedValueOnce(JSON.stringify({ status: "idle" }));        // poll: state key
+
+    mockExecSync.mockReturnValue("");
+    const callTool = vi.fn().mockResolvedValue(
+      JSON.stringify({ ok: true, namespace: "of-stack", status: "idle" })
+    );
+    const redis = makeRedis();
+
+    process.env.META_AGENT_TIMEOUT_MS = "5000";
+    vi.useFakeTimers();
+
+    const promise = ensureMetaAgent("of-stack", "https://github.com/gonzih/of-stack", callTool, redis);
+    await vi.advanceTimersByTimeAsync(2000);
+    await promise;
+
+    expect(callTool).toHaveBeenCalledWith("start_meta_agent", {
+      namespace: "of-stack",
+      repo_url: "https://github.com/gonzih/of-stack",
+    });
+  });
+
+  it("returns early on fast path when state key shows idle (workspace pre-exists)", async () => {
+    // Status key absent, state key present with idle — workspace already created
+    mockGet.mockResolvedValueOnce(null);                                 // status key
+    mockGet.mockResolvedValueOnce(JSON.stringify({ status: "idle" }));  // state key
+
+    const callTool = vi.fn();
+    const redis = makeRedis();
+
+    await ensureMetaAgent("of-stack", "https://github.com/gonzih/of-stack", callTool, redis);
+
+    expect(callTool).not.toHaveBeenCalled();
+    expect(mockExecSync).not.toHaveBeenCalled();
+  });
+
+  it("throws when start_meta_agent returns ok:false error payload", async () => {
+    mockGet.mockResolvedValueOnce(null); // status key
+    mockGet.mockResolvedValueOnce(null); // state key
+    mockExecSync.mockReturnValue("");
+
+    const callTool = vi.fn().mockResolvedValue(
+      JSON.stringify({ ok: false, error: "git clone failed: repository not found" })
+    );
+    const redis = makeRedis();
+
+    await expect(
+      ensureMetaAgent("of-stack", "https://github.com/gonzih/of-stack", callTool, redis)
+    ).rejects.toThrow("start_meta_agent failed: git clone failed: repository not found");
   });
 });
