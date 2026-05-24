@@ -1,6 +1,6 @@
 # cc-tg
 
-<img src="assets/logo.png" alt="AMAI" width="120">
+<img src="assets/logo.png" alt="cc-tg" width="120">
 
 [![npm version](https://img.shields.io/npm/v/@gonzih/cc-tg)](https://www.npmjs.com/package/@gonzih/cc-tg)
 
