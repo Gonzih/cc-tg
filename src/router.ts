@@ -11,6 +11,7 @@
 
 import { execSync } from "child_process";
 import { Redis } from "ioredis";
+import { metaAgentStatusKey, metaKey, metaInputKey } from "@gonzih/cc-wire";
 
 /** Callback type matching CcTgBot.callCcAgentTool */
 export type CallToolFn = (toolName: string, args?: Record<string, unknown>) => Promise<string | null>;
@@ -91,9 +92,9 @@ export async function ensureMetaAgent(
   redis: Redis
 ): Promise<void> {
   const timeoutMs = parseInt(process.env.META_AGENT_TIMEOUT_MS ?? "10000", 10);
-  const statusKey = `cca:meta-agent:status:${namespace}`;
+  const statusKey = metaAgentStatusKey(namespace);
   // State key written by startMetaAgent() directly — the source of truth for workspace existence.
-  const stateKey = `cca:meta:${namespace}`;
+  const stateKey = metaKey(namespace);
 
   console.log(`[router] ensureMetaAgent namespace=${namespace}`);
 
@@ -217,6 +218,6 @@ export async function routeToMetaAgent(
     timestamp: new Date().toISOString(),
   });
   // FIFO — cc-agent reads via LPOP
-  await redis.rpush(`cca:meta:${namespace}:input`, entry);
+  await redis.rpush(metaInputKey(namespace), entry);
   console.log(`[router] routed message to meta-agent namespace=${namespace}`);
 }

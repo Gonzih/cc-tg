@@ -13,6 +13,14 @@
 
 import { Redis } from "ioredis";
 import TelegramBot from "node-telegram-bot-api";
+import {
+  chatLogKey,
+  chatOutgoingChannel,
+  chatIncomingChannel,
+  notifyChannel,
+  metaAgentStatusKey,
+  metaInputKey,
+} from "@gonzih/cc-wire";
 import { splitLongMessage } from "./formatter.js";
 
 export interface ChatMessage {
@@ -92,8 +100,8 @@ export function writeChatLog(
   namespace: string,
   msg: ChatMessage
 ): void {
-  const logKey = `cca:chat:log:${namespace}`;
-  const outKey = `cca:chat:outgoing:${namespace}`;
+  const logKey = chatLogKey(namespace);
+  const outKey = chatOutgoingChannel(namespace);
   const payload = JSON.stringify(msg);
   // LIFO — newest first. Consumers must LRANGE 0 N then reverse for chronological order.
   redis.lpush(logKey, payload).catch((err: Error) => {
@@ -157,31 +165,31 @@ export function startNotifier(
     log("info", "subscriber disconnected, will reconnect with backoff");
   });
 
-  // cca:notify:{namespace} — forward job completion notifications to Telegram
-  sub.subscribe(`cca:notify:${namespace}`, (err) => {
+  // notifyChannel(namespace) — forward job completion notifications to Telegram
+  sub.subscribe(notifyChannel(namespace), (err) => {
     if (err) {
-      log("error", `subscribe cca:notify:${namespace} failed:`, err.message);
+      log("error", `subscribe ${notifyChannel(namespace)} failed:`, err.message);
     } else {
-      log("info", `subscribed to cca:notify:${namespace}`);
+      log("info", `subscribed to ${notifyChannel(namespace)}`);
     }
   });
 
-  // cca:chat:incoming:{namespace} — messages from UI
-  sub.subscribe(`cca:chat:incoming:${namespace}`, (err) => {
+  // chatIncomingChannel(namespace) — messages from UI
+  sub.subscribe(chatIncomingChannel(namespace), (err) => {
     if (err) {
-      log("error", `subscribe cca:chat:incoming:${namespace} failed:`, err.message);
+      log("error", `subscribe ${chatIncomingChannel(namespace)} failed:`, err.message);
     } else {
-      log("info", `subscribed to cca:chat:incoming:${namespace}`);
+      log("info", `subscribed to ${chatIncomingChannel(namespace)}`);
     }
   });
 
-  // cca:chat:outgoing:* — meta-agent stdout lines (source=claude) → buffer+debounce → Telegram
+  // chatOutgoingChannel("*") — meta-agent stdout lines (source=claude) → buffer+debounce → Telegram
   // Using psubscribe so we catch all namespaces (money-brain, isoc-nevada, etc.)
-  sub.psubscribe("cca:chat:outgoing:*", (err) => {
+  sub.psubscribe(chatOutgoingChannel("*"), (err) => {
     if (err) {
-      log("error", "psubscribe cca:chat:outgoing:* failed:", err.message);
+      log("error", `psubscribe ${chatOutgoingChannel("*")} failed:`, err.message);
     } else {
-      log("info", "psubscribed to cca:chat:outgoing:*");
+      log("info", `psubscribed to ${chatOutgoingChannel("*")}`);
     }
   });
 
@@ -193,7 +201,7 @@ export function startNotifier(
   function flushMetaAgentBuffer(ns: string, targetChatId: number): void {
     const buf = metaAgentBuffers.get(ns);
     if (!buf || !buf.text.trim()) return;
-    const text = stripAnsi(buf.text.trim());
+    const text = "← " + stripAnsi(buf.text.trim());
     buf.text = "";
     buf.timer = null;
     const chunks = splitLongMessage(text);
@@ -206,7 +214,7 @@ export function startNotifier(
 
   sub.on("pmessage", (pattern: string, channel: string, message: string) => {
     void pattern; // used only as a type guard
-    const ns = channel.replace("cca:chat:outgoing:", "");
+    const ns = channel.slice(chatOutgoingChannel("").length);
 
     let parsed: { source?: string; content?: string } | null = null;
     try {
@@ -241,9 +249,9 @@ export function startNotifier(
     buf.timer = setTimeout(() => flushMetaAgentBuffer(ns, targetChatId), META_AGENT_FLUSH_DELAY_MS);
   });
 
-  // Poll the cca:notify:{namespace} LIST every 5 seconds.
+  // Poll the notifyChannel(namespace) LIST every 5 seconds.
   // Jobs push to this list via RPUSH; pub/sub alone won't deliver those messages.
-  const notifyListKey = `cca:notify:${namespace}`;
+  const notifyListKey = notifyChannel(namespace);
   const MAX_PER_CYCLE = 20;
 
   const pollNotifyList = async (): Promise<void> => {
@@ -295,10 +303,10 @@ export function startNotifier(
   }, 5_000);
 
   sub.on("message", (channel: string, message: string) => {
-    const notifyChannel = `cca:notify:${namespace}`;
-    const incomingChannel = `cca:chat:incoming:${namespace}`;
+    const notifyCh = notifyChannel(namespace);
+    const incomingCh = chatIncomingChannel(namespace);
 
-    if (channel === notifyChannel) {
+    if (channel === notifyCh) {
       const targetId = chatId ?? getActiveChatId?.();
       if (targetId != null) {
         const text = parseNotification(message);
@@ -314,7 +322,7 @@ export function startNotifier(
       return;
     }
 
-    if (channel === incomingChannel) {
+    if (channel === incomingCh) {
       let content = message;
       let originalTimestamp: string | undefined;
       try {
@@ -350,7 +358,7 @@ export function startNotifier(
         void (async () => {
           let routedToMetaAgent = false;
           try {
-            const statusRaw = await redis.get(`cca:meta-agent:status:${namespace}`);
+            const statusRaw = await redis.get(metaAgentStatusKey(namespace));
             if (statusRaw) {
               const status = JSON.parse(statusRaw) as { status?: string };
               if (status.status === "running") {
@@ -360,7 +368,7 @@ export function startNotifier(
                   timestamp: new Date().toISOString(),
                 });
                 // Polled by cc-agent every 3s — up to 3s delivery latency
-                await redis.rpush(`cca:meta:${namespace}:input`, entry);
+                await redis.rpush(metaInputKey(namespace), entry);
                 log("info", `cca:chat:incoming: routed to meta-agent for namespace ${namespace}`);
                 routedToMetaAgent = true;
               }
