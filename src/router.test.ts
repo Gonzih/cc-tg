@@ -36,7 +36,13 @@ describe("parseRoutingTag", () => {
     expect(parseRoutingTag("fix the bug please")).toBeNull();
   });
 
-  it("parses simple #repo-name at start", () => {
+  it("returns null for #repo-name when DEFAULT_GITHUB_ORG is not set", () => {
+    expect(parseRoutingTag("#cc-agent fix the bug")).toBeNull();
+    expect(parseRoutingTag("please help with #of-stack this issue")).toBeNull();
+  });
+
+  it("parses simple #repo-name at start when DEFAULT_GITHUB_ORG is set", () => {
+    process.env.DEFAULT_GITHUB_ORG = "gonzih";
     const result = parseRoutingTag("#cc-agent fix the bug");
     expect(result).not.toBeNull();
     expect(result!.namespace).toBe("cc-agent");
@@ -44,7 +50,8 @@ describe("parseRoutingTag", () => {
     expect(result!.strippedMessage).toBe("fix the bug");
   });
 
-  it("parses #repo-name anywhere in message", () => {
+  it("parses #repo-name anywhere in message when DEFAULT_GITHUB_ORG is set", () => {
+    process.env.DEFAULT_GITHUB_ORG = "gonzih";
     const result = parseRoutingTag("please help with #of-stack this issue");
     expect(result).not.toBeNull();
     expect(result!.namespace).toBe("of-stack");
@@ -74,24 +81,28 @@ describe("parseRoutingTag", () => {
   });
 
   it("strips only the tag token, preserves rest of message", () => {
+    process.env.DEFAULT_GITHUB_ORG = "gonzih";
     const result = parseRoutingTag("#cc-agent");
     expect(result).not.toBeNull();
     expect(result!.strippedMessage).toBe("");
   });
 
   it("collapses extra whitespace after strip", () => {
+    process.env.DEFAULT_GITHUB_ORG = "gonzih";
     const result = parseRoutingTag("fix  #cc-agent  the bug");
     expect(result).not.toBeNull();
     expect(result!.strippedMessage).toBe("fix the bug");
   });
 
   it("uses first match only when multiple tags present", () => {
+    process.env.DEFAULT_GITHUB_ORG = "gonzih";
     const result = parseRoutingTag("#repo-a do stuff #repo-b");
     expect(result).not.toBeNull();
     expect(result!.namespace).toBe("repo-a");
   });
 
   it("handles underscores and dots in repo name", () => {
+    process.env.DEFAULT_GITHUB_ORG = "gonzih";
     const result = parseRoutingTag("#my_repo.v2 task");
     expect(result).not.toBeNull();
     expect(result!.namespace).toBe("my_repo.v2");
