@@ -433,7 +433,7 @@ describe("meta-agent outgoing (pmessage)", () => {
     await vi.advanceTimersByTimeAsync(1500);
 
     expect(bot.sendMessage).toHaveBeenCalledTimes(1);
-    expect(bot.sendMessage).toHaveBeenCalledWith(42, "← Hello\nWorld");
+    expect(bot.sendMessage).toHaveBeenCalledWith(42, "← [ns] Hello\nWorld");
   });
 
   it("filters out non-claude sources (echo guard)", async () => {
@@ -483,7 +483,7 @@ describe("meta-agent outgoing (pmessage)", () => {
 
     await vi.advanceTimersByTimeAsync(1500);
 
-    expect(bot.sendMessage).toHaveBeenCalledWith(99, "← isoc response");
+    expect(bot.sendMessage).toHaveBeenCalledWith(99, "← [isoc-nevada] isoc response");
   });
 
   it("resets debounce timer when new line arrives within 1.5s", async () => {
@@ -511,7 +511,7 @@ describe("meta-agent outgoing (pmessage)", () => {
     // Advance remaining 500ms to complete the 1.5s debounce
     await vi.advanceTimersByTimeAsync(500);
     expect(bot.sendMessage).toHaveBeenCalledTimes(1);
-    expect(bot.sendMessage).toHaveBeenCalledWith(42, "← line 1\nline 2");
+    expect(bot.sendMessage).toHaveBeenCalledWith(42, "← [ns] line 1\nline 2");
   });
 
   it("uses getActiveChatId when chatId is null", async () => {
@@ -527,7 +527,7 @@ describe("meta-agent outgoing (pmessage)", () => {
 
     await vi.advanceTimersByTimeAsync(1500);
 
-    expect(bot.sendMessage).toHaveBeenCalledWith(77, "← dynamic chat");
+    expect(bot.sendMessage).toHaveBeenCalledWith(77, "← [ns] dynamic chat");
   });
 
   it("drops message when no chatId is available", async () => {
@@ -558,7 +558,7 @@ describe("meta-agent outgoing (pmessage)", () => {
 
     await vi.advanceTimersByTimeAsync(1500);
 
-    expect(bot.sendMessage).toHaveBeenCalledWith(42, "← green text");
+    expect(bot.sendMessage).toHaveBeenCalledWith(42, "← [ns] green text");
   });
 
   it("skips lines with empty content", async () => {
@@ -592,8 +592,8 @@ describe("meta-agent outgoing (pmessage)", () => {
       await vi.advanceTimersByTimeAsync(1500);
 
       // Must go to 777 (originating chat), not 99 (fixed chat)
-      expect(bot.sendMessage).toHaveBeenCalledWith(777, "← done routing");
-      expect(bot.sendMessage).not.toHaveBeenCalledWith(99, "← done routing");
+      expect(bot.sendMessage).toHaveBeenCalledWith(777, "← [of-stack] done routing");
+      expect(bot.sendMessage).not.toHaveBeenCalledWith(99, "← [of-stack] done routing");
     });
 
     it("falls back to fixed chatId when no routing registered for namespace", async () => {
@@ -611,7 +611,7 @@ describe("meta-agent outgoing (pmessage)", () => {
       await vi.advanceTimersByTimeAsync(1500);
 
       // Falls back to fixed chatId=99
-      expect(bot.sendMessage).toHaveBeenCalledWith(99, "← unregistered namespace");
+      expect(bot.sendMessage).toHaveBeenCalledWith(99, "← [of-stack] unregistered namespace");
     });
 
     it("last registerRoutedChatId call wins for same namespace", async () => {
@@ -628,7 +628,7 @@ describe("meta-agent outgoing (pmessage)", () => {
 
       await vi.advanceTimersByTimeAsync(1500);
 
-      expect(bot.sendMessage).toHaveBeenCalledWith(222, "← overwritten");
+      expect(bot.sendMessage).toHaveBeenCalledWith(222, "← [of-stack] overwritten");
     });
 
     it("falls back to getActiveChatId when no fixed chatId and no routing for namespace", async () => {
@@ -647,7 +647,7 @@ describe("meta-agent outgoing (pmessage)", () => {
       await vi.advanceTimersByTimeAsync(1500);
 
       // Falls back to getActiveChatId()
-      expect(bot.sendMessage).toHaveBeenCalledWith(555, "← dynamic fallback");
+      expect(bot.sendMessage).toHaveBeenCalledWith(555, "← [of-stack] dynamic fallback");
     });
 
     it("per-namespace registry does not interfere with primary namespace routing", async () => {
@@ -664,7 +664,7 @@ describe("meta-agent outgoing (pmessage)", () => {
 
       await vi.advanceTimersByTimeAsync(1500);
 
-      expect(bot.sendMessage).toHaveBeenCalledWith(99, "← primary response");
+      expect(bot.sendMessage).toHaveBeenCalledWith(99, "← [money-brain] primary response");
     });
   });
 });
