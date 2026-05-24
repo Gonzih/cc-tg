@@ -201,7 +201,7 @@ export function startNotifier(
   function flushMetaAgentBuffer(ns: string, targetChatId: number): void {
     const buf = metaAgentBuffers.get(ns);
     if (!buf || !buf.text.trim()) return;
-    const text = "← " + stripAnsi(buf.text.trim());
+    const text = `← [${ns}] ` + stripAnsi(buf.text.trim());
     buf.text = "";
     buf.timer = null;
     const chunks = splitLongMessage(text);
