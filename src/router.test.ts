@@ -146,12 +146,42 @@ describe("ensureMetaAgent", () => {
     expect(mockExecSync).not.toHaveBeenCalled();
   });
 
+  it("returns early when meta-agent is idle (idle = ready)", async () => {
+    mockGet.mockResolvedValue(JSON.stringify({ status: "idle" }));
+    const callTool = vi.fn();
+    const redis = makeRedis();
+
+    await ensureMetaAgent("cc-agent", "https://github.com/gonzih/cc-agent", callTool, redis);
+
+    expect(callTool).not.toHaveBeenCalled();
+    expect(mockExecSync).not.toHaveBeenCalled();
+  });
+
+  it("resolves in poll loop when status becomes idle", async () => {
+    // No status on fast path
+    mockGet.mockResolvedValueOnce(null);
+    // Poll: idle on first tick → should resolve immediately
+    mockGet.mockResolvedValue(JSON.stringify({ status: "idle" }));
+
+    mockExecSync.mockReturnValue("");
+    const callTool = vi.fn().mockResolvedValue("ok");
+    const redis = makeRedis();
+
+    process.env.META_AGENT_TIMEOUT_MS = "5000";
+    vi.useFakeTimers();
+
+    const promise = ensureMetaAgent("cc-agent", "https://github.com/gonzih/cc-agent", callTool, redis);
+    await vi.advanceTimersByTimeAsync(2000);
+    await promise;
+
+    expect(callTool).toHaveBeenCalledOnce();
+  });
+
   it("starts meta-agent when not running (repo already exists)", async () => {
     // Not running initially
     mockGet.mockResolvedValueOnce(null);
-    // Poll: not running on first tick, running on second
+    // Poll: idle on first tick → resolves (idle = ready)
     mockGet.mockResolvedValueOnce(JSON.stringify({ status: "idle" }));
-    mockGet.mockResolvedValueOnce(JSON.stringify({ status: "running" }));
 
     // gh repo view succeeds (repo exists)
     mockExecSync.mockReturnValue("");
