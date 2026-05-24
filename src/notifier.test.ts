@@ -13,6 +13,7 @@ const mockPsubscribe = vi.fn().mockImplementation((_pattern: string, cb?: (err: 
 const mockOn = vi.fn();
 const mockDuplicate = vi.fn();
 const mockLpush = vi.fn().mockResolvedValue(1);
+const mockRpush = vi.fn().mockResolvedValue(1);
 const mockLtrim = vi.fn().mockResolvedValue("OK");
 const mockPublish = vi.fn().mockResolvedValue(1);
 const mockGet = vi.fn().mockResolvedValue(null);
@@ -26,6 +27,7 @@ vi.mock("ioredis", () => {
     this.on = mockOn;
     this.duplicate = mockDuplicate;
     this.lpush = mockLpush;
+    this.rpush = mockRpush;
     this.ltrim = mockLtrim;
     this.publish = mockPublish;
     this.get = mockGet;
@@ -47,6 +49,7 @@ function makeRedis(): ReturnType<typeof makeBot> & {
   on: typeof mockOn;
   duplicate: typeof mockDuplicate;
   lpush: typeof mockLpush;
+  rpush: typeof mockRpush;
   ltrim: typeof mockLtrim;
   publish: typeof mockPublish;
   get: typeof mockGet;
@@ -58,6 +61,7 @@ function makeRedis(): ReturnType<typeof makeBot> & {
     psubscribe: mockPsubscribe,
     on: mockOn,
     lpush: mockLpush,
+    rpush: mockRpush,
     ltrim: mockLtrim,
     publish: mockPublish,
     get: mockGet,
@@ -70,6 +74,7 @@ function makeRedis(): ReturnType<typeof makeBot> & {
     on: mockOn,
     duplicate: mockDuplicate,
     lpush: mockLpush,
+    rpush: mockRpush,
     ltrim: mockLtrim,
     publish: mockPublish,
     get: mockGet,
@@ -89,6 +94,7 @@ describe("startNotifier", () => {
       psubscribe: mockPsubscribe,
       on: mockOn,
       lpush: mockLpush,
+      rpush: mockRpush,
       ltrim: mockLtrim,
       publish: mockPublish,
       get: mockGet,
@@ -293,7 +299,7 @@ describe("startNotifier", () => {
     await new Promise((r) => setTimeout(r, 0));
 
     expect(mockGet).toHaveBeenCalledWith("cca:meta-agent:status:ns-meta");
-    expect(mockLpush).toHaveBeenCalledWith(
+    expect(mockRpush).toHaveBeenCalledWith(
       "cca:meta:ns-meta:input",
       expect.stringContaining('"content":"hello meta"')
     );
@@ -323,7 +329,7 @@ describe("startNotifier", () => {
     await new Promise((r) => setTimeout(r, 0));
 
     expect(handleUserMessage).toHaveBeenCalledWith(200, "hello coord");
-    expect(mockLpush).not.toHaveBeenCalledWith(
+    expect(mockRpush).not.toHaveBeenCalledWith(
       "cca:meta:ns-idle:input",
       expect.anything()
     );

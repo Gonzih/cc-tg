@@ -95,6 +95,7 @@ export function writeChatLog(
   const logKey = `cca:chat:log:${namespace}`;
   const outKey = `cca:chat:outgoing:${namespace}`;
   const payload = JSON.stringify(msg);
+  // LIFO — newest first. Consumers must LRANGE 0 N then reverse for chronological order.
   redis.lpush(logKey, payload).catch((err: Error) => {
     log("warn", "writeChatLog lpush failed:", err.message);
   });
@@ -168,7 +169,9 @@ export function startNotifier(
     }
   });
 
-  // Per-namespace debounce buffer: accumulate streaming lines, flush after 1.5s silence
+  // 1.5s silence buffer. Combined with cc-agent's 3s poll = up to 4.5s meta-agent response latency.
+  const META_AGENT_FLUSH_DELAY_MS = 1500;
+  // Per-namespace debounce buffer: accumulate streaming lines, flush after silence
   const metaAgentBuffers = new Map<string, { text: string; timer: ReturnType<typeof setTimeout> | null }>();
 
   function flushMetaAgentBuffer(ns: string, targetChatId: number): void {
@@ -217,7 +220,7 @@ export function startNotifier(
     }
     buf.text += (buf.text ? "\n" : "") + content;
     if (buf.timer) clearTimeout(buf.timer);
-    buf.timer = setTimeout(() => flushMetaAgentBuffer(ns, targetChatId), 1500);
+    buf.timer = setTimeout(() => flushMetaAgentBuffer(ns, targetChatId), META_AGENT_FLUSH_DELAY_MS);
   });
 
   // Poll the cca:notify:{namespace} LIST every 5 seconds.
@@ -315,7 +318,7 @@ export function startNotifier(
 
         // Log the incoming message — preserve original timestamp from UI if present
         const inMsg: ChatMessage = {
-          id: `ui-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          id: crypto.randomUUID(),
           source: "ui", // 'ui' distinguishes this from telegram/claude messages
           role: "user",
           content,
@@ -338,7 +341,8 @@ export function startNotifier(
                   content,
                   timestamp: new Date().toISOString(),
                 });
-                await redis.lpush(`cca:meta:${namespace}:input`, entry);
+                // Polled by cc-agent every 3s — up to 3s delivery latency
+                await redis.rpush(`cca:meta:${namespace}:input`, entry);
                 log("info", `cca:chat:incoming: routed to meta-agent for namespace ${namespace}`);
                 routedToMetaAgent = true;
               }

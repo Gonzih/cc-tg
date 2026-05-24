@@ -71,7 +71,8 @@ interface PendingRetry {
   timer: ReturnType<typeof setTimeout>;
 }
 
-const FLUSH_DELAY_MS = 800; // debounce streaming chunks into one Telegram message
+// Debounces streaming chunks. Resets on each chunk. Fires 800ms after last chunk.
+const FLUSH_DELAY_MS = 800;
 const TYPING_INTERVAL_MS = 4000; // re-send typing action before Telegram's 5s expiry
 
 // Claude Sonnet 4.6 pricing (per 1M tokens)
@@ -270,7 +271,7 @@ export class CcTgBot {
   private writeChatMessage(role: ChatMessage["role"], source: ChatMessage["source"], content: string, chatId: number): void {
     if (!this.redis) return;
     const msg: ChatMessage = {
-      id: `${source}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      id: crypto.randomUUID(),
       source,
       role,
       content,
