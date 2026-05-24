@@ -82,12 +82,17 @@ export async function ensureMetaAgent(
   const timeoutMs = parseInt(process.env.META_AGENT_TIMEOUT_MS ?? "10000", 10);
   const statusKey = `cca:meta-agent:status:${namespace}`;
 
-  // Fast path: already running
+  console.log(`[router] ensureMetaAgent namespace=${namespace} checking ${statusKey}`);
+
+  // Fast path: already running or idle (idle = ready to receive messages)
   const statusRaw = await redis.get(statusKey);
   if (statusRaw) {
     try {
       const status = JSON.parse(statusRaw) as { status?: string };
-      if (status.status === "running") return;
+      if (status.status === "running" || status.status === "idle") {
+        console.log(`[router] meta-agent ${namespace} is already ready (status=${status.status})`);
+        return;
+      }
     } catch {
       // Corrupt status value — fall through and restart
     }
@@ -118,7 +123,7 @@ export async function ensureMetaAgent(
     throw new Error(`start_meta_agent returned null — tool may not be available in cc-agent`);
   }
 
-  // Poll until the meta-agent reports "running"
+  // Poll until the meta-agent reports "running" or "idle" (both mean ready)
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     await new Promise<void>((resolve) => setTimeout(resolve, 1000));
@@ -126,10 +131,13 @@ export async function ensureMetaAgent(
     if (raw) {
       try {
         const s = JSON.parse(raw) as { status?: string };
-        if (s.status === "running") return;
+        console.log(`[router] waiting for meta-agent ${namespace} — current status: ${s.status}`);
+        if (s.status === "running" || s.status === "idle") return;
       } catch {
         // ignore parse errors, keep polling
       }
+    } else {
+      console.log(`[router] waiting for meta-agent ${namespace} — no status key yet`);
     }
   }
 
