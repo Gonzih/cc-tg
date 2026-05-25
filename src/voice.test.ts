@@ -360,7 +360,6 @@ describe('transcribeVoice', () => {
     });
 
     it('uses -l auto for a non-.en model', async () => {
-      // Override existsSync so only the second model (ggml-small.bin — no ".en.") is found
       const NON_EN_MODEL = '/opt/homebrew/share/whisper-cpp/ggml-small.bin';
       mocks.existsSyncMock.mockImplementation((p: string) => {
         if (p === WHISPER_PATH) return true;
@@ -368,7 +367,6 @@ describe('transcribeVoice', () => {
         if (p === NON_EN_MODEL) return true;
         return false;
       });
-
       setupHttpsDownload();
       await transcribeVoice('https://example.com/voice.ogg');
 
@@ -408,7 +406,6 @@ describe('transcribeVoice', () => {
       const fileStream = makeWriteStream();
       mocks.createWriteStreamMock.mockReturnValue(fileStream);
 
-      // Mock the request object to capture the error handler and trigger it
       let errorHandler: ((err: Error) => void) | undefined;
       const mockReq = {
         on: vi.fn((event: string, cb: (err: Error) => void) => {
@@ -418,13 +415,11 @@ describe('transcribeVoice', () => {
       };
 
       mocks.httpsGetMock.mockImplementation((_url: string, _cb: unknown) => {
-        // Don't call _cb — network never connects
         return mockReq;
       });
 
       const promise = transcribeVoice('https://example.com/voice.ogg');
 
-      // Trigger the network error
       expect(errorHandler).toBeDefined();
       errorHandler!(new Error('ECONNRESET'));
 
@@ -440,7 +435,6 @@ describe('transcribeVoice', () => {
         const res = {
           statusCode: 200,
           pipe: vi.fn((dest: ReturnType<typeof makeWriteStream>) => {
-            // Trigger write stream error
             Promise.resolve().then(() => dest._emit('error', new Error('ENOSPC: no space left')));
             return dest;
           }),
@@ -451,6 +445,16 @@ describe('transcribeVoice', () => {
 
       await expect(transcribeVoice('https://example.com/voice.ogg'))
         .rejects.toThrow('ENOSPC: no space left');
+    });
+
+    it('wraps non-Error thrown values in whisper-cpp error message', async () => {
+      mocks.execFileAsyncMock
+        .mockResolvedValueOnce({ stdout: '', stderr: '' })
+        .mockRejectedValueOnce('exit status 1');
+      setupHttpsDownload();
+
+      await expect(transcribeVoice('https://example.com/voice.ogg'))
+        .rejects.toThrow('whisper-cpp failed: exit status 1');
     });
   });
 });
