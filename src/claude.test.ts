@@ -79,4 +79,13 @@ describe('extractText', () => {
     };
     expect(extractText(msg)).toBe('');
   });
+
+  it('returns empty string when content is neither string nor array', () => {
+    const msg = {
+      type: 'assistant' as const,
+      payload: { message: { content: 42 } },
+      raw: {},
+    };
+    expect(extractText(msg)).toBe('');
+  });
 });
