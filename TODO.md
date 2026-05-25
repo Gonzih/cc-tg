@@ -1,12 +1,13 @@
-# TODO: Error-Handling Test Coverage
+# TODO: Comprehensive Unit Tests
 
-- [ ] Create branch feat/error-handling-tests
-- [ ] Read source files (router, voice, cron, notifier, claude)
-- [ ] Write router.ts error path tests
-- [ ] Write voice.ts missing error tests (ffmpeg fail, validation)
-- [ ] Write cron.ts error path tests (persist fail, load fail, console.log)
-- [ ] Write notifier.ts error tests (subscribe errors, sendMessage errors)
-- [ ] Write claude.ts error tests (proc error event, drainBuffer skip)
-- [ ] Run full test suite
-- [ ] Fix any failures
+- [ ] Create branch feat/comprehensive-unit-tests
+- [ ] Add tests to formatter.test.ts
+- [ ] Add tests to tokens.test.ts
+- [ ] Add tests to usage-limit.test.ts
+- [ ] Add tests to cron.test.ts
+- [ ] Add tests to router.test.ts
+- [ ] Add tests to voice.test.ts
+- [ ] Add tests to seed.test.ts
+- [ ] Run npm test — verify all pass
+- [ ] git diff --staged review
 - [ ] Commit, push, PR, merge, publish

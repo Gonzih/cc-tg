@@ -14,6 +14,10 @@ vi.mock('fs', async (importOriginal) => {
 import { existsSync, readFileSync, writeFileSync } from 'fs';
 import { CronManager, type CronJob } from './cron.js';
 
+const mockExistsSync = vi.mocked(existsSync);
+const mockReadFileSync = vi.mocked(readFileSync);
+const mockWriteFileSync = vi.mocked(writeFileSync);
+
 describe('CronManager.parseSchedule', () => {
   it('parses minutes', () => {
     expect(CronManager.parseSchedule('every 30m')).toBe(30 * 60_000);
@@ -232,6 +236,113 @@ describe('CronManager operations', () => {
       vi.advanceTimersByTime(120_000);
       expect(fireCallback).toHaveBeenCalledWith(42, 'new prompt', expect.any(String), expect.any(Function));
     });
+
+    it('no-op update (empty updates object) recreates timer with original values', () => {
+      fireCallback.mockImplementation((_chatId, _prompt, _jobId, done) => done());
+      const job = manager.add(42, 'every 1m', 'my prompt')!;
+      const updated = manager.update(42, job.id, {}) as CronJob;
+      expect(updated).not.toBe(false);
+      expect(updated).not.toBeNull();
+      expect(updated.prompt).toBe('my prompt');
+      expect(updated.schedule).toBe('every 1m');
+      // Timer still fires
+      vi.advanceTimersByTime(60_000);
+      expect(fireCallback).toHaveBeenCalledWith(42, 'my prompt', expect.any(String), expect.any(Function));
+    });
+  });
+
+  describe('clearAll — persist behavior', () => {
+    it('does not call persist when there are no jobs to clear (count === 0 branch)', () => {
+      mockWriteFileSync.mockClear();
+      const count = manager.clearAll(42);
+      expect(count).toBe(0);
+      // persist() is only called when count > 0
+      expect(mockWriteFileSync).not.toHaveBeenCalled();
+    });
+  });
+});
+
+describe('CronManager — load() behavior', () => {
+  let fireCallback: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    fireCallback = vi.fn();
+    // Reset mocks to defaults
+    mockExistsSync.mockReturnValue(false);
+    mockReadFileSync.mockReturnValue('[]');
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.clearAllMocks();
+  });
+
+  it('skips loading when crons.json does not exist', () => {
+    mockExistsSync.mockReturnValue(false);
+    const manager = new CronManager('/tmp/no-file', fireCallback);
+    expect(manager.list(42)).toEqual([]);
+  });
+
+  it('restores jobs from disk and schedules their timers', () => {
+    const storedJob: CronJob = {
+      id: 'test-id',
+      chatId: 42,
+      intervalMs: 60_000,
+      prompt: 'loaded prompt',
+      schedule: 'every 1m',
+      createdAt: new Date().toISOString(),
+    };
+    mockExistsSync.mockReturnValue(true);
+    mockReadFileSync.mockReturnValue(JSON.stringify([storedJob]));
+    fireCallback.mockImplementation((_chatId, _prompt, _jobId, done) => done());
+
+    const manager = new CronManager('/tmp/has-file', fireCallback);
+    expect(manager.list(42)).toHaveLength(1);
+    expect(manager.list(42)[0].prompt).toBe('loaded prompt');
+
+    // Timer should fire
+    vi.advanceTimersByTime(60_000);
+    expect(fireCallback).toHaveBeenCalledWith(42, 'loaded prompt', 'test-id', expect.any(Function));
+
+    // Cleanup
+    manager.clearAll(42);
+  });
+
+  it('gracefully handles corrupted JSON in crons.json', () => {
+    mockExistsSync.mockReturnValue(true);
+    mockReadFileSync.mockReturnValue('{ not valid json ');
+
+    // Should not throw — just logs error
+    expect(() => new CronManager('/tmp/corrupt', fireCallback)).not.toThrow();
+  });
+
+  it('handles persist errors gracefully (writeFileSync throws)', () => {
+    mockExistsSync.mockReturnValue(false);
+    mockWriteFileSync.mockImplementation(() => { throw new Error('EACCES: permission denied'); });
+
+    // add() calls persist() — should not throw even when persist fails
+    const manager = new CronManager('/tmp/no-write', fireCallback);
+    expect(() => manager.add(42, 'every 1m', 'test')).not.toThrow();
+  });
+});
+
+describe('CronManager.parseSchedule — additional edge cases', () => {
+  it('trims leading and trailing whitespace before matching', () => {
+    expect(CronManager.parseSchedule('  every 5m  ')).toBe(5 * 60_000);
+    expect(CronManager.parseSchedule('\tevery 2h\t')).toBe(2 * 3_600_000);
+  });
+
+  it('returns null for zero interval (0m)', () => {
+    // parseSchedule returns 0 for "every 0m" which is falsy — add() treats it as null
+    const ms = CronManager.parseSchedule('every 0m');
+    // 0 is falsy, so add() returns null for it
+    expect(ms).toBe(0);
+  });
+
+  it('returns null for non-digit schedule values', () => {
+    expect(CronManager.parseSchedule('every xh')).toBeNull();
+    expect(CronManager.parseSchedule('every 1.5h')).toBeNull();
   });
 });
 

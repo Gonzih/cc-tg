@@ -219,3 +219,49 @@ describe("all-exhausted detection", () => {
     );
   });
 });
+
+describe("edge cases — env var values", () => {
+  it("empty string CLAUDE_CODE_OAUTH_TOKENS results in empty pool", () => {
+    withEnv(
+      { CLAUDE_CODE_OAUTH_TOKENS: "", CLAUDE_CODE_OAUTH_TOKEN: undefined },
+      () => {
+        // empty string is falsy — falls through to CLAUDE_CODE_OAUTH_TOKEN branch
+        loadTokens();
+        expect(getTokenCount()).toBe(0);
+        expect(getCurrentToken()).toBe("");
+      }
+    );
+  });
+
+  it("whitespace-only tokens are filtered out", () => {
+    withEnv(
+      { CLAUDE_CODE_OAUTH_TOKENS: "  ,  ,  ", CLAUDE_CODE_OAUTH_TOKEN: undefined },
+      () => {
+        loadTokens();
+        expect(getTokenCount()).toBe(0);
+        expect(getCurrentToken()).toBe("");
+      }
+    );
+  });
+
+  it("mixed valid and whitespace tokens keeps only non-empty ones", () => {
+    withEnv(
+      { CLAUDE_CODE_OAUTH_TOKENS: "tok1,  , tok2 ,", CLAUDE_CODE_OAUTH_TOKEN: undefined },
+      () => {
+        loadTokens();
+        expect(getTokenCount()).toBe(2);
+        expect(getCurrentToken()).toBe("tok1");
+      }
+    );
+  });
+
+  it("getTokenIndex returns 0 when no tokens loaded", () => {
+    withEnv(
+      { CLAUDE_CODE_OAUTH_TOKENS: undefined, CLAUDE_CODE_OAUTH_TOKEN: undefined },
+      () => {
+        loadTokens();
+        expect(getTokenIndex()).toBe(0);
+      }
+    );
+  });
+});
