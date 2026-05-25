@@ -358,5 +358,123 @@ describe('transcribeVoice', () => {
         expect.any(Function),
       );
     });
+
+    it('uses http module for http:// URLs (not https)', async () => {
+      // Set up http download mock
+      const fileStream = makeWriteStream();
+      mocks.createWriteStreamMock.mockReturnValue(fileStream);
+
+      const mockHttpRequest = { on: vi.fn().mockReturnThis() };
+      mocks.httpGetMock.mockImplementation((_url: string, cb: (res: unknown) => void) => {
+        const res = {
+          statusCode: 200,
+          pipe: vi.fn((dest: ReturnType<typeof makeWriteStream>) => {
+            Promise.resolve().then(() => dest._emit('finish'));
+            return dest;
+          }),
+        };
+        cb(res);
+        return mockHttpRequest;
+      });
+
+      await transcribeVoice('http://example.com/voice.ogg');
+
+      expect(mocks.httpGetMock).toHaveBeenCalledWith(
+        'http://example.com/voice.ogg',
+        expect.any(Function),
+      );
+      expect(mocks.httpsGetMock).not.toHaveBeenCalled();
+    });
+
+    it('propagates network request-level errors', async () => {
+      const fileStream = makeWriteStream();
+      mocks.createWriteStreamMock.mockReturnValue(fileStream);
+
+      const mockRequest = {
+        on: vi.fn((event: string, cb: (err: Error) => void) => {
+          if (event === 'error') {
+            Promise.resolve().then(() => cb(new Error('ECONNREFUSED')));
+          }
+          return mockRequest;
+        }),
+      };
+      mocks.httpsGetMock.mockReturnValue(mockRequest);
+
+      await expect(transcribeVoice('https://example.com/voice.ogg'))
+        .rejects.toThrow('ECONNREFUSED');
+    });
+  });
+});
+
+describe('transcribeVoice — non-.en. model uses -l auto', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.unlinkMock.mockResolvedValue(undefined);
+    mocks.readFileMock.mockResolvedValue('transcribed');
+    mocks.execFileAsyncMock.mockResolvedValue({ stdout: '', stderr: '' });
+
+    // Make whisper available but use a non-.en. model (ggml-small.bin)
+    const WHISPER_PATH = '/opt/homebrew/bin/whisper-cli';
+    const FFMPEG_PATH  = '/opt/homebrew/bin/ffmpeg';
+    const NON_EN_MODEL = '/opt/homebrew/share/whisper-cpp/ggml-small.bin';
+
+    mocks.existsSyncMock.mockImplementation((p: string) => {
+      if (p === WHISPER_PATH) return true;
+      if (p === FFMPEG_PATH) return true;
+      if (p === NON_EN_MODEL) return true;
+      return false;
+    });
+  });
+
+  function setupHttpsDownloadLocal(statusCode = 200) {
+    const fileStream = makeWriteStream();
+    mocks.createWriteStreamMock.mockReturnValue(fileStream);
+    const mockRequest = { on: vi.fn().mockReturnThis() };
+    mocks.httpsGetMock.mockImplementation((_url: string, cb: (res: unknown) => void) => {
+      const res = {
+        statusCode,
+        pipe: vi.fn((dest: ReturnType<typeof makeWriteStream>) => {
+          if (statusCode === 200) Promise.resolve().then(() => dest._emit('finish'));
+          return dest;
+        }),
+      };
+      cb(res);
+      return mockRequest;
+    });
+    return fileStream;
+  }
+
+  it('uses -l auto for model without .en. in path', async () => {
+    setupHttpsDownloadLocal();
+    await transcribeVoice('https://example.com/voice.ogg');
+
+    const [, args] = mocks.execFileAsyncMock.mock.calls[1] as [string, string[]];
+    const lIdx = args.indexOf('-l');
+    expect(lIdx).toBeGreaterThan(-1);
+    expect(args[lIdx + 1]).toBe('auto');
+  });
+});
+
+describe('isVoiceAvailable — additional cases', () => {
+  beforeEach(() => {
+    mocks.existsSyncMock.mockReturnValue(false);
+  });
+
+  it('returns false when only model is missing (whisper and ffmpeg available)', () => {
+    mocks.existsSyncMock.mockImplementation((p: string) => {
+      if (p === '/opt/homebrew/bin/whisper-cli') return true;
+      if (p === '/opt/homebrew/bin/ffmpeg') return true;
+      return false;
+    });
+    expect(isVoiceAvailable()).toBe(false);
+  });
+
+  it('returns false when only ffmpeg is missing', () => {
+    mocks.existsSyncMock.mockImplementation((p: string) => {
+      if (p === '/opt/homebrew/bin/whisper-cli') return true;
+      if (p === '/opt/homebrew/share/whisper-cpp/ggml-small.en.bin') return true;
+      return false;
+    });
+    expect(isVoiceAvailable()).toBe(false);
   });
 });

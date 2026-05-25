@@ -80,4 +80,43 @@ describe("detectUsageLimit", () => {
     const wakeDate = new Date("2026-03-22T11:05:00Z");
     expect(sig.humanMessage).toContain(wakeDate.toUTCString());
   });
+
+  it("usage_exhausted takes priority over rate_limit when both keywords present", () => {
+    // The usage check runs first in detectUsageLimit
+    const sig = detectUsageLimit("usage limit exceeded and rate limit also exceeded");
+    expect(sig.detected).toBe(true);
+    expect(sig.reason).toBe("usage_exhausted");
+  });
+
+  it("not-detected result has reason:rate_limit, retryAfterMs:0, humanMessage empty", () => {
+    const sig = detectUsageLimit("everything is fine");
+    expect(sig.detected).toBe(false);
+    expect(sig.reason).toBe("rate_limit");
+    expect(sig.retryAfterMs).toBe(0);
+    expect(sig.humanMessage).toBe("");
+  });
+
+  it("detects 'rate limit' case-insensitively", () => {
+    expect(detectUsageLimit("RATE LIMIT exceeded").reason).toBe("rate_limit");
+    expect(detectUsageLimit("Rate Limit hit").reason).toBe("rate_limit");
+  });
+
+  it("detects 'overloaded' case-insensitively", () => {
+    expect(detectUsageLimit("System is OVERLOADED").detected).toBe(true);
+    expect(detectUsageLimit("System is OVERLOADED").reason).toBe("rate_limit");
+  });
+
+  it("at exactly midnight (00:00:00) the wake time is next day 01:05", () => {
+    vi.setSystemTime(new Date("2026-03-22T00:00:00Z"));
+    const sig = detectUsageLimit("usage limit reached");
+    const wakeDate = new Date("2026-03-22T01:05:00Z");
+    expect(sig.humanMessage).toContain(wakeDate.toUTCString());
+  });
+
+  it("at 23:30 the wake time is next day 00:05", () => {
+    vi.setSystemTime(new Date("2026-03-22T23:30:00Z"));
+    const sig = detectUsageLimit("usage limit reached");
+    const wakeDate = new Date("2026-03-23T00:05:00Z");
+    expect(sig.humanMessage).toContain(wakeDate.toUTCString());
+  });
 });

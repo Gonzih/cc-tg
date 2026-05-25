@@ -1,51 +1,71 @@
-# Plan: Hashtag Meta-Agent Routing
+# Plan: Comprehensive Unit Tests for Utility Modules
 
 ## Task restatement
 
-When a Telegram user sends a message containing `#tag` or `#org/repo`, route it to the
-corresponding cc-agent meta-agent instead of the local Claude session. Auto-create the
-GitHub repo and start the meta-agent if not already running. Reply immediately with
-`→ #namespace` so the user knows the message was delegated.
+Add tests for uncovered code paths, error handling, boundary conditions, and all conditional
+branches in the utility/helper/library modules: formatter.ts, tokens.ts, usage-limit.ts,
+cron.ts, router.ts, voice.ts, and seed.ts.
 
-## Approach options
+## Approach
 
-### A. Redis-only approach
-Skip MCP tools entirely. Check `cca:meta-agent:status:{namespace}` directly, use `spawn_agent`
-MCP tool to start, RPUSH to `cca:meta:{namespace}:input` to send.
-- Pro: Known working tools, consistent with notifier.ts patterns
-- Con: `spawn_agent` requires a `task` string — unclear what task makes a "meta-agent"
+Add tests directly to the existing test files — no new files needed. Each file already
+has a consistent vi/vitest style to follow.
 
-### B. MCP tool approach (spec-faithful)
-Call `start_meta_agent` and `message_meta_agent` via `callCcAgentTool`, check status via Redis.
-- Pro: Follows task spec, clean separation of concerns
-- Con: These tools may not exist in current cc-agent, returns null on failure
+## Key gaps to cover
 
-### C. Hybrid (chosen)
-- Check Redis for `cca:meta-agent:status:{namespace}` directly (known-working pattern from notifier.ts)
-- Call `callCcAgentTool("start_meta_agent", {namespace, repo_url})` to start — throw on null
-- Route messages via Redis RPUSH to `cca:meta:{namespace}:input` (known-working pattern)
-- Use `execSync` for `gh` repo verification/creation (same pattern as bot.ts)
+### formatter.ts
+- `htmlEscape()` directly (never called in isolation)
+- `splitLongMessage` with a `<pre>` block covering the only split point → `coveringPre` branch
+- `formatForTelegram` with `---` mid-sentence (should NOT convert)
+- `formatForTelegram` with bold spanning newlines (`s` flag)
+- `splitLongMessage` empty remaining after loop → no trailing chunk
 
-**Why this:** Stays consistent with existing code patterns, is spec-faithful for the start mechanism,
-and uses the reliable Redis RPUSH that notifier.ts already does for routing.
+### tokens.ts
+- Empty string `CLAUDE_CODE_OAUTH_TOKENS=""` → empty array (split+filter)
+- Whitespace-only tokens `"  ,  "` → filtered to []
+- Lazy init via `getCurrentToken` without prior `loadTokens`
+
+### usage-limit.ts
+- Text with both usage AND rate_limit keywords → usage_exhausted wins
+- `detected:false` branch → reason/retryAfterMs/humanMessage defaults
+
+### cron.ts
+- `clearAll` when no jobs → does NOT call persist (count=0 branch)
+- `load()` with corrupted JSON → logs error, doesn't crash
+- `load()` with valid persisted jobs → restores and schedules them
+- `update` with empty `{}` (no-op update) → still recreates timer
+
+### router.ts
+- `parseRoutingTag` with `#-repo` (dash start → no match)
+- `ensureMetaAgent` with corrupted status JSON → falls through
+- `ensureMetaAgent` with corrupted state JSON → falls through
+- `ensureMetaAgent` with `ok:false` no `error` field → "unknown error"
+- `ensureMetaAgent` when `gh repo create` throws → propagates error
+- `routeToMetaAgent` with single-word message (happy path edge)
+
+### voice.ts
+- HTTP URL (not HTTPS) → uses http getter
+- Request-level network error → rejects
+- Non-`.en.` model → uses `-l auto`
+- Only whitespace after artifact removal → `[empty transcription]`
+
+### seed.ts
+- `console.log` is called when file is written
+- Error from `writeFileSync` propagates
 
 ## Files to touch
 
-- `src/router.ts` — new: parseRoutingTag, ensureMetaAgent, routeToMetaAgent
-- `src/router.test.ts` — new: unit tests
-- `src/bot.ts` — add routing check in handleTelegram() before getOrCreateSession()
+- src/formatter.test.ts
+- src/tokens.test.ts
+- src/usage-limit.test.ts
+- src/cron.test.ts
+- src/router.test.ts
+- src/voice.test.ts
+- src/seed.test.ts
 
 ## Risks
 
-- `start_meta_agent` MCP tool may not exist → error surfaced to user with clear message
-- `gh` CLI may not be installed in the runtime environment → execSync throws, caught and re-thrown
-- strippedMessage may be empty if user sends only `#tag` → routeToMetaAgent is skipped, ensureMetaAgent still runs
-- Regex `#org/repo` might greedily match inside URLs → acceptable; Telegram plain text rarely embeds bare URLs with hash routing syntax
-
-## Key decisions
-
-- Tag parsed anywhere in message (not just start), first match wins
-- Strip tag + normalize whitespace before forwarding
-- If Redis not configured, skip routing entirely (fall through to local Claude)
-- Route BEFORE getOrCreateSession (skips local Claude session entirely)
-- Log the user message to chat log as "user"/"telegram" before routing
+- cron `load()` test requires mocking `existsSync` to return true + `readFileSync` to return JSON;
+  the module-level mock already does this but needs per-test overrides
+- voice http mock requires adding http mock setup (current tests only use https)
+- formatter `htmlEscape` is not exported — must test via `formatForTelegram` proxy
