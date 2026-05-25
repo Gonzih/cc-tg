@@ -1420,3 +1420,445 @@ describe('handleAgents', () => {
     expect(mocks.tgSendMessage).toHaveBeenCalledWith(42, 'No active meta-agents.');
   });
 });
+
+// ---------------------------------------------------------------------------
+// /cost command — covers formatCostReport, formatTokens, formatAgentCostSummary
+// ---------------------------------------------------------------------------
+
+describe('/cost command', () => {
+  let bot: CcTgBot;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({});
+    mocks.tgSetMyCommands.mockResolvedValue({});
+    mocks.existsSyncMock.mockReturnValue(false);
+    mocks.cronList.mockReturnValue([]);
+    bot = new CcTgBot({ telegramToken: 'test-token', cwd: '/tmp' });
+  });
+
+  afterEach(() => {
+    bot.stop();
+  });
+
+  async function sendCommand(text: string, userId = 100) {
+    await (bot as any).handleTelegram(makeMsg({ text, from: { id: userId } }));
+  }
+
+  it('/cost shows session cost report with zero usage when no messages sent', async () => {
+    vi.spyOn(bot as any, 'callCcAgentTool').mockResolvedValue(null);
+    await sendCommand('/cost');
+
+    expect(mocks.tgSendMessage).toHaveBeenCalledOnce();
+    const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+    expect(msg).toContain('📊 Session cost');
+    expect(msg).toContain('Messages: 0');
+    expect(msg).toContain('Total: $0.000');
+  });
+
+  it('/cost shows token counts formatted with k suffix for large values', async () => {
+    // Inject usage into costStore directly to test formatTokens
+    vi.spyOn(bot as any, 'callCcAgentTool').mockResolvedValue(null);
+    (bot as any).costStore.addUsage(42, {
+      inputTokens: 5000,
+      outputTokens: 1500,
+      cacheReadTokens: 2500,
+      cacheWriteTokens: 800,
+    });
+    await sendCommand('/cost');
+
+    const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+    expect(msg).toContain('5.0k'); // inputTokens formatted
+    expect(msg).toContain('1.5k'); // outputTokens
+    expect(msg).toContain('2.5k'); // cacheReadTokens
+    // 800 tokens stays as "800" (< 1000)
+    expect(msg).toContain('800');
+  });
+
+  it('/cost appends agent cost summary when callCcAgentTool returns JSON', async () => {
+    const costJson = JSON.stringify({
+      total_cost_usd: 1.23,
+      by_repo: [
+        { repo: 'myorg/myrepo', cost_usd: 1.23 },
+      ],
+    });
+    vi.spyOn(bot as any, 'callCcAgentTool').mockResolvedValue(costJson);
+    await sendCommand('/cost');
+
+    const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+    expect(msg).toContain('💰 Cost Summary');
+    expect(msg).toContain('myorg/myrepo');
+  });
+
+  it('/cost falls back gracefully when callCcAgentTool returns non-JSON', async () => {
+    vi.spyOn(bot as any, 'callCcAgentTool').mockResolvedValue('not-json-data');
+    await sendCommand('/cost');
+
+    const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+    // formatAgentCostSummary catch branch: returns raw fallback
+    expect(msg).toContain('💰 Cost Summary');
+    expect(msg).toContain('not-json-data');
+  });
+
+  it('/cost shows "No cost data" when by_repo is empty', async () => {
+    vi.spyOn(bot as any, 'callCcAgentTool').mockResolvedValue(
+      JSON.stringify({ total_cost_usd: 0, by_repo: [] })
+    );
+    await sendCommand('/cost');
+
+    const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+    expect(msg).toContain('No cost data available yet.');
+  });
+
+  it('usage event from Claude accumulates into costStore', async () => {
+    // Trigger session creation
+    await sendCommand('Hello Claude');
+    const onCalls = mocks.claudeOn.mock.calls as [string, (...args: unknown[]) => void][];
+    const usageHandler = onCalls.find(([event]) => event === 'usage')?.[1];
+    expect(usageHandler).toBeDefined();
+
+    // Fire a usage event
+    usageHandler!({ inputTokens: 100, outputTokens: 50, cacheReadTokens: 0, cacheWriteTokens: 0 });
+
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({});
+    vi.spyOn(bot as any, 'callCcAgentTool').mockResolvedValue(null);
+
+    await sendCommand('/cost');
+    const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+    // $0.00030 + $0.00075 = $0.00105
+    expect(msg).toContain('Total: $0.001');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Reply context building — covers buildPromptWithReplyContext
+// ---------------------------------------------------------------------------
+
+describe('buildPromptWithReplyContext (via handleTelegram)', () => {
+  let bot: CcTgBot;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({});
+    mocks.tgSetMyCommands.mockResolvedValue({});
+    mocks.existsSyncMock.mockReturnValue(false);
+    mocks.cronList.mockReturnValue([]);
+    bot = new CcTgBot({ telegramToken: 'test-token' });
+  });
+
+  afterEach(() => {
+    bot.stop();
+  });
+
+  it('prepends [Replying to: "..."] when message has reply_to_message with text', async () => {
+    await (bot as any).handleTelegram({
+      chat: { id: 42 },
+      from: { id: 100 },
+      text: 'follow up question',
+      reply_to_message: { text: 'original message from user' },
+    });
+
+    const prompt = mocks.claudeSendPrompt.mock.calls[0][0] as string;
+    expect(prompt).toContain('[Replying to: "original message from user"]');
+    expect(prompt).toContain('follow up question');
+  });
+
+  it('prepends [Replying to:] using caption when reply has no text', async () => {
+    await (bot as any).handleTelegram({
+      chat: { id: 42 },
+      from: { id: 100 },
+      text: 'describe this image',
+      reply_to_message: { caption: 'photo caption here' },
+    });
+
+    const prompt = mocks.claudeSendPrompt.mock.calls[0][0] as string;
+    expect(prompt).toContain('[Replying to: "photo caption here"]');
+  });
+
+  it('does not prepend reply context when reply_to_message has no text or caption', async () => {
+    await (bot as any).handleTelegram({
+      chat: { id: 42 },
+      from: { id: 100 },
+      text: 'reply to sticker',
+      reply_to_message: { sticker: { file_id: 'sticker-1' } },
+    });
+
+    const prompt = mocks.claudeSendPrompt.mock.calls[0][0] as string;
+    expect(prompt).not.toContain('[Replying to:');
+    expect(prompt).toContain('reply to sticker');
+  });
+
+  it('truncates reply text longer than 500 chars', async () => {
+    const longReply = 'x'.repeat(600);
+    await (bot as any).handleTelegram({
+      chat: { id: 42 },
+      from: { id: 100 },
+      text: 'my question',
+      reply_to_message: { text: longReply },
+    });
+
+    const prompt = mocks.claudeSendPrompt.mock.calls[0][0] as string;
+    expect(prompt).toContain('[truncated]');
+    // Should not contain the full 600 chars
+    const xCount = (prompt.match(/x/g) ?? []).length;
+    expect(xCount).toBeLessThanOrEqual(500);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// forwardNotification — covers CcTgBot.forwardNotification
+// ---------------------------------------------------------------------------
+
+describe('CcTgBot.forwardNotification', () => {
+  let bot: CcTgBot;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({});
+    mocks.tgSetMyCommands.mockResolvedValue({});
+    mocks.existsSyncMock.mockReturnValue(false);
+    mocks.cronList.mockReturnValue([]);
+    bot = new CcTgBot({ telegramToken: 'test-token' });
+  });
+
+  afterEach(() => {
+    bot.stop();
+  });
+
+  it('silently does nothing when no active session exists for chatId', async () => {
+    // No session was created — forwardNotification should be a no-op
+    expect(() => bot.forwardNotification(42, 'job done')).not.toThrow();
+    expect(mocks.claudeSendPrompt).not.toHaveBeenCalled();
+  });
+
+  it('calls sendPrompt on the active session when one exists', async () => {
+    // Create a session
+    await (bot as any).handleTelegram(makeMsg({ text: 'Hello' }));
+    vi.clearAllMocks();
+
+    bot.forwardNotification(42, 'job done notification');
+    expect(mocks.claudeSendPrompt).toHaveBeenCalledWith(
+      expect.stringContaining('job done notification')
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getMe — covers CcTgBot.getMe
+// ---------------------------------------------------------------------------
+
+describe('CcTgBot.getMe', () => {
+  let bot: CcTgBot;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.tgGetMe.mockResolvedValue({ id: 12345, username: 'mybot' });
+    mocks.tgSendMessage.mockResolvedValue({});
+    mocks.tgSetMyCommands.mockResolvedValue({});
+    mocks.existsSyncMock.mockReturnValue(false);
+    bot = new CcTgBot({ telegramToken: 'test-token' });
+  });
+
+  afterEach(() => {
+    bot.stop();
+  });
+
+  it('returns bot identity from Telegram API', async () => {
+    const me = await bot.getMe();
+    expect(me.id).toBe(12345);
+    expect(me.username).toBe('mybot');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// /get_file — path is directory (not a file)
+// ---------------------------------------------------------------------------
+
+describe('/get_file additional cases', () => {
+  let bot: CcTgBot;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({});
+    mocks.tgSetMyCommands.mockResolvedValue({});
+    mocks.existsSyncMock.mockReturnValue(true); // file exists
+    mocks.statSyncMock.mockReturnValue({ size: 1024, isFile: () => false }); // but it's a directory!
+    mocks.cronList.mockReturnValue([]);
+    bot = new CcTgBot({ telegramToken: 'test-token' });
+  });
+
+  afterEach(() => {
+    bot.stop();
+  });
+
+  it('rejects directory paths with "Not a file" message', async () => {
+    // /tmp/testdir starts with /tmp/ so it passes the safe-dir check,
+    // but statSync returns isFile()=false → "Not a file"
+    await (bot as any).handleTelegram(makeMsg({ text: '/get_file /tmp/testdir' }));
+    const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+    expect(msg).toContain('Not a file');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// /help command
+// ---------------------------------------------------------------------------
+
+describe('/help command', () => {
+  let bot: CcTgBot;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({});
+    mocks.tgSetMyCommands.mockResolvedValue({});
+    mocks.existsSyncMock.mockReturnValue(false);
+    mocks.cronList.mockReturnValue([]);
+    bot = new CcTgBot({ telegramToken: 'test-token' });
+  });
+
+  afterEach(() => {
+    bot.stop();
+  });
+
+  it('lists all bot commands with descriptions', async () => {
+    await (bot as any).handleTelegram(makeMsg({ text: '/help' }));
+    const reply = mocks.tgSendMessage.mock.calls[0][1] as string;
+    expect(reply).toContain('/reset');
+    expect(reply).toContain('/status');
+    expect(reply).toContain('/cost');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// /skills command
+// ---------------------------------------------------------------------------
+
+describe('/skills command', () => {
+  let bot: CcTgBot;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({});
+    mocks.tgSetMyCommands.mockResolvedValue({});
+    mocks.existsSyncMock.mockReturnValue(false);
+    mocks.cronList.mockReturnValue([]);
+    bot = new CcTgBot({ telegramToken: 'test-token' });
+  });
+
+  afterEach(() => {
+    bot.stop();
+  });
+
+  it('sends listSkills() output as reply', async () => {
+    await (bot as any).handleTelegram(makeMsg({ text: '/skills' }));
+    const reply = mocks.tgSendMessage.mock.calls[0][1] as string;
+    // listSkills() returns "No skills directory found" when fs.existsSync returns false
+    expect(reply).toContain('skills');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// /stop command
+// ---------------------------------------------------------------------------
+
+describe('/stop command', () => {
+  let bot: CcTgBot;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({});
+    mocks.tgSetMyCommands.mockResolvedValue({});
+    mocks.existsSyncMock.mockReturnValue(false);
+    mocks.cronList.mockReturnValue([]);
+    bot = new CcTgBot({ telegramToken: 'test-token' });
+  });
+
+  afterEach(() => {
+    bot.stop();
+  });
+
+  it('replies "No active session." when no session exists', async () => {
+    await (bot as any).handleTelegram(makeMsg({ text: '/stop' }));
+    const reply = mocks.tgSendMessage.mock.calls[0][1] as string;
+    expect(reply).toBe('No active session.');
+  });
+
+  it('replies "Stopped." after killing an active session', async () => {
+    // Create a session first
+    await (bot as any).handleTelegram(makeMsg({ text: 'Hello' }));
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({});
+
+    await (bot as any).handleTelegram(makeMsg({ text: '/stop' }));
+    const reply = mocks.tgSendMessage.mock.calls[0][1] as string;
+    expect(reply).toBe('Stopped.');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Authorization check
+// ---------------------------------------------------------------------------
+
+describe('Authorization (allowedUserIds)', () => {
+  let bot: CcTgBot;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({});
+    mocks.tgSetMyCommands.mockResolvedValue({});
+    mocks.existsSyncMock.mockReturnValue(false);
+    mocks.cronList.mockReturnValue([]);
+    // Only allow user 999
+    bot = new CcTgBot({ telegramToken: 'test-token', allowedUserIds: [999] });
+  });
+
+  afterEach(() => {
+    bot.stop();
+  });
+
+  it('replies "Not authorized." for disallowed users', async () => {
+    // user 100 is NOT in the allowlist
+    await (bot as any).handleTelegram(makeMsg({ text: 'Hello', from: { id: 100 } }));
+    const reply = mocks.tgSendMessage.mock.calls[0][1] as string;
+    expect(reply).toBe('Not authorized.');
+  });
+
+  it('allows messages from users in the allowlist', async () => {
+    await (bot as any).handleTelegram(makeMsg({ text: 'Hello', from: { id: 999 } }));
+    // Should not reply "Not authorized."
+    const calls = mocks.tgSendMessage.mock.calls;
+    const anyUnauth = calls.some(([, msg]: [unknown, string]) => msg === 'Not authorized.');
+    expect(anyUnauth).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getLastActiveChatId
+// ---------------------------------------------------------------------------
+
+describe('CcTgBot.getLastActiveChatId', () => {
+  let bot: CcTgBot;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({});
+    mocks.tgSetMyCommands.mockResolvedValue({});
+    mocks.existsSyncMock.mockReturnValue(false);
+    mocks.cronList.mockReturnValue([]);
+    bot = new CcTgBot({ telegramToken: 'test-token' });
+  });
+
+  afterEach(() => {
+    bot.stop();
+  });
+
+  it('returns undefined before any message is received', () => {
+    expect(bot.getLastActiveChatId()).toBeUndefined();
+  });
+
+  it('returns chatId after a message is received', async () => {
+    await (bot as any).handleTelegram(makeMsg({ chat: { id: 77 }, text: 'Hello' }));
+    expect(bot.getLastActiveChatId()).toBe(77);
+  });
+});

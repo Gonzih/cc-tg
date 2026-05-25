@@ -310,17 +310,11 @@ describe("splitLongMessage", () => {
   });
 
   it("splits after a covering <pre> block when all natural boundaries are inside it", () => {
-    // Construct text: a <pre> block that spans maxLen boundary, with no spaces or newlines
-    // outside it within the window — forces the coveringPre branch.
     const preContent = "y".repeat(2000);
     const text = `<pre>${preContent}</pre>extra`;
-    // maxLen=100 — the pre block spans [0, 2011], which covers position 100.
-    // No spaces/newlines inside the pre block, so coveringPre branch must fire.
     const chunks = splitLongMessage(text, 100);
     expect(chunks.length).toBeGreaterThanOrEqual(1);
-    // The first chunk must end at the close of the <pre> block
     expect(chunks[0]).toContain("</pre>");
-    // No chunk should have mismatched <pre>/<\/pre> tags
     for (const chunk of chunks) {
       const opens = (chunk.match(/<pre>/g) || []).length;
       const closes = (chunk.match(/<\/pre>/g) || []).length;
@@ -329,32 +323,81 @@ describe("splitLongMessage", () => {
   });
 
   it("hard-splits at maxLen when no boundary and no covering pre block", () => {
-    // Pure run of 'a' with no spaces/newlines/pre — falls to splitAt = maxLen
     const text = "a".repeat(200);
     const chunks = splitLongMessage(text, 50);
-    // Every chunk should be at most 50 characters
     for (const chunk of chunks) {
       expect(chunk.length).toBeLessThanOrEqual(50);
     }
-    // Content is fully preserved
     expect(chunks.join("")).toBe(text);
   });
 
+  it("hard splits at maxLen when all boundary candidates are inside a <pre> with no covering range", () => {
+    const text = "A".repeat(10);
+    const chunks = splitLongMessage(text, 5);
+    expect(chunks).toHaveLength(2);
+    expect(chunks[0]).toBe("AAAAA");
+    expect(chunks[1]).toBe("AAAAA");
+  });
+
+  it("splits after the closing </pre> tag when the split point is inside a <pre> block", () => {
+    const preContent = "y".repeat(200);
+    const suffix = " " + "z".repeat(200);
+    const text = `<pre>${preContent}</pre>${suffix}`;
+    const chunks = splitLongMessage(text, 100);
+    expect(chunks[0]).toContain("</pre>");
+    expect(chunks.join("")).toContain("z".repeat(10));
+  });
+
   it("produces no trailing empty chunk when remaining is exactly empty after loop", () => {
-    // text length = 2 * maxLen exactly, split at word boundary at maxLen
-    // After slicing off the first half, remaining is exactly the second half with no leftover.
     const half = "a".repeat(50);
-    const text = `${half} ${half}`;  // 101 chars with space at index 50
+    const text = `${half} ${half}`;
     const chunks = splitLongMessage(text, 51);
     for (const chunk of chunks) {
       expect(chunk.length).toBeGreaterThan(0);
     }
   });
+
+  it("produces no trailing empty chunk when text ends in separator", () => {
+    const text = "abc   ";
+    const chunks = splitLongMessage(text, 3);
+    for (const chunk of chunks) {
+      expect(chunk.length).toBeGreaterThan(0);
+    }
+    expect(chunks.join("")).toContain("abc");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// findPreRanges edge cases (exercised via splitLongMessage)
+// ---------------------------------------------------------------------------
+
+describe("findPreRanges internal behavior (via splitLongMessage)", () => {
+  it("handles text with no <pre> tags — splitLongMessage still splits normally", () => {
+    const text = "word ".repeat(1000);
+    const chunks = splitLongMessage(text, 100);
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const chunk of chunks) {
+      expect(chunk.length).toBeLessThanOrEqual(100);
+    }
+  });
+
+  it("handles unclosed <pre> tag — no crash, still splits", () => {
+    const text = "<pre>unclosed content " + "x".repeat(5000);
+    expect(() => splitLongMessage(text, 100)).not.toThrow();
+    const chunks = splitLongMessage(text, 100);
+    expect(chunks.length).toBeGreaterThan(1);
+  });
+
+  it("isInsidePre returns false when split point is before the pre block starts", () => {
+    const text = "ab cd" + "<pre>" + "z".repeat(20) + "</pre>";
+    const chunks = splitLongMessage(text, 5);
+    expect(chunks[0]).toBe("ab");
+    expect(chunks.join("")).toContain("</pre>");
+  });
 });
 
 describe("formatForTelegram — additional edge cases", () => {
   it("--- in the middle of a sentence is NOT converted (only full-line ---)", () => {
-    // The regex ^-{3,}$ with gm only matches --- on its own line
     const result = formatForTelegram("before --- after");
     expect(result).toBe("before --- after");
   });
@@ -370,13 +413,11 @@ describe("formatForTelegram — additional edge cases", () => {
   });
 
   it("multiple HTML special chars in the same text", () => {
-    // & < > all in one string
     const result = formatForTelegram("a & b < c > d");
     expect(result).toBe("a &amp; b &lt; c &gt; d");
   });
 
   it("htmlEscape inside code block does not double-escape", () => {
-    // <pre> content is html-escaped once; the outer text is also html-escaped
     const input = "```\na & b\n```";
     const result = formatForTelegram(input);
     expect(result).toBe("<pre>a &amp; b\n</pre>");
