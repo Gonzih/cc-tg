@@ -1,47 +1,71 @@
-# Plan: Integration & E2E Tests for Uncovered Branches
+# Plan: Comprehensive Unit Tests for Utility Modules
 
 ## Task restatement
 
-Write integration and end-to-end tests covering uncovered controller/API endpoint branches,
-request/response handling, and error scenarios. Ensure all HTTP methods and status codes
-are tested (Telegram sendMessage, sendDocument, etc.).
+Add tests for uncovered code paths, error handling, boundary conditions, and all conditional
+branches in the utility/helper/library modules: formatter.ts, tokens.ts, usage-limit.ts,
+cron.ts, router.ts, voice.ts, and seed.ts.
 
 ## Approach
 
-Write two new test files using the established vitest + hoisted mocks pattern:
+Add tests directly to the existing test files — no new files needed. Each file already
+has a consistent vi/vitest style to follow.
 
-### File 1: `src/bot.error.test.ts`
-Tests for error branches and edge cases in CcTgBot:
-- Telegram API error recovery (sendMessage throws → HTML→plain retry)
-- Claude process error event → sends error message to chat
-- Unauthorized user → "Not authorized." reply
-- Group chat filtering: allowlist, mention, reply-to-bot
-- Hashtag routing error → error reply sent to user
-- Forum topic routing via topicNameCache
-- forwardNotification with active session, exited session, no session
-- handleUserMessage error path (session.claude.exited)
-- Voice message: Redis rpush/lrem, whisper error paths (HTTP, missing model)
-- File upload: sendDocument throws (logged, does not crash), statSync race
-- CostStore: corrupt JSON silently degrades, missing directory is created
-- getLastActiveChatId tracking
-- /voice_retry: no redis, deduplication, stale purge, expired file_id cleanup
+## Key gaps to cover
 
-### File 2: `src/notifier.error.test.ts`  
-Tests for notifier error branches:
-- parseNotification: JSON with text/driver/model/cost, plain string, malformed
-- notify channel subscribe error logged
-- pmessage handler: non-JSON skipped, wrong source skipped, no chatId dropped
-- pmessage debounce buffer accumulation and flush
-- registerRoutedChatId: per-namespace routing wins over global chatId
-- Notify LIST polling: forwardNotification called, overflow "...and N more" message
-- forwardNotification: sendMessage failure logged, not thrown
-- writeChatLog: fire-and-forget (lpush fail doesn't propagate)
+### formatter.ts
+- `htmlEscape()` directly (never called in isolation)
+- `splitLongMessage` with a `<pre>` block covering the only split point → `coveringPre` branch
+- `formatForTelegram` with `---` mid-sentence (should NOT convert)
+- `formatForTelegram` with bold spanning newlines (`s` flag)
+- `splitLongMessage` empty remaining after loop → no trailing chunk
+
+### tokens.ts
+- Empty string `CLAUDE_CODE_OAUTH_TOKENS=""` → empty array (split+filter)
+- Whitespace-only tokens `"  ,  "` → filtered to []
+- Lazy init via `getCurrentToken` without prior `loadTokens`
+
+### usage-limit.ts
+- Text with both usage AND rate_limit keywords → usage_exhausted wins
+- `detected:false` branch → reason/retryAfterMs/humanMessage defaults
+
+### cron.ts
+- `clearAll` when no jobs → does NOT call persist (count=0 branch)
+- `load()` with corrupted JSON → logs error, doesn't crash
+- `load()` with valid persisted jobs → restores and schedules them
+- `update` with empty `{}` (no-op update) → still recreates timer
+
+### router.ts
+- `parseRoutingTag` with `#-repo` (dash start → no match)
+- `ensureMetaAgent` with corrupted status JSON → falls through
+- `ensureMetaAgent` with corrupted state JSON → falls through
+- `ensureMetaAgent` with `ok:false` no `error` field → "unknown error"
+- `ensureMetaAgent` when `gh repo create` throws → propagates error
+- `routeToMetaAgent` with single-word message (happy path edge)
+
+### voice.ts
+- HTTP URL (not HTTPS) → uses http getter
+- Request-level network error → rejects
+- Non-`.en.` model → uses `-l auto`
+- Only whitespace after artifact removal → `[empty transcription]`
+
+### seed.ts
+- `console.log` is called when file is written
+- Error from `writeFileSync` propagates
 
 ## Files to touch
-- `src/bot.error.test.ts` — new
-- `src/notifier.error.test.ts` — new
+
+- src/formatter.test.ts
+- src/tokens.test.ts
+- src/usage-limit.test.ts
+- src/cron.test.ts
+- src/router.test.ts
+- src/voice.test.ts
+- src/seed.test.ts
 
 ## Risks
-- Some internal methods are private — accessed via `(bot as any).method()`
-- Redis mock must be set up carefully to avoid interference between tests
-- Fake timers needed for debounce/interval tests
+
+- cron `load()` test requires mocking `existsSync` to return true + `readFileSync` to return JSON;
+  the module-level mock already does this but needs per-test overrides
+- voice http mock requires adding http mock setup (current tests only use https)
+- formatter `htmlEscape` is not exported — must test via `formatForTelegram` proxy

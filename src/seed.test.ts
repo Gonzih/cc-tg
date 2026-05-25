@@ -15,6 +15,9 @@ const mockWriteFileSync = vi.mocked(writeFileSync);
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // Reset implementations so error-injecting tests don't bleed into subsequent tests
+  mockMkdirSync.mockImplementation(() => undefined);
+  mockWriteFileSync.mockImplementation(() => undefined);
 });
 
 describe("seedClaudeMd", () => {
@@ -57,5 +60,47 @@ describe("seedClaudeMd", () => {
     expect(content).toContain("FERAL LIFE Protocol");
     expect(content).toContain("AXIOM");
     expect(content).toContain("Void Operator");
+  });
+
+  it("logs confirmation message after writing", () => {
+    mockExistsSync.mockReturnValue(false);
+    const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    seedClaudeMd("/some/project");
+
+    expect(consoleSpy).toHaveBeenCalledWith(
+      expect.stringContaining("seeded .claude/CLAUDE.md")
+    );
+    consoleSpy.mockRestore();
+  });
+
+  it("does not log when file already exists", () => {
+    mockExistsSync.mockReturnValue(true);
+    const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+
+    seedClaudeMd("/some/project");
+
+    expect(consoleSpy).not.toHaveBeenCalled();
+    consoleSpy.mockRestore();
+  });
+
+  it("propagates writeFileSync errors", () => {
+    mockExistsSync.mockReturnValue(false);
+    mockWriteFileSync.mockImplementation(() => { throw new Error("EACCES: permission denied"); });
+
+    expect(() => seedClaudeMd("/some/project")).toThrow("EACCES: permission denied");
+  });
+
+  it("propagates mkdirSync errors", () => {
+    mockExistsSync.mockReturnValue(false);
+    mockMkdirSync.mockImplementation(() => { throw new Error("ENOTDIR"); });
+
+    expect(() => seedClaudeMd("/some/project")).toThrow("ENOTDIR");
+  });
+
+  it("uses correct encoding (utf-8) when writing", () => {
+    mockExistsSync.mockReturnValue(false);
+    seedClaudeMd("/some/project");
+    expect(mockWriteFileSync.mock.calls[0][2]).toBe("utf-8");
   });
 });

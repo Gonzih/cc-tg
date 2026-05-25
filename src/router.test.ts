@@ -111,6 +111,32 @@ describe("parseRoutingTag", () => {
   it("returns null for bare # with no following word char", () => {
     expect(parseRoutingTag("hello # world")).toBeNull();
   });
+
+  it("returns null when tag starts with a dash (#-repo is invalid)", () => {
+    // Regex requires [a-zA-Z0-9] as first char after #
+    process.env.DEFAULT_GITHUB_ORG = "gonzih";
+    expect(parseRoutingTag("#-repo fix it")).toBeNull();
+  });
+
+  it("handles repo name with dots and underscores (#org/my_repo.v2)", () => {
+    const result = parseRoutingTag("#gonzih/my_repo.v2 deploy");
+    expect(result).not.toBeNull();
+    expect(result!.namespace).toBe("my_repo.v2");
+    expect(result!.repoUrl).toBe("https://github.com/gonzih/my_repo.v2");
+  });
+
+  it("tag-only message results in empty strippedMessage for #org/repo", () => {
+    const result = parseRoutingTag("#gonzih/cc-agent");
+    expect(result).not.toBeNull();
+    expect(result!.strippedMessage).toBe("");
+  });
+
+  it("strips tag from end of message", () => {
+    process.env.DEFAULT_GITHUB_ORG = "gonzih";
+    const result = parseRoutingTag("fix the bug #cc-agent");
+    expect(result).not.toBeNull();
+    expect(result!.strippedMessage).toBe("fix the bug");
+  });
 });
 
 // ===========================================================================
@@ -138,6 +164,17 @@ describe("routeToMetaAgent", () => {
     const redis = makeRedis();
     await routeToMetaAgent("cc-agent", "", redis);
     expect(mockRpush).not.toHaveBeenCalled();
+  });
+
+  it("logs routing confirmation when message is routed", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    mockRpush.mockResolvedValue(1);
+    const redis = makeRedis();
+
+    await routeToMetaAgent("my-ns", "do the thing", redis);
+
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("routed message to meta-agent namespace=my-ns"));
+    logSpy.mockRestore();
   });
 });
 
@@ -335,5 +372,183 @@ describe("ensureMetaAgent", () => {
     await expect(
       ensureMetaAgent("of-stack", "https://github.com/gonzih/of-stack", callTool, redis)
     ).rejects.toThrow("start_meta_agent failed: git clone failed: repository not found");
+  });
+
+  it("throws with 'unknown error' when ok:false payload has no error field", async () => {
+    mockGet.mockResolvedValueOnce(null); // status key
+    mockGet.mockResolvedValueOnce(null); // state key
+    mockExecSync.mockReturnValue("");
+
+    const callTool = vi.fn().mockResolvedValue(JSON.stringify({ ok: false }));
+    const redis = makeRedis();
+
+    await expect(
+      ensureMetaAgent("ns", "https://github.com/gonzih/ns", callTool, redis)
+    ).rejects.toThrow("start_meta_agent failed: unknown error");
+  });
+
+  it("throws when gh repo create also fails", async () => {
+    mockGet.mockResolvedValueOnce(null); // status key
+    mockGet.mockResolvedValueOnce(null); // state key
+    // gh repo view fails, then gh repo create also fails
+    mockExecSync
+      .mockImplementationOnce(() => { throw new Error("not found"); })
+      .mockImplementationOnce(() => { throw new Error("API rate limit exceeded"); });
+
+    const callTool = vi.fn();
+    const redis = makeRedis();
+
+    await expect(
+      ensureMetaAgent("fail-ns", "https://github.com/gonzih/fail-ns", callTool, redis)
+    ).rejects.toThrow("Failed to create repo gonzih/fail-ns: API rate limit exceeded");
+    expect(callTool).not.toHaveBeenCalled();
+  });
+
+  it("falls through when status key has corrupt JSON (not valid JSON)", async () => {
+    // Corrupt status key → falls through to state key check
+    mockGet.mockResolvedValueOnce("not-valid-json"); // status key corrupt
+    mockGet.mockResolvedValueOnce(null);              // state key absent → proceed
+    // Poll: immediately ready on first tick
+    mockGet.mockResolvedValue(JSON.stringify({ status: "idle" }));
+
+    mockExecSync.mockReturnValue("");
+    const callTool = vi.fn().mockResolvedValue("ok");
+    const redis = makeRedis();
+
+    process.env.META_AGENT_TIMEOUT_MS = "5000";
+    vi.useFakeTimers();
+
+    const promise = ensureMetaAgent("cc-agent", "https://github.com/gonzih/cc-agent", callTool, redis);
+    await vi.advanceTimersByTimeAsync(2000);
+    await promise;
+
+    // Fell through the corrupt status key and proceeded to start_meta_agent
+    expect(callTool).toHaveBeenCalledWith("start_meta_agent", expect.objectContaining({ namespace: "cc-agent" }));
+  });
+
+  it("falls through when state key has corrupt JSON", async () => {
+    mockGet.mockResolvedValueOnce(null);        // status key absent
+    mockGet.mockResolvedValueOnce("bad-json");  // state key corrupt → falls through
+    // Poll resolves immediately
+    mockGet.mockResolvedValue(JSON.stringify({ status: "running" }));
+
+    mockExecSync.mockReturnValue("");
+    const callTool = vi.fn().mockResolvedValue("ok");
+    const redis = makeRedis();
+
+    process.env.META_AGENT_TIMEOUT_MS = "5000";
+    vi.useFakeTimers();
+
+    const promise = ensureMetaAgent("ns2", "https://github.com/gonzih/ns2", callTool, redis);
+    await vi.advanceTimersByTimeAsync(2000);
+    await promise;
+
+    expect(callTool).toHaveBeenCalled();
+  });
+
+  it("logs 'already ready' when status key is running", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    mockGet.mockResolvedValueOnce(JSON.stringify({ status: "running" }));
+    const callTool = vi.fn();
+    const redis = makeRedis();
+
+    await ensureMetaAgent("cc-agent", "https://github.com/gonzih/cc-agent", callTool, redis);
+
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("already ready"));
+    logSpy.mockRestore();
+  });
+
+  it("logs 'workspace exists' when state key is idle", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    mockGet.mockResolvedValueOnce(null);                                 // status key absent
+    mockGet.mockResolvedValueOnce(JSON.stringify({ status: "idle" }));  // state key present
+    const callTool = vi.fn();
+    const redis = makeRedis();
+
+    await ensureMetaAgent("ns", "https://github.com/gonzih/ns", callTool, redis);
+
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("workspace exists"));
+    logSpy.mockRestore();
+  });
+
+  it("logs repo creation when gh repo view fails but create succeeds", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    mockGet.mockResolvedValueOnce(null); // status key
+    mockGet.mockResolvedValueOnce(null); // state key
+    mockGet.mockResolvedValue(JSON.stringify({ status: "running" })); // poll
+
+    mockExecSync
+      .mockImplementationOnce(() => { throw new Error("not found"); })
+      .mockReturnValue("");
+
+    const callTool = vi.fn().mockResolvedValue("ok");
+    const redis = makeRedis();
+
+    process.env.META_AGENT_TIMEOUT_MS = "5000";
+    vi.useFakeTimers();
+
+    const promise = ensureMetaAgent("new-ns", "https://github.com/gonzih/new-ns", callTool, redis);
+    await vi.advanceTimersByTimeAsync(1500);
+    await promise;
+
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("created repo gonzih/new-ns"));
+    logSpy.mockRestore();
+  });
+
+  it("non-JSON plain text result from start_meta_agent does not throw", async () => {
+    // Fast path: both keys absent
+    mockGet.mockResolvedValueOnce(null);
+    mockGet.mockResolvedValueOnce(null);
+    // Poll: idle on first tick
+    mockGet.mockResolvedValue(JSON.stringify({ status: "idle" }));
+
+    mockExecSync.mockReturnValue("");
+    // Plain text (SyntaxError) — should not throw, continue to poll
+    const callTool = vi.fn().mockResolvedValue("ok");
+    const redis = makeRedis();
+
+    process.env.META_AGENT_TIMEOUT_MS = "5000";
+    vi.useFakeTimers();
+
+    const promise = ensureMetaAgent("ns", "https://github.com/gonzih/ns", callTool, redis);
+    await vi.advanceTimersByTimeAsync(2000);
+    await promise;
+
+    expect(callTool).toHaveBeenCalledOnce();
+  });
+});
+
+// ===========================================================================
+// routeToMetaAgent — additional edge cases
+// ===========================================================================
+
+describe("routeToMetaAgent — additional cases", () => {
+  it("routes single-word stripped message", async () => {
+    mockRpush.mockResolvedValue(1);
+    const redis = makeRedis();
+
+    await routeToMetaAgent("ns", "deploy", redis);
+
+    expect(mockRpush).toHaveBeenCalledOnce();
+    const [key, raw] = mockRpush.mock.calls[0] as [string, string];
+    expect(key).toBe("cca:meta:ns:input");
+    const entry = JSON.parse(raw) as { content: string; id: string; timestamp: string };
+    expect(entry.content).toBe("deploy");
+  });
+
+  it("does not route whitespace-only stripped message (empty after trim)", async () => {
+    const redis = makeRedis();
+    // The function only checks `if (!strippedMessage)` — empty string is falsy
+    await routeToMetaAgent("ns", "", redis);
+    expect(mockRpush).not.toHaveBeenCalled();
+  });
+
+  it("timestamp in routed entry is a valid ISO 8601 string", async () => {
+    mockRpush.mockResolvedValue(1);
+    const redis = makeRedis();
+    await routeToMetaAgent("ns", "hello", redis);
+    const raw = (mockRpush.mock.calls[0] as [string, string])[1];
+    const entry = JSON.parse(raw) as { timestamp: string };
+    expect(() => new Date(entry.timestamp).toISOString()).not.toThrow();
   });
 });

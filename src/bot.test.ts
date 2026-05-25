@@ -847,6 +847,30 @@ describe('listSkills', () => {
     readdirMock.mockRestore();
     readFileMock.mockRestore();
   });
+
+  it('returns error message when readdirSync throws', () => {
+    mocks.existsSyncMock.mockReturnValue(true);
+    const readdirMock = vi.spyOn(fsModule, 'readdirSync').mockImplementation(() => {
+      throw new Error('permission denied');
+    });
+    const result = listSkills();
+    expect(result).toBe('Could not read skills directory.');
+    readdirMock.mockRestore();
+  });
+
+  it('lists skill name without description when readFileSync throws for that file', () => {
+    mocks.existsSyncMock.mockReturnValue(true);
+    const readdirMock = vi.spyOn(fsModule, 'readdirSync').mockReturnValue(['broken.md', 'ok.md'] as any);
+    const readFileMock = vi.spyOn(fsModule, 'readFileSync').mockImplementation((path: any) => {
+      if (String(path).includes('broken.md')) throw new Error('read error');
+      return '---\nname: ok\ndescription: Works fine\n---\n';
+    });
+    const result = listSkills();
+    expect(result).toContain('/broken');
+    expect(result).toContain('/ok — Works fine');
+    readdirMock.mockRestore();
+    readFileMock.mockRestore();
+  });
 });
 
 describe('CcTgBot chat bridge', () => {

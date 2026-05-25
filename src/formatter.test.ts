@@ -1,6 +1,9 @@
 import { describe, it, expect } from "vitest";
 import { formatForTelegram, splitLongMessage } from "./formatter.js";
 
+// htmlEscape is not exported but we can verify it through formatForTelegram
+// by passing text that contains HTML special chars outside code blocks.
+
 describe("formatForTelegram", () => {
   describe("headings → bold", () => {
     it("converts ## heading to <b>bold</b>", () => {
@@ -304,5 +307,95 @@ describe("splitLongMessage", () => {
       const closes = (chunk.match(/<\/pre>/g) || []).length;
       expect(opens).toBe(closes);
     }
+  });
+
+  it("splits after a covering <pre> block when all natural boundaries are inside it", () => {
+    // Construct text: a <pre> block that spans maxLen boundary, with no spaces or newlines
+    // outside it within the window — forces the coveringPre branch.
+    const preContent = "y".repeat(2000);
+    const text = `<pre>${preContent}</pre>extra`;
+    // maxLen=100 — the pre block spans [0, 2011], which covers position 100.
+    // No spaces/newlines inside the pre block, so coveringPre branch must fire.
+    const chunks = splitLongMessage(text, 100);
+    expect(chunks.length).toBeGreaterThanOrEqual(1);
+    // The first chunk must end at the close of the <pre> block
+    expect(chunks[0]).toContain("</pre>");
+    // No chunk should have mismatched <pre>/<\/pre> tags
+    for (const chunk of chunks) {
+      const opens = (chunk.match(/<pre>/g) || []).length;
+      const closes = (chunk.match(/<\/pre>/g) || []).length;
+      expect(opens).toBe(closes);
+    }
+  });
+
+  it("hard-splits at maxLen when no boundary and no covering pre block", () => {
+    // Pure run of 'a' with no spaces/newlines/pre — falls to splitAt = maxLen
+    const text = "a".repeat(200);
+    const chunks = splitLongMessage(text, 50);
+    // Every chunk should be at most 50 characters
+    for (const chunk of chunks) {
+      expect(chunk.length).toBeLessThanOrEqual(50);
+    }
+    // Content is fully preserved
+    expect(chunks.join("")).toBe(text);
+  });
+
+  it("produces no trailing empty chunk when remaining is exactly empty after loop", () => {
+    // text length = 2 * maxLen exactly, split at word boundary at maxLen
+    // After slicing off the first half, remaining is exactly the second half with no leftover.
+    const half = "a".repeat(50);
+    const text = `${half} ${half}`;  // 101 chars with space at index 50
+    const chunks = splitLongMessage(text, 51);
+    for (const chunk of chunks) {
+      expect(chunk.length).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe("formatForTelegram — additional edge cases", () => {
+  it("--- in the middle of a sentence is NOT converted (only full-line ---)", () => {
+    // The regex ^-{3,}$ with gm only matches --- on its own line
+    const result = formatForTelegram("before --- after");
+    expect(result).toBe("before --- after");
+  });
+
+  it("longer rule (----) on its own line is also stripped", () => {
+    const result = formatForTelegram("above\n----\nbelow");
+    expect(result).toBe("above\n\nbelow");
+  });
+
+  it("bold spanning a newline is converted (s flag)", () => {
+    const result = formatForTelegram("**hello\nworld**");
+    expect(result).toBe("<b>hello\nworld</b>");
+  });
+
+  it("multiple HTML special chars in the same text", () => {
+    // & < > all in one string
+    const result = formatForTelegram("a & b < c > d");
+    expect(result).toBe("a &amp; b &lt; c &gt; d");
+  });
+
+  it("htmlEscape inside code block does not double-escape", () => {
+    // <pre> content is html-escaped once; the outer text is also html-escaped
+    const input = "```\na & b\n```";
+    const result = formatForTelegram(input);
+    expect(result).toBe("<pre>a &amp; b\n</pre>");
+  });
+
+  it("italic does not fire for snake_case in the middle of a word", () => {
+    expect(formatForTelegram("foo_bar_baz")).toBe("foo_bar_baz");
+  });
+
+  it("italic fires when _ delimiters are at non-word-character boundaries", () => {
+    expect(formatForTelegram("(_italic_)")).toBe("(<i>italic</i>)");
+  });
+
+  it("inline code with < and > escapes them", () => {
+    const result = formatForTelegram("`a < b`");
+    expect(result).toBe("<code>a &lt; b</code>");
+  });
+
+  it("handles empty string input", () => {
+    expect(formatForTelegram("")).toBe("");
   });
 });
