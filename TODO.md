@@ -1,14 +1,12 @@
-# TODO: Protocol Compliance Audit
+# TODO: Error-Handling Test Coverage
 
-- [x] Read all relevant source files and audit against protocol spec
-- [x] Write PLAN.md and TODO.md
-- [ ] Create branch fix/protocol-compliance
-- [ ] Fix ChatMessage id to use crypto.randomUUID() in bot.ts and notifier.ts
-- [ ] Add LIFO ordering comment to writeChatLog() LPUSH in notifier.ts
-- [ ] Fix meta-agent input queue: lpush → rpush + add timing comment in notifier.ts
-- [ ] Add descriptive comment to FLUSH_DELAY_MS in bot.ts
-- [ ] Extract 1500ms to META_AGENT_FLUSH_DELAY_MS constant + add comment in notifier.ts
-- [ ] Add token rotation independence comment to tokens.ts
-- [ ] Create docs/redis-protocol.md
-- [ ] Run build, verify it passes
+- [ ] Create branch feat/error-handling-tests
+- [ ] Read source files (router, voice, cron, notifier, claude)
+- [ ] Write router.ts error path tests
+- [ ] Write voice.ts missing error tests (ffmpeg fail, validation)
+- [ ] Write cron.ts error path tests (persist fail, load fail, console.log)
+- [ ] Write notifier.ts error tests (subscribe errors, sendMessage errors)
+- [ ] Write claude.ts error tests (proc error event, drainBuffer skip)
+- [ ] Run full test suite
+- [ ] Fix any failures
 - [ ] Commit, push, PR, merge, publish
