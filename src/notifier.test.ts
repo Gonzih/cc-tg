@@ -1091,4 +1091,290 @@ describe("writeChatLog", () => {
     expect(mockLtrim).toHaveBeenCalledWith("cca:chat:log:myns", 0, 499);
     expect(mockPublish).toHaveBeenCalledWith("cca:chat:outgoing:myns", JSON.stringify(msg));
   });
+
+  it("logs console.warn when lpush fails", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    mockLpush.mockRejectedValueOnce(new Error("ECONNREFUSED"));
+    const redis = { lpush: mockLpush, ltrim: mockLtrim, publish: mockPublish };
+    const msg: ChatMessage = {
+      id: "2", source: "telegram", role: "user", content: "hi",
+      timestamp: "2026-01-01T00:00:00.000Z", chatId: 42,
+    };
+
+    writeChatLog(redis as never, "ns", msg);
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(warnSpy).toHaveBeenCalledWith("[notifier]", "writeChatLog lpush failed:", "ECONNREFUSED");
+    warnSpy.mockRestore();
+  });
+
+  it("logs console.warn when ltrim fails", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    mockLtrim.mockRejectedValueOnce(new Error("ltrim timeout"));
+    const redis = { lpush: mockLpush, ltrim: mockLtrim, publish: mockPublish };
+    const msg: ChatMessage = {
+      id: "3", source: "telegram", role: "user", content: "hi",
+      timestamp: "2026-01-01T00:00:00.000Z", chatId: 42,
+    };
+
+    writeChatLog(redis as never, "ns", msg);
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(warnSpy).toHaveBeenCalledWith("[notifier]", "writeChatLog ltrim failed:", "ltrim timeout");
+    warnSpy.mockRestore();
+  });
+
+  it("logs console.warn when publish fails", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    mockPublish.mockRejectedValueOnce(new Error("publish error"));
+    const redis = { lpush: mockLpush, ltrim: mockLtrim, publish: mockPublish };
+    const msg: ChatMessage = {
+      id: "4", source: "telegram", role: "user", content: "hi",
+      timestamp: "2026-01-01T00:00:00.000Z", chatId: 42,
+    };
+
+    writeChatLog(redis as never, "ns", msg);
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(warnSpy).toHaveBeenCalledWith("[notifier]", "writeChatLog publish failed:", "publish error");
+    warnSpy.mockRestore();
+  });
+});
+
+describe("subscribe / psubscribe error callbacks", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGet.mockResolvedValue(null);
+    mockRpop.mockResolvedValue(null);
+    const sub = {
+      subscribe: mockSubscribe,
+      psubscribe: mockPsubscribe,
+      on: mockOn,
+      lpush: mockLpush,
+      rpush: mockRpush,
+      ltrim: mockLtrim,
+      publish: mockPublish,
+      get: mockGet,
+    };
+    mockDuplicate.mockReturnValue(sub);
+  });
+
+  it("logs console.error when subscribe callback returns an error", () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    // First subscribe call (notifyChannel) gets an error
+    mockSubscribe.mockImplementationOnce((_channel: string, cb?: (err: Error | null) => void) => {
+      if (cb) cb(new Error("connection refused"));
+      return Promise.resolve(0);
+    });
+
+    const bot = makeBot();
+    const redis = makeRedis();
+    startNotifier(bot as never, 123, "default", redis as never);
+
+    expect(errorSpy).toHaveBeenCalledWith(
+      "[notifier]",
+      "subscribe cca:notify:default failed:",
+      "connection refused"
+    );
+    errorSpy.mockRestore();
+  });
+
+  it("logs console.error when psubscribe callback returns an error", () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    mockPsubscribe.mockImplementationOnce((_pattern: string, cb?: (err: Error | null) => void) => {
+      if (cb) cb(new Error("psubscribe denied"));
+      return Promise.resolve(0);
+    });
+
+    const bot = makeBot();
+    const redis = makeRedis();
+    startNotifier(bot as never, 123, "default", redis as never);
+
+    expect(errorSpy).toHaveBeenCalledWith(
+      "[notifier]",
+      "psubscribe cca:chat:outgoing:* failed:",
+      "psubscribe denied"
+    );
+    errorSpy.mockRestore();
+  });
+
+  it("logs console.warn when subscriber emits an error event", () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let errorHandler: ((err: Error) => void) | undefined;
+    mockOn.mockImplementation((event: string, handler: unknown) => {
+      if (event === "error") errorHandler = handler as (err: Error) => void;
+    });
+
+    const bot = makeBot();
+    const redis = makeRedis();
+    startNotifier(bot as never, 123, "default", redis as never);
+
+    expect(errorHandler).toBeDefined();
+    errorHandler!(new Error("Redis connection lost"));
+
+    expect(warnSpy).toHaveBeenCalledWith("[notifier]", "subscriber error:", "Redis connection lost");
+    warnSpy.mockRestore();
+  });
+});
+
+describe("sendMessage error handling", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    mockGet.mockResolvedValue(null);
+    mockRpop.mockResolvedValue(null);
+    mockLlen.mockResolvedValue(0);
+    const sub = {
+      subscribe: mockSubscribe,
+      psubscribe: mockPsubscribe,
+      on: mockOn,
+      lpush: mockLpush,
+      rpush: mockRpush,
+      ltrim: mockLtrim,
+      publish: mockPublish,
+      get: mockGet,
+    };
+    mockDuplicate.mockReturnValue(sub);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("logs warn when notify channel sendMessage fails", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const bot = makeBot();
+    bot.sendMessage.mockRejectedValueOnce(new Error("Telegram 429"));
+    const redis = makeRedis();
+
+    let messageHandler: ((channel: string, message: string) => void) | undefined;
+    mockOn.mockImplementation((event: string, handler: unknown) => {
+      if (event === "message") messageHandler = handler as typeof messageHandler;
+    });
+
+    startNotifier(bot as never, 999, "notify-err", redis as never);
+    messageHandler!("cca:notify:notify-err", "Job done");
+
+    // Flush the microtask queue so .catch fires
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(warnSpy).toHaveBeenCalledWith("[notifier]", "sendMessage failed:", "Telegram 429");
+  });
+
+  it("logs warn when UI echo sendMessage fails", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const bot = makeBot();
+    bot.sendMessage.mockRejectedValueOnce(new Error("Telegram timeout"));
+    const redis = makeRedis();
+
+    let messageHandler: ((channel: string, message: string) => void) | undefined;
+    mockOn.mockImplementation((event: string, handler: unknown) => {
+      if (event === "message") messageHandler = handler as typeof messageHandler;
+    });
+
+    startNotifier(bot as never, 888, "ui-err", redis as never);
+    messageHandler!("cca:chat:incoming:ui-err", "hello");
+
+    // Flush microtask queue (the .catch fires asynchronously)
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(warnSpy).toHaveBeenCalledWith("[notifier]", "sendMessage (UI echo) failed:", "Telegram timeout");
+  });
+
+  it("logs warn when notify list sendMessage fails", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const bot = makeBot();
+    bot.sendMessage.mockRejectedValue(new Error("rate limited"));
+    const redis = makeRedis();
+
+    mockRpop
+      .mockResolvedValueOnce(JSON.stringify({ text: "Done" }))
+      .mockResolvedValue(null);
+
+    startNotifier(bot as never, 777, "poll-err", redis as never);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(warnSpy).toHaveBeenCalledWith("[notifier]", "notify list sendMessage failed:", "rate limited");
+  });
+
+  it("logs warn when llen fails after draining 20 items", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const bot = makeBot();
+    const redis = makeRedis();
+
+    // Fill exactly 20 items so llen is called
+    const items = Array.from({ length: 20 }, () => JSON.stringify({ text: "msg" }));
+    mockRpop.mockImplementation(() => {
+      const item = items.shift();
+      return Promise.resolve(item ?? null);
+    });
+    mockLlen.mockRejectedValueOnce(new Error("llen failed"));
+
+    startNotifier(bot as never, 111, "llen-err", redis as never);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(warnSpy).toHaveBeenCalledWith("[notifier]", "notify list llen failed:", "llen failed");
+  });
+
+  it("logs warn when summary sendMessage fails (overflow path)", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const bot = makeBot();
+    // First 20 sendMessages succeed, the summary fails
+    bot.sendMessage
+      .mockResolvedValue({}) // regular messages ok
+      .mockRejectedValueOnce(new Error("summary rate limit")); // summary fails
+    // Actually sendMessage is called in order, so summary is call #21
+    // Re-mock: first 20 succeed, 21st (summary) fails
+    bot.sendMessage.mockReset();
+    bot.sendMessage.mockImplementation((_chatId: unknown, text: unknown) => {
+      if (typeof text === "string" && text.includes("more notifications")) {
+        return Promise.reject(new Error("summary rate limit"));
+      }
+      return Promise.resolve({});
+    });
+    const redis = makeRedis();
+
+    const items = Array.from({ length: 20 }, () => JSON.stringify({ text: "msg" }));
+    mockRpop.mockImplementation(() => {
+      const item = items.shift();
+      return Promise.resolve(item ?? null);
+    });
+    mockLlen.mockResolvedValue(5);
+
+    startNotifier(bot as never, 222, "summary-err", redis as never);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(warnSpy).toHaveBeenCalledWith("[notifier]", "notify list summary sendMessage failed:", "summary rate limit");
+  });
+
+  it("logs warn when flushMetaAgentBuffer sendMessage fails", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const bot = makeBot();
+    bot.sendMessage.mockRejectedValue(new Error("flush failed"));
+    const redis = makeRedis();
+
+    let pmessageHandler: ((pattern: string, channel: string, message: string) => void) | undefined;
+    mockOn.mockImplementation((event: string, handler: unknown) => {
+      if (event === "pmessage") pmessageHandler = handler as typeof pmessageHandler;
+    });
+
+    startNotifier(bot as never, 333, "flush-err", redis as never);
+
+    pmessageHandler!("cca:chat:outgoing:*", "cca:chat:outgoing:flush-err",
+      JSON.stringify({ source: "claude", content: "hello from meta-agent" }));
+
+    await vi.advanceTimersByTimeAsync(1500);
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      "[notifier]",
+      "meta-agent flush sendMessage failed (ns=flush-err):",
+      "flush failed"
+    );
+  });
 });

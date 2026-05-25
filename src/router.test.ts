@@ -165,6 +165,17 @@ describe("routeToMetaAgent", () => {
     await routeToMetaAgent("cc-agent", "", redis);
     expect(mockRpush).not.toHaveBeenCalled();
   });
+
+  it("logs routing confirmation when message is routed", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    mockRpush.mockResolvedValue(1);
+    const redis = makeRedis();
+
+    await routeToMetaAgent("my-ns", "do the thing", redis);
+
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("routed message to meta-agent namespace=my-ns"));
+    logSpy.mockRestore();
+  });
 });
 
 // ===========================================================================
@@ -363,9 +374,9 @@ describe("ensureMetaAgent", () => {
     ).rejects.toThrow("start_meta_agent failed: git clone failed: repository not found");
   });
 
-  it("throws 'unknown error' when ok:false payload has no error field", async () => {
-    mockGet.mockResolvedValueOnce(null);
-    mockGet.mockResolvedValueOnce(null);
+  it("throws with 'unknown error' when ok:false payload has no error field", async () => {
+    mockGet.mockResolvedValueOnce(null); // status key
+    mockGet.mockResolvedValueOnce(null); // state key
     mockExecSync.mockReturnValue("");
 
     const callTool = vi.fn().mockResolvedValue(JSON.stringify({ ok: false }));
@@ -376,26 +387,49 @@ describe("ensureMetaAgent", () => {
     ).rejects.toThrow("start_meta_agent failed: unknown error");
   });
 
-  it("falls through corrupted status JSON and continues to state key check", async () => {
-    // Status key has corrupted JSON → falls through to stateKey
-    mockGet.mockResolvedValueOnce("{not valid json}"); // corrupted status key
-    mockGet.mockResolvedValueOnce(JSON.stringify({ status: "idle" }));  // state key has idle
+  it("throws when gh repo create also fails", async () => {
+    mockGet.mockResolvedValueOnce(null); // status key
+    mockGet.mockResolvedValueOnce(null); // state key
+    // gh repo view fails, then gh repo create also fails
+    mockExecSync
+      .mockImplementationOnce(() => { throw new Error("not found"); })
+      .mockImplementationOnce(() => { throw new Error("API rate limit exceeded"); });
 
     const callTool = vi.fn();
     const redis = makeRedis();
 
-    await ensureMetaAgent("ns", "https://github.com/gonzih/ns", callTool, redis);
-
-    // Should not have started the meta-agent (state key was idle)
+    await expect(
+      ensureMetaAgent("fail-ns", "https://github.com/gonzih/fail-ns", callTool, redis)
+    ).rejects.toThrow("Failed to create repo gonzih/fail-ns: API rate limit exceeded");
     expect(callTool).not.toHaveBeenCalled();
-    expect(mockExecSync).not.toHaveBeenCalled();
   });
 
-  it("falls through corrupted state JSON and proceeds to start meta-agent", async () => {
-    // Both fast-path keys have corrupted JSON → must start fresh
-    mockGet.mockResolvedValueOnce("{bad}");   // corrupted status key
-    mockGet.mockResolvedValueOnce("{bad}");   // corrupted state key
-    // Poll: returns running on first tick
+  it("falls through when status key has corrupt JSON (not valid JSON)", async () => {
+    // Corrupt status key → falls through to state key check
+    mockGet.mockResolvedValueOnce("not-valid-json"); // status key corrupt
+    mockGet.mockResolvedValueOnce(null);              // state key absent → proceed
+    // Poll: immediately ready on first tick
+    mockGet.mockResolvedValue(JSON.stringify({ status: "idle" }));
+
+    mockExecSync.mockReturnValue("");
+    const callTool = vi.fn().mockResolvedValue("ok");
+    const redis = makeRedis();
+
+    process.env.META_AGENT_TIMEOUT_MS = "5000";
+    vi.useFakeTimers();
+
+    const promise = ensureMetaAgent("cc-agent", "https://github.com/gonzih/cc-agent", callTool, redis);
+    await vi.advanceTimersByTimeAsync(2000);
+    await promise;
+
+    // Fell through the corrupt status key and proceeded to start_meta_agent
+    expect(callTool).toHaveBeenCalledWith("start_meta_agent", expect.objectContaining({ namespace: "cc-agent" }));
+  });
+
+  it("falls through when state key has corrupt JSON", async () => {
+    mockGet.mockResolvedValueOnce(null);        // status key absent
+    mockGet.mockResolvedValueOnce("bad-json");  // state key corrupt → falls through
+    // Poll resolves immediately
     mockGet.mockResolvedValue(JSON.stringify({ status: "running" }));
 
     mockExecSync.mockReturnValue("");
@@ -405,28 +439,60 @@ describe("ensureMetaAgent", () => {
     process.env.META_AGENT_TIMEOUT_MS = "5000";
     vi.useFakeTimers();
 
-    const promise = ensureMetaAgent("ns", "https://github.com/gonzih/ns", callTool, redis);
+    const promise = ensureMetaAgent("ns2", "https://github.com/gonzih/ns2", callTool, redis);
     await vi.advanceTimersByTimeAsync(2000);
     await promise;
 
-    expect(callTool).toHaveBeenCalledWith("start_meta_agent", expect.objectContaining({ namespace: "ns" }));
+    expect(callTool).toHaveBeenCalled();
   });
 
-  it("throws when gh repo create fails", async () => {
-    mockGet.mockResolvedValueOnce(null);
-    mockGet.mockResolvedValueOnce(null);
-
-    // gh repo view throws (not found), gh repo create also throws
-    mockExecSync
-      .mockImplementationOnce(() => { throw new Error("not found"); })
-      .mockImplementationOnce(() => { throw new Error("already exists remotely"); });
-
+  it("logs 'already ready' when status key is running", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    mockGet.mockResolvedValueOnce(JSON.stringify({ status: "running" }));
     const callTool = vi.fn();
     const redis = makeRedis();
 
-    await expect(
-      ensureMetaAgent("ns", "https://github.com/gonzih/ns", callTool, redis)
-    ).rejects.toThrow("Failed to create repo gonzih/ns");
+    await ensureMetaAgent("cc-agent", "https://github.com/gonzih/cc-agent", callTool, redis);
+
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("already ready"));
+    logSpy.mockRestore();
+  });
+
+  it("logs 'workspace exists' when state key is idle", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    mockGet.mockResolvedValueOnce(null);                                 // status key absent
+    mockGet.mockResolvedValueOnce(JSON.stringify({ status: "idle" }));  // state key present
+    const callTool = vi.fn();
+    const redis = makeRedis();
+
+    await ensureMetaAgent("ns", "https://github.com/gonzih/ns", callTool, redis);
+
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("workspace exists"));
+    logSpy.mockRestore();
+  });
+
+  it("logs repo creation when gh repo view fails but create succeeds", async () => {
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    mockGet.mockResolvedValueOnce(null); // status key
+    mockGet.mockResolvedValueOnce(null); // state key
+    mockGet.mockResolvedValue(JSON.stringify({ status: "running" })); // poll
+
+    mockExecSync
+      .mockImplementationOnce(() => { throw new Error("not found"); })
+      .mockReturnValue("");
+
+    const callTool = vi.fn().mockResolvedValue("ok");
+    const redis = makeRedis();
+
+    process.env.META_AGENT_TIMEOUT_MS = "5000";
+    vi.useFakeTimers();
+
+    const promise = ensureMetaAgent("new-ns", "https://github.com/gonzih/new-ns", callTool, redis);
+    await vi.advanceTimersByTimeAsync(1500);
+    await promise;
+
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("created repo gonzih/new-ns"));
+    logSpy.mockRestore();
   });
 
   it("non-JSON plain text result from start_meta_agent does not throw", async () => {

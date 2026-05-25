@@ -359,8 +359,26 @@ describe('transcribeVoice', () => {
       );
     });
 
+    it('uses -l auto for a non-.en model', async () => {
+      // Override existsSync so only the second model (ggml-small.bin — no ".en.") is found
+      const NON_EN_MODEL = '/opt/homebrew/share/whisper-cpp/ggml-small.bin';
+      mocks.existsSyncMock.mockImplementation((p: string) => {
+        if (p === WHISPER_PATH) return true;
+        if (p === FFMPEG_PATH) return true;
+        if (p === NON_EN_MODEL) return true;
+        return false;
+      });
+
+      setupHttpsDownload();
+      await transcribeVoice('https://example.com/voice.ogg');
+
+      const [, args] = mocks.execFileAsyncMock.mock.calls[1] as [string, string[]];
+      const lIdx = args.indexOf('-l');
+      expect(lIdx).toBeGreaterThan(-1);
+      expect(args[lIdx + 1]).toBe('auto');
+    });
+
     it('uses http module for http:// URLs (not https)', async () => {
-      // Set up http download mock
       const fileStream = makeWriteStream();
       mocks.createWriteStreamMock.mockReturnValue(fileStream);
 
@@ -386,72 +404,54 @@ describe('transcribeVoice', () => {
       expect(mocks.httpsGetMock).not.toHaveBeenCalled();
     });
 
-    it('propagates network request-level errors', async () => {
+    it('rejects when the HTTP request itself emits a network error', async () => {
       const fileStream = makeWriteStream();
       mocks.createWriteStreamMock.mockReturnValue(fileStream);
 
-      const mockRequest = {
+      // Mock the request object to capture the error handler and trigger it
+      let errorHandler: ((err: Error) => void) | undefined;
+      const mockReq = {
         on: vi.fn((event: string, cb: (err: Error) => void) => {
-          if (event === 'error') {
-            Promise.resolve().then(() => cb(new Error('ECONNREFUSED')));
-          }
-          return mockRequest;
+          if (event === 'error') errorHandler = cb;
+          return mockReq;
         }),
       };
-      mocks.httpsGetMock.mockReturnValue(mockRequest);
+
+      mocks.httpsGetMock.mockImplementation((_url: string, _cb: unknown) => {
+        // Don't call _cb — network never connects
+        return mockReq;
+      });
+
+      const promise = transcribeVoice('https://example.com/voice.ogg');
+
+      // Trigger the network error
+      expect(errorHandler).toBeDefined();
+      errorHandler!(new Error('ECONNRESET'));
+
+      await expect(promise).rejects.toThrow('ECONNRESET');
+    });
+
+    it('rejects when the download write stream emits an error', async () => {
+      const fileStream = makeWriteStream();
+      mocks.createWriteStreamMock.mockReturnValue(fileStream);
+
+      const mockRequest = { on: vi.fn().mockReturnThis() };
+      mocks.httpsGetMock.mockImplementation((_url: string, cb: (res: unknown) => void) => {
+        const res = {
+          statusCode: 200,
+          pipe: vi.fn((dest: ReturnType<typeof makeWriteStream>) => {
+            // Trigger write stream error
+            Promise.resolve().then(() => dest._emit('error', new Error('ENOSPC: no space left')));
+            return dest;
+          }),
+        };
+        cb(res);
+        return mockRequest;
+      });
 
       await expect(transcribeVoice('https://example.com/voice.ogg'))
-        .rejects.toThrow('ECONNREFUSED');
+        .rejects.toThrow('ENOSPC: no space left');
     });
-  });
-});
-
-describe('transcribeVoice — non-.en. model uses -l auto', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    mocks.unlinkMock.mockResolvedValue(undefined);
-    mocks.readFileMock.mockResolvedValue('transcribed');
-    mocks.execFileAsyncMock.mockResolvedValue({ stdout: '', stderr: '' });
-
-    // Make whisper available but use a non-.en. model (ggml-small.bin)
-    const WHISPER_PATH = '/opt/homebrew/bin/whisper-cli';
-    const FFMPEG_PATH  = '/opt/homebrew/bin/ffmpeg';
-    const NON_EN_MODEL = '/opt/homebrew/share/whisper-cpp/ggml-small.bin';
-
-    mocks.existsSyncMock.mockImplementation((p: string) => {
-      if (p === WHISPER_PATH) return true;
-      if (p === FFMPEG_PATH) return true;
-      if (p === NON_EN_MODEL) return true;
-      return false;
-    });
-  });
-
-  function setupHttpsDownloadLocal(statusCode = 200) {
-    const fileStream = makeWriteStream();
-    mocks.createWriteStreamMock.mockReturnValue(fileStream);
-    const mockRequest = { on: vi.fn().mockReturnThis() };
-    mocks.httpsGetMock.mockImplementation((_url: string, cb: (res: unknown) => void) => {
-      const res = {
-        statusCode,
-        pipe: vi.fn((dest: ReturnType<typeof makeWriteStream>) => {
-          if (statusCode === 200) Promise.resolve().then(() => dest._emit('finish'));
-          return dest;
-        }),
-      };
-      cb(res);
-      return mockRequest;
-    });
-    return fileStream;
-  }
-
-  it('uses -l auto for model without .en. in path', async () => {
-    setupHttpsDownloadLocal();
-    await transcribeVoice('https://example.com/voice.ogg');
-
-    const [, args] = mocks.execFileAsyncMock.mock.calls[1] as [string, string[]];
-    const lIdx = args.indexOf('-l');
-    expect(lIdx).toBeGreaterThan(-1);
-    expect(args[lIdx + 1]).toBe('auto');
   });
 });
 

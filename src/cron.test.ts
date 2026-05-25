@@ -345,3 +345,104 @@ describe('CronManager.parseSchedule — additional edge cases', () => {
     expect(CronManager.parseSchedule('every 1.5h')).toBeNull();
   });
 });
+
+describe('CronManager error handling and logging', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it('logs console.error when writeFileSync throws during persist', () => {
+    vi.mocked(writeFileSync).mockImplementationOnce(() => {
+      throw new Error('EACCES: permission denied');
+    });
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    vi.useFakeTimers();
+    const manager = new CronManager('/tmp/test-persist-err', vi.fn());
+    manager.add(42, 'every 1h', 'task'); // triggers persist
+
+    expect(consoleSpy).toHaveBeenCalledWith('[cron] persist error:', 'EACCES: permission denied');
+    manager.clearAll(42);
+  });
+
+  it('logs console.error when readFileSync throws during load', () => {
+    vi.mocked(existsSync).mockReturnValueOnce(true); // storePath exists
+    vi.mocked(readFileSync).mockImplementationOnce(() => {
+      throw new Error('ENOENT: no such file');
+    });
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    vi.useFakeTimers();
+    new CronManager('/tmp/test-load-throw', vi.fn());
+
+    expect(consoleSpy).toHaveBeenCalledWith('[cron] load error:', 'ENOENT: no such file');
+  });
+
+  it('logs console.error when stored JSON is corrupt during load', () => {
+    vi.mocked(existsSync).mockReturnValueOnce(true);
+    vi.mocked(readFileSync).mockReturnValueOnce('{{invalid-json}}');
+    const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    vi.useFakeTimers();
+    new CronManager('/tmp/test-corrupt-json', vi.fn());
+
+    expect(consoleSpy).toHaveBeenCalledWith('[cron] load error:', expect.any(String));
+  });
+
+  it('logs console.log with job count when jobs are loaded from disk', () => {
+    vi.mocked(existsSync).mockReturnValueOnce(true);
+    const jobs: CronJob[] = [
+      {
+        id: 'job1',
+        chatId: 42,
+        intervalMs: 60_000,
+        prompt: 'ping',
+        schedule: 'every 1m',
+        createdAt: new Date().toISOString(),
+      },
+    ];
+    vi.mocked(readFileSync).mockReturnValueOnce(JSON.stringify(jobs));
+    const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    vi.useFakeTimers();
+    const manager = new CronManager('/tmp/test-loaded', vi.fn());
+
+    expect(consoleSpy).toHaveBeenCalledWith('[cron] loaded 1 jobs from disk');
+
+    // Clean up the loaded timer
+    manager.clearAll(42);
+  });
+
+  it('logs "skipping tick" when previous task is still running (add path)', () => {
+    const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.useFakeTimers();
+    const manager = new CronManager('/tmp/test-skip', vi.fn()); // fire callback never calls done
+    manager.add(42, 'every 1m', 'slow-task');
+
+    vi.advanceTimersByTime(60_000); // first tick: fires (done not called)
+    vi.advanceTimersByTime(60_000); // second tick: skipped
+
+    expect(consoleSpy).toHaveBeenCalledWith(
+      expect.stringMatching(/\[cron:.*\] skipping tick — previous task still running/)
+    );
+
+    manager.clearAll(42);
+  });
+
+  it('logs "firing" message when a job fires', () => {
+    const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.useFakeTimers();
+    const fireCallback = vi.fn((_chatId, _prompt, _jobId, done) => done());
+    const manager = new CronManager('/tmp/test-fire-log', fireCallback);
+    manager.add(42, 'every 1m', 'my-task');
+
+    vi.advanceTimersByTime(60_000);
+
+    expect(consoleSpy).toHaveBeenCalledWith(
+      expect.stringMatching(/\[cron:.*\] firing for chat=42 prompt="my-task"/)
+    );
+
+    manager.clearAll(42);
+  });
+});
