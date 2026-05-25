@@ -1,51 +1,47 @@
-# Plan: Hashtag Meta-Agent Routing
+# Plan: Integration & E2E Tests for Uncovered Branches
 
 ## Task restatement
 
-When a Telegram user sends a message containing `#tag` or `#org/repo`, route it to the
-corresponding cc-agent meta-agent instead of the local Claude session. Auto-create the
-GitHub repo and start the meta-agent if not already running. Reply immediately with
-`→ #namespace` so the user knows the message was delegated.
+Write integration and end-to-end tests covering uncovered controller/API endpoint branches,
+request/response handling, and error scenarios. Ensure all HTTP methods and status codes
+are tested (Telegram sendMessage, sendDocument, etc.).
 
-## Approach options
+## Approach
 
-### A. Redis-only approach
-Skip MCP tools entirely. Check `cca:meta-agent:status:{namespace}` directly, use `spawn_agent`
-MCP tool to start, RPUSH to `cca:meta:{namespace}:input` to send.
-- Pro: Known working tools, consistent with notifier.ts patterns
-- Con: `spawn_agent` requires a `task` string — unclear what task makes a "meta-agent"
+Write two new test files using the established vitest + hoisted mocks pattern:
 
-### B. MCP tool approach (spec-faithful)
-Call `start_meta_agent` and `message_meta_agent` via `callCcAgentTool`, check status via Redis.
-- Pro: Follows task spec, clean separation of concerns
-- Con: These tools may not exist in current cc-agent, returns null on failure
+### File 1: `src/bot.error.test.ts`
+Tests for error branches and edge cases in CcTgBot:
+- Telegram API error recovery (sendMessage throws → HTML→plain retry)
+- Claude process error event → sends error message to chat
+- Unauthorized user → "Not authorized." reply
+- Group chat filtering: allowlist, mention, reply-to-bot
+- Hashtag routing error → error reply sent to user
+- Forum topic routing via topicNameCache
+- forwardNotification with active session, exited session, no session
+- handleUserMessage error path (session.claude.exited)
+- Voice message: Redis rpush/lrem, whisper error paths (HTTP, missing model)
+- File upload: sendDocument throws (logged, does not crash), statSync race
+- CostStore: corrupt JSON silently degrades, missing directory is created
+- getLastActiveChatId tracking
+- /voice_retry: no redis, deduplication, stale purge, expired file_id cleanup
 
-### C. Hybrid (chosen)
-- Check Redis for `cca:meta-agent:status:{namespace}` directly (known-working pattern from notifier.ts)
-- Call `callCcAgentTool("start_meta_agent", {namespace, repo_url})` to start — throw on null
-- Route messages via Redis RPUSH to `cca:meta:{namespace}:input` (known-working pattern)
-- Use `execSync` for `gh` repo verification/creation (same pattern as bot.ts)
-
-**Why this:** Stays consistent with existing code patterns, is spec-faithful for the start mechanism,
-and uses the reliable Redis RPUSH that notifier.ts already does for routing.
+### File 2: `src/notifier.error.test.ts`  
+Tests for notifier error branches:
+- parseNotification: JSON with text/driver/model/cost, plain string, malformed
+- notify channel subscribe error logged
+- pmessage handler: non-JSON skipped, wrong source skipped, no chatId dropped
+- pmessage debounce buffer accumulation and flush
+- registerRoutedChatId: per-namespace routing wins over global chatId
+- Notify LIST polling: forwardNotification called, overflow "...and N more" message
+- forwardNotification: sendMessage failure logged, not thrown
+- writeChatLog: fire-and-forget (lpush fail doesn't propagate)
 
 ## Files to touch
-
-- `src/router.ts` — new: parseRoutingTag, ensureMetaAgent, routeToMetaAgent
-- `src/router.test.ts` — new: unit tests
-- `src/bot.ts` — add routing check in handleTelegram() before getOrCreateSession()
+- `src/bot.error.test.ts` — new
+- `src/notifier.error.test.ts` — new
 
 ## Risks
-
-- `start_meta_agent` MCP tool may not exist → error surfaced to user with clear message
-- `gh` CLI may not be installed in the runtime environment → execSync throws, caught and re-thrown
-- strippedMessage may be empty if user sends only `#tag` → routeToMetaAgent is skipped, ensureMetaAgent still runs
-- Regex `#org/repo` might greedily match inside URLs → acceptable; Telegram plain text rarely embeds bare URLs with hash routing syntax
-
-## Key decisions
-
-- Tag parsed anywhere in message (not just start), first match wins
-- Strip tag + normalize whitespace before forwarding
-- If Redis not configured, skip routing entirely (fall through to local Claude)
-- Route BEFORE getOrCreateSession (skips local Claude session entirely)
-- Log the user message to chat log as "user"/"telegram" before routing
+- Some internal methods are private — accessed via `(bot as any).method()`
+- Redis mock must be set up carefully to avoid interference between tests
+- Fake timers needed for debounce/interval tests
