@@ -249,7 +249,7 @@ describe("startNotifier", () => {
       }
     });
 
-    startNotifier(bot as never, null, "dyn", redis as never, handleUserMessage, getActiveChatId);
+    startNotifier(bot as never, null, "dyn", redis as never, handleUserMessage, undefined, getActiveChatId);
 
     messageHandler!("cca:chat:incoming:dyn", "hello dynamic");
 
@@ -371,12 +371,58 @@ describe("startNotifier", () => {
       }
     });
 
-    startNotifier(bot as never, null, "dyn", redis as never, handleUserMessage, getActiveChatId);
+    startNotifier(bot as never, null, "dyn", redis as never, handleUserMessage, undefined, getActiveChatId);
 
     messageHandler!("cca:chat:incoming:dyn", "orphaned message");
 
     expect(bot.sendMessage).not.toHaveBeenCalled();
     expect(handleUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("forwardNotification is called for notify pub/sub, handleUserMessage is NOT called", () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+    const handleUserMessage = vi.fn();
+    const forwardNotification = vi.fn();
+
+    let messageHandler: ((channel: string, message: string) => void) | undefined;
+    mockOn.mockImplementation((event: string, handler: unknown) => {
+      if (event === "message") {
+        messageHandler = handler as (channel: string, message: string) => void;
+      }
+    });
+
+    startNotifier(bot as never, 500, "testns", redis as never, handleUserMessage, forwardNotification);
+
+    messageHandler!("cca:notify:testns", "job finished");
+
+    expect(bot.sendMessage).toHaveBeenCalledWith(500, "job finished");
+    expect(forwardNotification).toHaveBeenCalledWith(500, "job finished");
+    expect(handleUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("handleUserMessage is still called for cca:chat:incoming (unchanged)", async () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+    const handleUserMessage = vi.fn();
+    const forwardNotification = vi.fn();
+
+    let messageHandler: ((channel: string, message: string) => void) | undefined;
+    mockOn.mockImplementation((event: string, handler: unknown) => {
+      if (event === "message") {
+        messageHandler = handler as (channel: string, message: string) => void;
+      }
+    });
+
+    startNotifier(bot as never, 600, "testns2", redis as never, handleUserMessage, forwardNotification);
+
+    messageHandler!("cca:chat:incoming:testns2", "hello from UI");
+
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(bot.sendMessage).toHaveBeenCalledWith(600, "📱 [from UI]: hello from UI");
+    expect(handleUserMessage).toHaveBeenCalledWith(600, "hello from UI");
+    expect(forwardNotification).not.toHaveBeenCalled();
   });
 });
 
@@ -520,7 +566,7 @@ describe("meta-agent outgoing (pmessage)", () => {
     const getActiveChatId = vi.fn().mockReturnValue(77);
     const pmessage = capturePmessageHandler();
 
-    startNotifier(bot as never, null, "ns", redis as never, undefined, getActiveChatId);
+    startNotifier(bot as never, null, "ns", redis as never, undefined, undefined, getActiveChatId);
 
     pmessage("cca:chat:outgoing:*", "cca:chat:outgoing:ns",
       JSON.stringify({ source: "claude", content: "dynamic chat" }));
@@ -536,7 +582,7 @@ describe("meta-agent outgoing (pmessage)", () => {
     const getActiveChatId = vi.fn().mockReturnValue(undefined);
     const pmessage = capturePmessageHandler();
 
-    startNotifier(bot as never, null, "ns", redis as never, undefined, getActiveChatId);
+    startNotifier(bot as never, null, "ns", redis as never, undefined, undefined, getActiveChatId);
 
     pmessage("cca:chat:outgoing:*", "cca:chat:outgoing:ns",
       JSON.stringify({ source: "claude", content: "orphaned" }));
@@ -637,7 +683,7 @@ describe("meta-agent outgoing (pmessage)", () => {
       const getActiveChatId = vi.fn().mockReturnValue(555);
       const pmessage = capturePmessageHandler();
 
-      const notifier = startNotifier(bot as never, null, "money-brain", redis as never, undefined, getActiveChatId);
+      const notifier = startNotifier(bot as never, null, "money-brain", redis as never, undefined, undefined, getActiveChatId);
       // Register for a different namespace — of-stack not registered
       notifier.registerRoutedChatId("other-ns", 999);
 
@@ -784,7 +830,7 @@ describe("notify list poller", () => {
 
     mockRpop.mockResolvedValueOnce(JSON.stringify({ text: "hello" })).mockResolvedValue(null);
 
-    startNotifier(bot as never, null, "ns-noid", redis as never, undefined, () => undefined);
+    startNotifier(bot as never, null, "ns-noid", redis as never, undefined, undefined, () => undefined);
 
     await vi.advanceTimersByTimeAsync(5_000);
 
@@ -799,32 +845,34 @@ describe("notify list poller", () => {
       .mockResolvedValueOnce(JSON.stringify({ text: "dynamic notify" }))
       .mockResolvedValue(null);
 
-    startNotifier(bot as never, null, "ns-dynamic", redis as never, undefined, () => 42);
+    startNotifier(bot as never, null, "ns-dynamic", redis as never, undefined, undefined, () => 42);
 
     await vi.advanceTimersByTimeAsync(5_000);
 
     expect(bot.sendMessage).toHaveBeenCalledWith(42, "dynamic notify");
   });
 
-  it("calls handleUserMessage for each polled notify item", async () => {
+  it("calls forwardNotification (not handleUserMessage) for each polled notify item", async () => {
     const bot = makeBot();
     const redis = makeRedis();
     const handleUserMessage = vi.fn();
+    const forwardNotification = vi.fn();
 
     mockRpop
       .mockResolvedValueOnce(JSON.stringify({ text: "Task complete" }))
       .mockResolvedValueOnce(JSON.stringify({ text: "Another job done" }))
       .mockResolvedValue(null);
 
-    startNotifier(bot as never, 555, "ns-hum", redis as never, handleUserMessage);
+    startNotifier(bot as never, 555, "ns-hum", redis as never, handleUserMessage, forwardNotification);
 
     await vi.advanceTimersByTimeAsync(5_000);
 
     expect(bot.sendMessage).toHaveBeenCalledWith(555, "Task complete");
     expect(bot.sendMessage).toHaveBeenCalledWith(555, "Another job done");
-    expect(handleUserMessage).toHaveBeenCalledWith(555, "Task complete");
-    expect(handleUserMessage).toHaveBeenCalledWith(555, "Another job done");
-    expect(handleUserMessage).toHaveBeenCalledTimes(2);
+    expect(forwardNotification).toHaveBeenCalledWith(555, "Task complete");
+    expect(forwardNotification).toHaveBeenCalledWith(555, "Another job done");
+    expect(forwardNotification).toHaveBeenCalledTimes(2);
+    expect(handleUserMessage).not.toHaveBeenCalled();
   });
 
   it("does not call handleUserMessage when it is undefined (poll path)", async () => {
@@ -853,6 +901,21 @@ describe("notify list poller", () => {
     await vi.advanceTimersByTimeAsync(5_000);
 
     expect(bot.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("does not call forwardNotification when it is undefined (poll path)", async () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+
+    mockRpop
+      .mockResolvedValueOnce(JSON.stringify({ text: "Silent notify" }))
+      .mockResolvedValue(null);
+
+    // No forwardNotification — should not throw
+    startNotifier(bot as never, 555, "ns-nofwd", redis as never);
+
+    await expect(vi.advanceTimersByTimeAsync(5_000)).resolves.not.toThrow();
+    expect(bot.sendMessage).toHaveBeenCalledWith(555, "Silent notify");
   });
 });
 
@@ -926,10 +989,11 @@ describe("parseNotification", () => {
     expect(parseNotification(JSON.stringify({ foo: "bar" }))).toBe(JSON.stringify({ foo: "bar" }));
   });
 
-  it("pub/sub handler calls handleUserMessage with same text sent to Telegram", () => {
+  it("pub/sub handler calls forwardNotification (not handleUserMessage) with same text sent to Telegram", () => {
     const bot = makeBot();
     const redis = makeRedis();
     const handleUserMessage = vi.fn();
+    const forwardNotification = vi.fn();
 
     let messageHandler: ((channel: string, message: string) => void) | undefined;
     mockOn.mockImplementation((event: string, handler: unknown) => {
@@ -938,11 +1002,12 @@ describe("parseNotification", () => {
       }
     });
 
-    startNotifier(bot as never, 456, "myns", redis as never, handleUserMessage);
+    startNotifier(bot as never, 456, "myns", redis as never, handleUserMessage, forwardNotification);
 
     messageHandler!("cca:notify:myns", "Job done: my-task");
     expect(bot.sendMessage).toHaveBeenCalledWith(456, "Job done: my-task");
-    expect(handleUserMessage).toHaveBeenCalledWith(456, "Job done: my-task");
+    expect(forwardNotification).toHaveBeenCalledWith(456, "Job done: my-task");
+    expect(handleUserMessage).not.toHaveBeenCalled();
   });
 
   it("pub/sub handler does not call handleUserMessage when it is undefined", () => {

@@ -133,8 +133,9 @@ export interface NotifierHandle {
  * @param chatId    - Telegram chat ID to forward notifications to. Pass null to use getActiveChatId.
  * @param namespace - cc-agent namespace (used to build Redis channel names)
  * @param redis     - ioredis client in normal mode (will be duplicated for pub/sub)
- * @param handleUserMessage - Optional callback to feed UI messages into the active Claude session
- * @param getActiveChatId   - Optional callback to resolve chatId dynamically (used when chatId is null)
+ * @param handleUserMessage    - Optional callback to feed UI messages into the active Claude session
+ * @param forwardNotification  - Optional callback to forward job notifications to an existing Claude session only (no session creation)
+ * @param getActiveChatId      - Optional callback to resolve chatId dynamically (used when chatId is null)
  *
  * @returns NotifierHandle with registerRoutedChatId for per-namespace response routing
  */
@@ -144,6 +145,7 @@ export function startNotifier(
   namespace: string,
   redis: Redis,
   handleUserMessage?: (chatId: number, text: string) => void,
+  forwardNotification?: (chatId: number, text: string) => void,
   getActiveChatId?: () => number | undefined
 ): NotifierHandle {
   // Per-namespace chatId registry: when a message is routed to a non-default namespace,
@@ -286,8 +288,8 @@ export function startNotifier(
       bot.sendMessage(targetId, text).catch((err: Error) => {
         log("warn", "notify list sendMessage failed:", err.message);
       });
-      if (handleUserMessage) {
-        handleUserMessage(targetId, text);
+      if (forwardNotification) {
+        forwardNotification(targetId, text);
       }
     }
 
@@ -313,8 +315,8 @@ export function startNotifier(
         bot.sendMessage(targetId, text).catch((err: Error) => {
           log("warn", "sendMessage failed:", err.message);
         });
-        if (handleUserMessage) {
-          handleUserMessage(targetId, text);
+        if (forwardNotification) {
+          forwardNotification(targetId, text);
         }
       } else {
         log("warn", "notify: no chatId available, dropping notification");

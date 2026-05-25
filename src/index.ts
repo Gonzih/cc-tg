@@ -158,6 +158,7 @@ const notifyChatId = process.env.CC_AGENT_NOTIFY_CHAT_ID
 // Mutable placeholder closures — filled in once `bot` is created below.
 let getLastActiveChatIdFn: () => number | undefined = () => undefined;
 let handleUserMessageFn: ((chatId: number, text: string) => void) | undefined;
+let forwardNotificationFn: ((chatId: number, text: string) => void) | undefined;
 
 const notifierBot = new TelegramBot(telegramToken, { polling: false });
 const notifier = startNotifier(
@@ -166,6 +167,7 @@ const notifier = startNotifier(
   namespace,
   sharedRedis,
   (cid, text) => handleUserMessageFn?.(cid, text),
+  (cid, text) => forwardNotificationFn?.(cid, text),
   () => getLastActiveChatIdFn(),
 );
 console.log(`[notifier] started for namespace=${namespace} chatId=${notifyChatId ?? "dynamic"}`);
@@ -184,6 +186,7 @@ const bot = new CcTgBot({
 // Wire closures now that bot is constructed
 getLastActiveChatIdFn = () => bot.getLastActiveChatId();
 handleUserMessageFn = (cid, text) => { void bot.handleUserMessage(cid, text); };
+forwardNotificationFn = (cid, text) => { bot.forwardNotification(cid, text); };
 
 if (process.env.CC_AGENT_OPS_PORT) {
   const botInfo = await bot.getMe();

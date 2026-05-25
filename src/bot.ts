@@ -641,6 +641,24 @@ export class CcTgBot {
     }
   }
 
+  /**
+   * Forward a cc-agent job notification into an existing Claude session.
+   * Unlike handleUserMessage, this never creates a new session — if no session
+   * is active for the chatId, the notification is already visible in Telegram
+   * and we silently skip feeding it into Claude.
+   */
+  public forwardNotification(chatId: number, text: string): void {
+    const key = this.sessionKey(chatId);
+    const session = this.sessions.get(key);
+    if (!session || session.claude.exited) return;
+    try {
+      session.claude.sendPrompt(stampPrompt(text));
+      this.writeChatMessage("user", "cc-tg", text, chatId);
+    } catch (err) {
+      console.error(`[forwardNotification:${chatId}] failed:`, (err as Error).message);
+    }
+  }
+
   private async handleVoice(chatId: number, msg: TelegramBot.Message, threadId?: number, threadName?: string): Promise<void> {
     const fileId = msg.voice?.file_id ?? msg.audio?.file_id;
     if (!fileId) return;
