@@ -19,7 +19,7 @@ import { getCurrentToken, rotateToken, getTokenIndex, getTokenCount } from "./to
 import { writeChatLog, type ChatMessage } from "./notifier.js";
 import { CronManager } from "./cron.js";
 import { parseRoutingTag, ensureMetaAgent, routeToMetaAgent } from "./router.js";
-import { VOICE_PENDING_KEY, VOICE_FAILED_KEY, TTL, metaAgentStatusKey } from "@gonzih/cc-wire";
+import { VOICE_PENDING_KEY, VOICE_FAILED_KEY, TTL, metaAgentStatusKey, wikiKey, wikiUpdatedKey } from "@gonzih/cc-wire";
 
 const BOT_COMMANDS: Array<{ command: string; description: string }> = [
   { command: "start", description: "Reset session and start fresh" },
@@ -1613,16 +1613,6 @@ export class CcTgBot {
     }
   }
 
-  // ─── Wiki helpers ───────────────────────────────────────────────────────────
-
-  private wikiKey(repoSlug: string): string {
-    return `cca:wiki:${repoSlug}`;
-  }
-
-  private wikiUpdatedKey(repoSlug: string): string {
-    return `cca:wiki:${repoSlug}:updated`;
-  }
-
   private async handleWiki(chatId: number, text: string, threadId?: number): Promise<void> {
     const args = text.slice("/wiki".length).trim();
     const parts = args.split(/\s+/);
@@ -1686,7 +1676,7 @@ export class CcTgBot {
     }
 
     if (repoSlug) {
-      const pages = await this.redis.hkeys(this.wikiKey(repoSlug));
+      const pages = await this.redis.hkeys(wikiKey(repoSlug));
       if (!pages.length) {
         await this.replyToChat(chatId, `No wiki pages for "${repoSlug}".`, threadId);
         return;
@@ -1726,7 +1716,7 @@ export class CcTgBot {
       return;
     }
 
-    const content = await this.redis.hget(this.wikiKey(repoSlug), pageName);
+    const content = await this.redis.hget(wikiKey(repoSlug), pageName);
     if (!content) {
       await this.replyToChat(chatId, `Page "${pageName}" not found in "${repoSlug}".`, threadId);
       return;
@@ -1751,8 +1741,8 @@ export class CcTgBot {
       return;
     }
 
-    await this.redis.hset(this.wikiKey(repoSlug), pageName, content);
-    await this.redis.set(this.wikiUpdatedKey(repoSlug), new Date().toISOString());
+    await this.redis.hset(wikiKey(repoSlug), pageName, content);
+    await this.redis.set(wikiUpdatedKey(repoSlug), new Date().toISOString());
     await this.replyToChat(chatId, `Updated "${pageName}" in "${repoSlug}".`, threadId);
   }
 
@@ -1762,9 +1752,9 @@ export class CcTgBot {
       return;
     }
 
-    const deleted = await this.redis.hdel(this.wikiKey(repoSlug), pageName);
+    const deleted = await this.redis.hdel(wikiKey(repoSlug), pageName);
     if (deleted) {
-      await this.redis.set(this.wikiUpdatedKey(repoSlug), new Date().toISOString());
+      await this.redis.set(wikiUpdatedKey(repoSlug), new Date().toISOString());
       await this.replyToChat(chatId, `Deleted "${pageName}" from "${repoSlug}".`, threadId);
     } else {
       await this.replyToChat(chatId, `Page "${pageName}" not found in "${repoSlug}".`, threadId);
@@ -1804,7 +1794,7 @@ export class CcTgBot {
       const pageName = file.replace(/\.md$/, "");
       try {
         const content = readFileSync(join(wikiDir, file), "utf8");
-        await this.redis.hset(this.wikiKey(repoSlug), pageName, content);
+        await this.redis.hset(wikiKey(repoSlug), pageName, content);
         synced++;
       } catch (err) {
         errors.push(`${file}: ${(err as Error).message}`);
@@ -1812,7 +1802,7 @@ export class CcTgBot {
     }
 
     if (synced > 0) {
-      await this.redis.set(this.wikiUpdatedKey(repoSlug), new Date().toISOString());
+      await this.redis.set(wikiUpdatedKey(repoSlug), new Date().toISOString());
     }
 
     let reply = `Synced ${synced}/${files.length} pages to cca:wiki:${repoSlug}`;

@@ -19,7 +19,7 @@
   ],
   "dependencies": {
     "@gonzih/agent-ops": "^0.1.0",
-    "@gonzih/cc-wire": "^0.1.0",
+    "@gonzih/cc-wire": "^0.1.4",
     "node-telegram-bot-api": "^0.66.0"
   },
   "devDependencies": {
