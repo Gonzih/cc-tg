@@ -39,6 +39,7 @@ const BOT_COMMANDS: Array<{ command: string; description: string }> = [
   { command: "voice_retry", description: "Retry failed voice message transcriptions" },
   { command: "drivers", description: "List available agent drivers" },
   { command: "agents", description: "Show running meta-agents and their live status" },
+  { command: "wiki", description: "Manage wiki pages — list/show/update/delete/sync" },
 ];
 
 export interface BotOptions {
@@ -241,6 +242,8 @@ export class CcTgBot {
   private cron: CronManager;
   /** In-memory cache of forum topic names: `${chatId}:${threadId}` → topic name */
   private topicNameCache = new Map<string, string>();
+  /** Pending /wiki update state: chatId → {repoSlug, pageName, threadId} — awaiting user's next message as content */
+  private pendingWikiUpdates = new Map<number, { repoSlug: string; pageName: string; threadId?: number }>();
 
   constructor(opts: BotOptions) {
     this.opts = opts;
@@ -430,6 +433,14 @@ export class CcTgBot {
 
     const sessionKey = this.sessionKey(chatId, threadId);
 
+    // Pending /wiki update — next message is the new page content
+    const pendingWiki = this.pendingWikiUpdates.get(chatId);
+    if (pendingWiki && !text.startsWith("/")) {
+      this.pendingWikiUpdates.delete(chatId);
+      await this.handleWikiUpdateContent(chatId, pendingWiki.repoSlug, pendingWiki.pageName, text, pendingWiki.threadId);
+      return;
+    }
+
     // /start or /reset — kill existing session and ack
     if (text === "/start" || text === "/reset") {
       this.killSession(chatId, true, threadId);
@@ -541,6 +552,12 @@ export class CcTgBot {
     // /agents — show running meta-agents and their live status
     if (text === "/agents") {
       await this.handleAgents(chatId, threadId);
+      return;
+    }
+
+    // /wiki <subcommand> — manage wiki pages in Redis
+    if (text.startsWith("/wiki")) {
+      await this.handleWiki(chatId, text, threadId);
       return;
     }
 
@@ -1595,6 +1612,217 @@ export class CcTgBot {
       await this.replyToChat(chatId, `Failed to get agents status: ${(err as Error).message}`, threadId);
     }
   }
+
+  // ─── Wiki helpers ───────────────────────────────────────────────────────────
+
+  private wikiKey(repoSlug: string): string {
+    return `cca:wiki:${repoSlug}`;
+  }
+
+  private wikiUpdatedKey(repoSlug: string): string {
+    return `cca:wiki:${repoSlug}:updated`;
+  }
+
+  private async handleWiki(chatId: number, text: string, threadId?: number): Promise<void> {
+    const args = text.slice("/wiki".length).trim();
+    const parts = args.split(/\s+/);
+    const subCmd = parts[0] ?? "";
+
+    if (subCmd === "list" || subCmd === "") {
+      await this.handleWikiList(chatId, parts[1], threadId);
+      return;
+    }
+
+    if (subCmd === "show") {
+      const repoSlug = parts[1];
+      const pageName = parts.slice(2).join(" ");
+      if (!repoSlug || !pageName) {
+        await this.replyToChat(chatId, "Usage: /wiki show <repo_slug> <page_name>", threadId);
+        return;
+      }
+      await this.handleWikiShow(chatId, repoSlug, pageName, threadId);
+      return;
+    }
+
+    if (subCmd === "update") {
+      const repoSlug = parts[1];
+      const pageName = parts.slice(2).join(" ");
+      if (!repoSlug || !pageName) {
+        await this.replyToChat(chatId, "Usage: /wiki update <repo_slug> <page_name>", threadId);
+        return;
+      }
+      this.pendingWikiUpdates.set(chatId, { repoSlug, pageName, threadId });
+      await this.replyToChat(chatId, `Send the new content for page "${pageName}" in repo "${repoSlug}":`, threadId);
+      return;
+    }
+
+    if (subCmd === "delete") {
+      const repoSlug = parts[1];
+      const pageName = parts.slice(2).join(" ");
+      if (!repoSlug || !pageName) {
+        await this.replyToChat(chatId, "Usage: /wiki delete <repo_slug> <page_name>", threadId);
+        return;
+      }
+      await this.handleWikiDelete(chatId, repoSlug, pageName, threadId);
+      return;
+    }
+
+    if (subCmd === "sync") {
+      await this.handleWikiSync(chatId, threadId);
+      return;
+    }
+
+    await this.replyToChat(
+      chatId,
+      "Usage:\n/wiki list [repo_slug]\n/wiki show <repo_slug> <page_name>\n/wiki update <repo_slug> <page_name>\n/wiki delete <repo_slug> <page_name>\n/wiki sync",
+      threadId
+    );
+  }
+
+  private async handleWikiList(chatId: number, repoSlug: string | undefined, threadId?: number): Promise<void> {
+    if (!this.redis) {
+      await this.replyToChat(chatId, "Redis not configured — wiki unavailable.", threadId);
+      return;
+    }
+
+    if (repoSlug) {
+      const pages = await this.redis.hkeys(this.wikiKey(repoSlug));
+      if (!pages.length) {
+        await this.replyToChat(chatId, `No wiki pages for "${repoSlug}".`, threadId);
+        return;
+      }
+      const lines = pages.sort().map((p, i) => `${i + 1}. ${p}`);
+      await this.replyToChat(chatId, `Wiki pages for ${repoSlug} (${pages.length}):\n${lines.join("\n")}`, threadId);
+      return;
+    }
+
+    // List all repos — scan for cca:wiki:* keys, exclude :updated keys
+    const keys: string[] = [];
+    let cursor = "0";
+    do {
+      const [nextCursor, found] = await this.redis.scan(cursor, "MATCH", "cca:wiki:*", "COUNT", 100);
+      cursor = nextCursor;
+      keys.push(...found.filter((k) => !k.endsWith(":updated")));
+    } while (cursor !== "0");
+
+    if (!keys.length) {
+      await this.replyToChat(chatId, "No wiki repos found.", threadId);
+      return;
+    }
+
+    const counts = await Promise.all(
+      keys.sort().map(async (key) => {
+        const slug = key.slice("cca:wiki:".length);
+        const count = await this.redis!.hlen(key);
+        return `${slug} (${count} pages)`;
+      })
+    );
+    await this.replyToChat(chatId, `Wiki repos:\n${counts.join("\n")}`, threadId);
+  }
+
+  private async handleWikiShow(chatId: number, repoSlug: string, pageName: string, threadId?: number): Promise<void> {
+    if (!this.redis) {
+      await this.replyToChat(chatId, "Redis not configured — wiki unavailable.", threadId);
+      return;
+    }
+
+    const content = await this.redis.hget(this.wikiKey(repoSlug), pageName);
+    if (!content) {
+      await this.replyToChat(chatId, `Page "${pageName}" not found in "${repoSlug}".`, threadId);
+      return;
+    }
+
+    const TG_LIMIT = 4000;
+    const header = `📄 ${repoSlug}/${pageName}\n\n`;
+    const fullText = header + content;
+
+    if (fullText.length <= TG_LIMIT) {
+      await this.replyToChat(chatId, fullText, threadId);
+      return;
+    }
+
+    const truncated = fullText.slice(0, TG_LIMIT - 20) + "\n...(truncated)";
+    await this.replyToChat(chatId, truncated, threadId);
+  }
+
+  private async handleWikiUpdateContent(chatId: number, repoSlug: string, pageName: string, content: string, threadId?: number): Promise<void> {
+    if (!this.redis) {
+      await this.replyToChat(chatId, "Redis not configured — wiki unavailable.", threadId);
+      return;
+    }
+
+    await this.redis.hset(this.wikiKey(repoSlug), pageName, content);
+    await this.redis.set(this.wikiUpdatedKey(repoSlug), new Date().toISOString());
+    await this.replyToChat(chatId, `Updated "${pageName}" in "${repoSlug}".`, threadId);
+  }
+
+  private async handleWikiDelete(chatId: number, repoSlug: string, pageName: string, threadId?: number): Promise<void> {
+    if (!this.redis) {
+      await this.replyToChat(chatId, "Redis not configured — wiki unavailable.", threadId);
+      return;
+    }
+
+    const deleted = await this.redis.hdel(this.wikiKey(repoSlug), pageName);
+    if (deleted) {
+      await this.redis.set(this.wikiUpdatedKey(repoSlug), new Date().toISOString());
+      await this.replyToChat(chatId, `Deleted "${pageName}" from "${repoSlug}".`, threadId);
+    } else {
+      await this.replyToChat(chatId, `Page "${pageName}" not found in "${repoSlug}".`, threadId);
+    }
+  }
+
+  private async handleWikiSync(chatId: number, threadId?: number): Promise<void> {
+    if (!this.redis) {
+      await this.replyToChat(chatId, "Redis not configured — wiki unavailable.", threadId);
+      return;
+    }
+
+    const wikiDir = "/Users/feral/money-brain/wiki";
+    if (!existsSync(wikiDir)) {
+      await this.replyToChat(chatId, `Wiki directory not found: ${wikiDir}`, threadId);
+      return;
+    }
+
+    let files: string[];
+    try {
+      files = readdirSync(wikiDir).filter((f) => f.endsWith(".md"));
+    } catch (err) {
+      await this.replyToChat(chatId, `Failed to read wiki directory: ${(err as Error).message}`, threadId);
+      return;
+    }
+
+    if (!files.length) {
+      await this.replyToChat(chatId, "No .md files found in wiki directory.", threadId);
+      return;
+    }
+
+    const repoSlug = "gonzih-money-brain";
+    let synced = 0;
+    const errors: string[] = [];
+
+    for (const file of files) {
+      const pageName = file.replace(/\.md$/, "");
+      try {
+        const content = readFileSync(join(wikiDir, file), "utf8");
+        await this.redis.hset(this.wikiKey(repoSlug), pageName, content);
+        synced++;
+      } catch (err) {
+        errors.push(`${file}: ${(err as Error).message}`);
+      }
+    }
+
+    if (synced > 0) {
+      await this.redis.set(this.wikiUpdatedKey(repoSlug), new Date().toISOString());
+    }
+
+    let reply = `Synced ${synced}/${files.length} pages to cca:wiki:${repoSlug}`;
+    if (errors.length) {
+      reply += `\nErrors:\n${errors.join("\n")}`;
+    }
+    await this.replyToChat(chatId, reply, threadId);
+  }
+
+  // ────────────────────────────────────────────────────────────────────────────
 
   private callCcAgentTool(toolName: string, args: Record<string, unknown> = {}): Promise<string | null> {
     // For spawn tools, pass through the configured driver and model

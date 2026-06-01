@@ -26,9 +26,19 @@ const mocks = vi.hoisted(() => ({
   cronUpdate: vi.fn(),
   existsSyncMock: vi.fn().mockReturnValue(false),
   statSyncMock: vi.fn().mockReturnValue({ size: 1024, isFile: () => true }),
+  readdirSyncMock: vi.fn().mockReturnValue([]),
+  readFileSyncMock: vi.fn().mockReturnValue(''),
   execSyncMock: vi.fn().mockReturnValue(''),
   writeChatLog: vi.fn(),
   transcribeVoiceMock: vi.fn().mockResolvedValue('transcribed text'),
+  // Redis wiki mocks
+  redisHget: vi.fn().mockResolvedValue(null),
+  redisHkeys: vi.fn().mockResolvedValue([]),
+  redisHlen: vi.fn().mockResolvedValue(0),
+  redisHset: vi.fn().mockResolvedValue(1),
+  redisHdel: vi.fn().mockResolvedValue(0),
+  redisScan: vi.fn().mockResolvedValue(['0', []]),
+  redisSet: vi.fn().mockResolvedValue('OK'),
 }));
 
 vi.mock('node-telegram-bot-api', () => ({
@@ -86,6 +96,8 @@ vi.mock('fs', async (importOriginal) => {
     ...actual,
     existsSync: mocks.existsSyncMock,
     statSync: mocks.statSyncMock,
+    readdirSync: mocks.readdirSyncMock,
+    readFileSync: mocks.readFileSyncMock,
   };
 });
 
@@ -1860,5 +1872,247 @@ describe('CcTgBot.getLastActiveChatId', () => {
   it('returns chatId after a message is received', async () => {
     await (bot as any).handleTelegram(makeMsg({ chat: { id: 77 }, text: 'Hello' }));
     expect(bot.getLastActiveChatId()).toBe(77);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// /wiki commands
+// ---------------------------------------------------------------------------
+
+describe('/wiki commands', () => {
+  let bot: CcTgBot;
+
+  function makeRedis() {
+    return {
+      hget: mocks.redisHget,
+      hkeys: mocks.redisHkeys,
+      hlen: mocks.redisHlen,
+      hset: mocks.redisHset,
+      hdel: mocks.redisHdel,
+      scan: mocks.redisScan,
+      set: mocks.redisSet,
+      on: vi.fn(),
+      once: vi.fn(),
+    };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({});
+    mocks.tgSetMyCommands.mockResolvedValue({});
+    mocks.existsSyncMock.mockReturnValue(false);
+    mocks.cronList.mockReturnValue([]);
+    mocks.readdirSyncMock.mockReturnValue([]);
+    mocks.readFileSyncMock.mockReturnValue('');
+    mocks.redisHget.mockResolvedValue(null);
+    mocks.redisHkeys.mockResolvedValue([]);
+    mocks.redisHlen.mockResolvedValue(0);
+    mocks.redisHset.mockResolvedValue(1);
+    mocks.redisHdel.mockResolvedValue(0);
+    mocks.redisScan.mockResolvedValue(['0', []]);
+    mocks.redisSet.mockResolvedValue('OK');
+    bot = new CcTgBot({ telegramToken: 'test-token', redis: makeRedis() as any });
+  });
+
+  afterEach(() => {
+    bot.stop();
+  });
+
+  async function sendWiki(text: string) {
+    await (bot as any).handleTelegram(makeMsg({ text }));
+  }
+
+  it('/wiki with no args lists repos (no-arg alias for /wiki list)', async () => {
+    mocks.redisScan.mockResolvedValue(['0', []]);
+    await sendWiki('/wiki');
+    expect(mocks.tgSendMessage.mock.calls[0][1]).toContain('No wiki repos found');
+  });
+
+  it('/wiki unknown subcommand shows usage', async () => {
+    await sendWiki('/wiki foobar');
+    const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+    expect(msg).toContain('/wiki list');
+    expect(msg).toContain('/wiki show');
+    expect(msg).toContain('/wiki update');
+    expect(msg).toContain('/wiki delete');
+    expect(msg).toContain('/wiki sync');
+  });
+
+  // --- /wiki list ---
+
+  it('/wiki list with no repos shows "No wiki repos found"', async () => {
+    mocks.redisScan.mockResolvedValue(['0', []]);
+    await sendWiki('/wiki list');
+    expect(mocks.tgSendMessage.mock.calls[0][1]).toContain('No wiki repos found');
+  });
+
+  it('/wiki list filters out :updated keys and shows repo counts', async () => {
+    mocks.redisScan.mockResolvedValue(['0', ['cca:wiki:my-repo', 'cca:wiki:my-repo:updated', 'cca:wiki:other']]);
+    mocks.redisHlen
+      .mockResolvedValueOnce(3)
+      .mockResolvedValueOnce(1);
+    await sendWiki('/wiki list');
+    const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+    expect(msg).toContain('my-repo (3 pages)');
+    expect(msg).toContain('other (1 pages)');
+    expect(msg).not.toContain(':updated');
+  });
+
+  it('/wiki list <repo_slug> shows pages for that repo', async () => {
+    mocks.redisHkeys.mockResolvedValue(['intro', 'setup', 'api']);
+    await sendWiki('/wiki list my-repo');
+    const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+    expect(msg).toContain('my-repo');
+    expect(msg).toContain('intro');
+    expect(msg).toContain('setup');
+    expect(msg).toContain('api');
+    expect(mocks.redisHkeys).toHaveBeenCalledWith('cca:wiki:my-repo');
+  });
+
+  it('/wiki list <repo_slug> shows "No wiki pages" when empty', async () => {
+    mocks.redisHkeys.mockResolvedValue([]);
+    await sendWiki('/wiki list empty-repo');
+    expect(mocks.tgSendMessage.mock.calls[0][1]).toContain('No wiki pages for "empty-repo"');
+  });
+
+  // --- /wiki show ---
+
+  it('/wiki show missing args shows usage', async () => {
+    await sendWiki('/wiki show');
+    expect(mocks.tgSendMessage.mock.calls[0][1]).toContain('Usage: /wiki show');
+  });
+
+  it('/wiki show missing page_name shows usage', async () => {
+    await sendWiki('/wiki show my-repo');
+    expect(mocks.tgSendMessage.mock.calls[0][1]).toContain('Usage: /wiki show');
+  });
+
+  it('/wiki show not found page shows not-found message', async () => {
+    mocks.redisHget.mockResolvedValue(null);
+    await sendWiki('/wiki show my-repo intro');
+    expect(mocks.tgSendMessage.mock.calls[0][1]).toContain('not found');
+    expect(mocks.redisHget).toHaveBeenCalledWith('cca:wiki:my-repo', 'intro');
+  });
+
+  it('/wiki show returns page content', async () => {
+    mocks.redisHget.mockResolvedValue('# Intro\nHello world');
+    await sendWiki('/wiki show my-repo intro');
+    const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+    expect(msg).toContain('my-repo/intro');
+    expect(msg).toContain('# Intro');
+    expect(msg).toContain('Hello world');
+  });
+
+  it('/wiki show truncates content longer than 4000 chars', async () => {
+    const longContent = 'x'.repeat(5000);
+    mocks.redisHget.mockResolvedValue(longContent);
+    await sendWiki('/wiki show my-repo big-page');
+    const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+    expect(msg).toContain('(truncated)');
+    expect(msg.length).toBeLessThanOrEqual(4010);
+  });
+
+  // --- /wiki update ---
+
+  it('/wiki update missing args shows usage', async () => {
+    await sendWiki('/wiki update');
+    expect(mocks.tgSendMessage.mock.calls[0][1]).toContain('Usage: /wiki update');
+  });
+
+  it('/wiki update prompts for content and saves on next message', async () => {
+    await sendWiki('/wiki update my-repo intro');
+    expect(mocks.tgSendMessage.mock.calls[0][1]).toContain('Send the new content');
+
+    // Next plain-text message is the content
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({});
+    await (bot as any).handleTelegram(makeMsg({ text: '# My intro page' }));
+    expect(mocks.redisHset).toHaveBeenCalledWith('cca:wiki:my-repo', 'intro', '# My intro page');
+    expect(mocks.redisSet).toHaveBeenCalledWith('cca:wiki:my-repo:updated', expect.any(String));
+    expect(mocks.tgSendMessage.mock.calls[0][1]).toContain('Updated "intro" in "my-repo"');
+  });
+
+  it('/wiki update: slash command cancels pending update', async () => {
+    await sendWiki('/wiki update my-repo intro');
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({});
+    // Sending another slash command should NOT trigger wiki save
+    await sendWiki('/help');
+    expect(mocks.redisHset).not.toHaveBeenCalled();
+  });
+
+  // --- /wiki delete ---
+
+  it('/wiki delete missing args shows usage', async () => {
+    await sendWiki('/wiki delete');
+    expect(mocks.tgSendMessage.mock.calls[0][1]).toContain('Usage: /wiki delete');
+  });
+
+  it('/wiki delete existing page confirms deletion', async () => {
+    mocks.redisHdel.mockResolvedValue(1);
+    await sendWiki('/wiki delete my-repo intro');
+    expect(mocks.redisHdel).toHaveBeenCalledWith('cca:wiki:my-repo', 'intro');
+    expect(mocks.redisSet).toHaveBeenCalled();
+    expect(mocks.tgSendMessage.mock.calls[0][1]).toContain('Deleted "intro" from "my-repo"');
+  });
+
+  it('/wiki delete non-existent page shows not-found message', async () => {
+    mocks.redisHdel.mockResolvedValue(0);
+    await sendWiki('/wiki delete my-repo missing');
+    expect(mocks.tgSendMessage.mock.calls[0][1]).toContain('not found');
+    expect(mocks.redisSet).not.toHaveBeenCalled();
+  });
+
+  // --- /wiki sync ---
+
+  it('/wiki sync with missing wiki dir shows error', async () => {
+    mocks.existsSyncMock.mockReturnValue(false);
+    await sendWiki('/wiki sync');
+    const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+    expect(msg).toContain('Wiki directory not found');
+  });
+
+  it('/wiki sync with no .md files shows empty message', async () => {
+    mocks.existsSyncMock.mockReturnValue(true);
+    mocks.readdirSyncMock.mockReturnValue(['README.txt', 'image.png']);
+    await sendWiki('/wiki sync');
+    expect(mocks.tgSendMessage.mock.calls[0][1]).toContain('No .md files found');
+  });
+
+  it('/wiki sync pushes markdown files to Redis', async () => {
+    mocks.existsSyncMock.mockReturnValue(true);
+    mocks.readdirSyncMock.mockReturnValue(['intro.md', 'setup.md']);
+    mocks.readFileSyncMock
+      .mockReturnValueOnce('# Intro')
+      .mockReturnValueOnce('# Setup');
+    await sendWiki('/wiki sync');
+    expect(mocks.redisHset).toHaveBeenCalledWith('cca:wiki:gonzih-money-brain', 'intro', '# Intro');
+    expect(mocks.redisHset).toHaveBeenCalledWith('cca:wiki:gonzih-money-brain', 'setup', '# Setup');
+    expect(mocks.redisSet).toHaveBeenCalledWith('cca:wiki:gonzih-money-brain:updated', expect.any(String));
+    const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+    expect(msg).toContain('Synced 2/2 pages');
+  });
+
+  it('/wiki sync reports per-file errors', async () => {
+    mocks.existsSyncMock.mockReturnValue(true);
+    mocks.readdirSyncMock.mockReturnValue(['good.md', 'bad.md']);
+    mocks.readFileSyncMock.mockImplementation((path: any) => {
+      if (String(path).endsWith('bad.md')) throw new Error('permission denied');
+      return '# Good';
+    });
+    await sendWiki('/wiki sync');
+    const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+    expect(msg).toContain('Synced 1/2');
+    expect(msg).toContain('bad.md');
+    expect(msg).toContain('permission denied');
+  });
+
+  // --- no Redis ---
+
+  it('/wiki list without Redis shows unavailable message', async () => {
+    bot.stop();
+    bot = new CcTgBot({ telegramToken: 'test-token' }); // no redis
+    await (bot as any).handleTelegram(makeMsg({ text: '/wiki list' }));
+    expect(mocks.tgSendMessage.mock.calls[0][1]).toContain('Redis not configured');
   });
 });
