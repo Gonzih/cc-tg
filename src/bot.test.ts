@@ -2116,3 +2116,360 @@ describe('/wiki commands', () => {
     expect(mocks.tgSendMessage.mock.calls[0][1]).toContain('Redis not configured');
   });
 });
+
+// ---------------------------------------------------------------------------
+// /effort command
+// ---------------------------------------------------------------------------
+
+describe('/effort command', () => {
+  let bot: CcTgBot;
+
+  async function sendCmd(text: string) {
+    await (bot as any).handleTelegram(makeMsg({ text, from: { id: 100 } }));
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({});
+    mocks.tgSetMyCommands.mockResolvedValue({});
+    mocks.existsSyncMock.mockReturnValue(false);
+    mocks.cronList.mockReturnValue([]);
+    bot = new CcTgBot({ telegramToken: 'test-token' });
+  });
+
+  afterEach(() => {
+    bot.stop();
+  });
+
+  it('shows usage when no level given', async () => {
+    await sendCmd('/effort');
+    const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+    expect(msg).toContain('Usage: /effort <level>');
+    expect(msg).toContain('low, medium, high, xhigh, max, auto');
+  });
+
+  it('shows usage for invalid level', async () => {
+    await sendCmd('/effort turbo');
+    const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+    expect(msg).toContain('Usage: /effort <level>');
+  });
+
+  it('informs user when no active session', async () => {
+    await sendCmd('/effort high');
+    const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+    expect(msg).toContain('No active session');
+    expect(msg).toContain('high');
+  });
+
+  it('forwards /effort to Claude when session is active', async () => {
+    // Create a session
+    await sendCmd('hello');
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({});
+
+    await sendCmd('/effort high');
+    expect(mocks.claudeSendPrompt).toHaveBeenCalledWith('/effort high');
+    const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+    expect(msg).toContain('⚡ Effort set to: high');
+  });
+
+  it('is case-insensitive for level', async () => {
+    await sendCmd('hello');
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({});
+
+    await sendCmd('/effort HIGH');
+    expect(mocks.claudeSendPrompt).toHaveBeenCalledWith('/effort high');
+    const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+    expect(msg).toContain('high');
+  });
+
+  it('accepts all valid levels', async () => {
+    for (const level of ['low', 'medium', 'high', 'xhigh', 'max', 'auto']) {
+      vi.clearAllMocks();
+      mocks.tgSendMessage.mockResolvedValue({});
+      mocks.cronList.mockReturnValue([]);
+      bot.stop();
+      bot = new CcTgBot({ telegramToken: 'test-token' });
+      await sendCmd('hello');
+      vi.clearAllMocks();
+      mocks.tgSendMessage.mockResolvedValue({});
+      await sendCmd(`/effort ${level}`);
+      expect(mocks.claudeSendPrompt).toHaveBeenCalledWith(`/effort ${level}`);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// /compact command
+// ---------------------------------------------------------------------------
+
+describe('/compact command', () => {
+  let bot: CcTgBot;
+
+  async function sendCmd(text: string) {
+    await (bot as any).handleTelegram(makeMsg({ text, from: { id: 100 } }));
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({});
+    mocks.tgSetMyCommands.mockResolvedValue({});
+    mocks.existsSyncMock.mockReturnValue(false);
+    mocks.cronList.mockReturnValue([]);
+    bot = new CcTgBot({ telegramToken: 'test-token' });
+  });
+
+  afterEach(() => {
+    bot.stop();
+  });
+
+  it('replies "No active session." when no session exists', async () => {
+    await sendCmd('/compact');
+    expect(mocks.tgSendMessage).toHaveBeenCalledWith(42, 'No active session.');
+  });
+
+  it('sends /compact to Claude and replies with ack when session is active', async () => {
+    await sendCmd('hello');
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({});
+
+    await sendCmd('/compact');
+    expect(mocks.claudeSendPrompt).toHaveBeenCalledWith('/compact');
+    const msg = mocks.tgSendMessage.mock.calls[0][1] as string;
+    expect(msg).toContain('🗜️');
+  });
+
+  it('resets messagesSinceCompact to 0 on /compact', async () => {
+    await sendCmd('hello');
+    // Manually bump the counter
+    const sessions = (bot as any).sessions as Map<string, { messagesSinceCompact: number }>;
+    const session = sessions.get('42:main')!;
+    session.messagesSinceCompact = 15;
+
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({});
+    await sendCmd('/compact');
+    expect(session.messagesSinceCompact).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Auto-compact threshold
+// ---------------------------------------------------------------------------
+
+describe('auto-compact (CC_TG_AUTO_COMPACT_MESSAGES)', () => {
+  let bot: CcTgBot;
+
+  async function sendCmd(text: string) {
+    await (bot as any).handleTelegram(makeMsg({ text, from: { id: 100 } }));
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({});
+    mocks.tgSetMyCommands.mockResolvedValue({});
+    mocks.existsSyncMock.mockReturnValue(false);
+    mocks.cronList.mockReturnValue([]);
+    bot = new CcTgBot({ telegramToken: 'test-token' });
+    delete process.env.CC_TG_AUTO_COMPACT_MESSAGES;
+  });
+
+  afterEach(() => {
+    bot.stop();
+    delete process.env.CC_TG_AUTO_COMPACT_MESSAGES;
+  });
+
+  it('does not fire when count is below threshold', async () => {
+    process.env.CC_TG_AUTO_COMPACT_MESSAGES = '5';
+    await sendCmd('hello');
+    const sessions = (bot as any).sessions as Map<string, { messagesSinceCompact: number }>;
+    const session = sessions.get('42:main')!;
+    session.messagesSinceCompact = 3;
+
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({});
+    await sendCmd('another message');
+    // /compact should NOT have been sent
+    expect(mocks.claudeSendPrompt).not.toHaveBeenCalledWith('/compact');
+  });
+
+  it('fires /compact when messagesSinceCompact reaches threshold', async () => {
+    process.env.CC_TG_AUTO_COMPACT_MESSAGES = '5';
+    await sendCmd('hello');
+    const sessions = (bot as any).sessions as Map<string, { messagesSinceCompact: number }>;
+    const session = sessions.get('42:main')!;
+    session.messagesSinceCompact = 5;
+
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({});
+    await sendCmd('another message');
+    // First call is /compact, second call is the actual prompt
+    expect(mocks.claudeSendPrompt).toHaveBeenCalledWith('/compact');
+  });
+
+  it('resets messagesSinceCompact to 0 after auto-compact fires', async () => {
+    process.env.CC_TG_AUTO_COMPACT_MESSAGES = '5';
+    await sendCmd('hello');
+    const sessions = (bot as any).sessions as Map<string, { messagesSinceCompact: number }>;
+    const session = sessions.get('42:main')!;
+    session.messagesSinceCompact = 5;
+
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({});
+    await sendCmd('another message');
+    expect(session.messagesSinceCompact).toBe(0);
+  });
+
+  it('is disabled when CC_TG_AUTO_COMPACT_MESSAGES=0', async () => {
+    process.env.CC_TG_AUTO_COMPACT_MESSAGES = '0';
+    await sendCmd('hello');
+    const sessions = (bot as any).sessions as Map<string, { messagesSinceCompact: number }>;
+    const session = sessions.get('42:main')!;
+    session.messagesSinceCompact = 100;
+
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({});
+    await sendCmd('another message');
+    expect(mocks.claudeSendPrompt).not.toHaveBeenCalledWith('/compact');
+  });
+
+  it('increments messagesSinceCompact on each Claude result', async () => {
+    await sendCmd('hello');
+    const onCalls = mocks.claudeOn.mock.calls as [string, (...args: unknown[]) => void][];
+    const messageHandler = onCalls.find(([event]) => event === 'message')?.[1];
+    const sessions = (bot as any).sessions as Map<string, { messagesSinceCompact: number }>;
+    const session = sessions.get('42:main')!;
+
+    expect(session.messagesSinceCompact).toBe(0);
+    messageHandler?.({ type: 'result', payload: { result: 'response' }, raw: {} });
+    expect(session.messagesSinceCompact).toBe(1);
+    messageHandler?.({ type: 'result', payload: { result: 'response 2' }, raw: {} });
+    expect(session.messagesSinceCompact).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cost warning (CC_TG_COST_WARN_USD)
+// ---------------------------------------------------------------------------
+
+describe('cost warning (CC_TG_COST_WARN_USD)', () => {
+  let bot: CcTgBot;
+
+  async function sendCmd(text: string) {
+    await (bot as any).handleTelegram(makeMsg({ text, from: { id: 100 } }));
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({});
+    mocks.tgSetMyCommands.mockResolvedValue({});
+    mocks.existsSyncMock.mockReturnValue(false);
+    mocks.cronList.mockReturnValue([]);
+    bot = new CcTgBot({ telegramToken: 'test-token' });
+    delete process.env.CC_TG_COST_WARN_USD;
+  });
+
+  afterEach(() => {
+    bot.stop();
+    delete process.env.CC_TG_COST_WARN_USD;
+    vi.useRealTimers();
+  });
+
+  it('sends warning when session cost exceeds threshold', async () => {
+    process.env.CC_TG_COST_WARN_USD = '1.0';
+    await sendCmd('hello');
+
+    const onCalls = mocks.claudeOn.mock.calls as [string, (...args: unknown[]) => void][];
+    const usageHandler = onCalls.find(([event]) => event === 'usage')?.[1];
+    const messageHandler = onCalls.find(([event]) => event === 'message')?.[1];
+
+    // Push cost above threshold: 1M output tokens = $15
+    usageHandler!({ inputTokens: 0, outputTokens: 1_000_000, cacheReadTokens: 0, cacheWriteTokens: 0 });
+
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({});
+
+    messageHandler?.({ type: 'result', payload: { result: 'done' }, raw: {} });
+    await vi.advanceTimersByTimeAsync(1000);
+
+    const calls = mocks.tgSendMessage.mock.calls.map((c) => c[1] as string);
+    const warnCall = calls.find((m) => m.includes('⚠️'));
+    expect(warnCall).toBeDefined();
+    expect(warnCall).toContain('consider /compact or /reset');
+  });
+
+  it('does not send warning when cost is below threshold', async () => {
+    process.env.CC_TG_COST_WARN_USD = '100.0';
+    await sendCmd('hello');
+
+    const onCalls = mocks.claudeOn.mock.calls as [string, (...args: unknown[]) => void][];
+    const messageHandler = onCalls.find(([event]) => event === 'message')?.[1];
+
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({});
+
+    messageHandler?.({ type: 'result', payload: { result: 'done' }, raw: {} });
+    await vi.advanceTimersByTimeAsync(1000);
+
+    const calls = mocks.tgSendMessage.mock.calls.map((c) => c[1] as string);
+    expect(calls.find((m) => m.includes('⚠️'))).toBeUndefined();
+  });
+
+  it('sends warning only once per session', async () => {
+    process.env.CC_TG_COST_WARN_USD = '1.0';
+    await sendCmd('hello');
+
+    const onCalls = mocks.claudeOn.mock.calls as [string, (...args: unknown[]) => void][];
+    const usageHandler = onCalls.find(([event]) => event === 'usage')?.[1];
+    const messageHandler = onCalls.find(([event]) => event === 'message')?.[1];
+
+    // Push cost above threshold
+    usageHandler!({ inputTokens: 0, outputTokens: 1_000_000, cacheReadTokens: 0, cacheWriteTokens: 0 });
+
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({});
+
+    // First result
+    messageHandler?.({ type: 'result', payload: { result: 'done' }, raw: {} });
+    await vi.advanceTimersByTimeAsync(1000);
+
+    const firstWarnCount = mocks.tgSendMessage.mock.calls.filter((c) =>
+      (c[1] as string).includes('⚠️')
+    ).length;
+    expect(firstWarnCount).toBe(1);
+
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({});
+
+    // Second result — warning should NOT fire again
+    messageHandler?.({ type: 'result', payload: { result: 'done again' }, raw: {} });
+    await vi.advanceTimersByTimeAsync(1000);
+
+    const secondWarnCount = mocks.tgSendMessage.mock.calls.filter((c) =>
+      (c[1] as string).includes('⚠️')
+    ).length;
+    expect(secondWarnCount).toBe(0);
+  });
+
+  it('is disabled when CC_TG_COST_WARN_USD=0', async () => {
+    process.env.CC_TG_COST_WARN_USD = '0';
+    await sendCmd('hello');
+
+    const onCalls = mocks.claudeOn.mock.calls as [string, (...args: unknown[]) => void][];
+    const usageHandler = onCalls.find(([event]) => event === 'usage')?.[1];
+    const messageHandler = onCalls.find(([event]) => event === 'message')?.[1];
+
+    usageHandler!({ inputTokens: 0, outputTokens: 1_000_000, cacheReadTokens: 0, cacheWriteTokens: 0 });
+
+    vi.clearAllMocks();
+    mocks.tgSendMessage.mockResolvedValue({});
+
+    messageHandler?.({ type: 'result', payload: { result: 'done' }, raw: {} });
+    await vi.advanceTimersByTimeAsync(1000);
+
+    const calls = mocks.tgSendMessage.mock.calls.map((c) => c[1] as string);
+    expect(calls.find((m) => m.includes('⚠️'))).toBeUndefined();
+  });
+});

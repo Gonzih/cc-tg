@@ -1,13 +1,15 @@
-# TODO: Comprehensive Unit Tests
+# TODO: feat/effort-control
 
-- [ ] Create branch feat/comprehensive-unit-tests
-- [ ] Add tests to formatter.test.ts
-- [ ] Add tests to tokens.test.ts
-- [ ] Add tests to usage-limit.test.ts
-- [ ] Add tests to cron.test.ts
-- [ ] Add tests to router.test.ts
-- [ ] Add tests to voice.test.ts
-- [ ] Add tests to seed.test.ts
-- [ ] Run npm test — verify all pass
+- [ ] Create branch feat/effort-control
+- [ ] Add effort + compact to BOT_COMMANDS in bot.ts
+- [ ] Add messagesSinceCompact + costWarnSent to Session interface
+- [ ] Implement handleEffort() and handleCompact()
+- [ ] Wire /effort and /compact in handleTelegram()
+- [ ] Add maybeSendAutoCompact() and call it before sendPrompt
+- [ ] Increment messagesSinceCompact in handleClaudeMessage
+- [ ] Add cost warning in flushPending
+- [ ] Update README.md with new commands and env vars
+- [ ] Write tests for new features in bot.test.ts
+- [ ] Run build (npm run build) and tests (npm test)
 - [ ] git diff --staged review
 - [ ] Commit, push, PR, merge, publish

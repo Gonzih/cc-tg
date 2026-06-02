@@ -32,6 +32,8 @@ Open your bot in Telegram and start chatting.
 | `ALLOWED_USER_IDS` | no | Comma-separated Telegram user IDs. Leave empty to allow anyone |
 | `CWD` | no | Working directory for Claude Code. Defaults to current directory |
 | `THREAD_CWD_MAP` | no | JSON mapping of forum topic names or IDs to CWD paths (see [Multi-topic sessions](#multi-topic-sessions)) |
+| `CC_TG_AUTO_COMPACT_MESSAGES` | no | Automatically send `/compact` after this many messages in a session (default: 40, set to 0 to disable) |
+| `CC_TG_COST_WARN_USD` | no | Send a cost warning notification when session cost exceeds this USD amount (default: 5.0, set to 0 to disable) |
 
 *One of `CLAUDE_CODE_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, or `ANTHROPIC_API_KEY` required.
 
@@ -66,6 +68,8 @@ Message [@userinfobot](https://t.me/userinfobot) — it replies with your numeri
 | `/mcp_version` | Show latest published cc-agent npm version and current cache |
 | `/clear_npx_cache` | Clear npx cache and reload cc-agent (upgrades to latest version) |
 | `/get_file <path>` | Send a file from the server to this chat |
+| `/effort <level>` | Set Claude effort level (`low` / `medium` / `high` / `xhigh` / `max` / `auto`) |
+| `/compact` | Compact context history to free tokens |
 | `/restart` | Self-restart the cc-tg bot process (no SSH needed) |
 | Any text | Sent directly to Claude Code |
 | Voice message | Transcribed via whisper.cpp and sent to Claude |
