@@ -1,54 +1,74 @@
-# Plan: Comprehensive Unit Tests for 90%+ Coverage
+# PLAN.md — feat/effort-control
 
-## Task restatement
+## Task Restatement
+Add effort level control (`/effort <level>`), manual context compaction (`/compact`),
+auto-compact after N messages (`CC_TG_AUTO_COMPACT_MESSAGES`), and a session cost warning
+(`CC_TG_COST_WARN_USD`) to the cc-tg Telegram bot. Also update `/help` and README.
 
-Write unit tests for all uncovered functions/branches in core business logic modules
-(bot.ts, claude.ts, formatter.ts, voice.ts, notifier.ts) to hit 90%+ coverage.
+---
 
-## Current coverage gaps
+## Approaches Considered
 
-| File | Stmts | Branch | Funcs | Key gaps |
-|---|---|---|---|---|
-| bot.ts | 68.53% | 65.19% | 49.65% | normalizeTopicNamespace, listSkills, enrichPromptWithUrls, buildPromptWithReplyContext |
-| claude.ts | 83.52% | 72.22% | 93.33% | ClaudeProcess constructor, drainBuffer, sendPrompt, kill, resolveClaude |
-| formatter.ts | 86.66% | 66.66% | 80% | findPreRanges unclosed pre, splitLongMessage hard split |
-| voice.ts | 100% | 86.95% | 75% | HTTP (not HTTPS) download, non-.en model (-l auto), non-Error throw wrap |
-| notifier.ts | 91.32% | 93.25% | 67.85% | Already well-tested via existing tests |
+### A) Forward slash commands verbatim to Claude subprocess stdin (CHOSEN)
+Forward `/effort high` and `/compact` to Claude via `session.claude.sendPrompt()`.
+**Pro**: Zero new abstractions; exactly what the spec says.
+**Con**: Relies on Claude Code's stream-json input layer processing slash commands.
 
-## Approach
+### B) Pass effort/compact as CLI flags on process spawn
+Kill existing session and re-spawn with `--effort high` flag.
+**Con**: Loses conversation history; ugly UX. Rejected.
 
-### New files
-1. `src/claude-process.test.ts` — Tests for `ClaudeProcess` class:
-   - Mock `child_process.spawn` to control stdout/stderr/exit/error events
-   - Test drainBuffer: JSON parsing, usage events (message_start/message_delta), non-JSON skip
-   - Test sendPrompt: throws when exited, writes to stdin
-   - Test sendImage: with and without caption
-   - Test kill: calls proc.kill()
-   - Test exited getter state
-   - Test resolveClaude: PATH resolution via existsSync mock
+### C) Custom JSON message type
+Add `{ type: "command", command: "effort", value: "high" }`.
+**Con**: Claude Code doesn't define such a type. Rejected.
 
-2. `src/bot-helpers.test.ts` — Tests for exported helper functions from bot.ts:
-   - `normalizeTopicNamespace`: all transformation rules
-   - `listSkills`: no dir, empty dir, read error, missing descriptions
-   - `enrichPromptWithUrls`: no URLs, skip jina.ai, fetch failures, multiple URLs
+---
 
-### Modified files  
-3. `src/voice.test.ts` — Add:
-   - HTTP (not HTTPS) download uses http.get
-   - Non-.en model path uses `-l auto`
-   - whisper error wrapping non-Error objects
+## Approach: A — forward via sendPrompt
 
-4. `src/formatter.test.ts` — Add:
-   - `findPreRanges` with unclosed `<pre>` tag (no match)
-   - `splitLongMessage` hard split at maxLen (no natural boundaries)
+---
 
-## Files to touch
-- src/claude-process.test.ts (new)
-- src/bot-helpers.test.ts (new)
-- src/voice.test.ts (modify)
-- src/formatter.test.ts (modify)
+## Files to Touch
+- `src/bot.ts` — core changes: commands, session fields, auto-compact, cost warning
+- `src/bot.test.ts` — tests for new features
+- `README.md` — document new commands and env vars
+
+---
+
+## Implementation Details
+
+### Session interface additions
+```
+messagesSinceCompact: number   // incremented per-response; reset on /compact
+costWarnSent: boolean           // true once cost threshold notification is sent
+```
+
+### BOT_COMMANDS additions
+```
+{ command: "effort", description: "Set effort level: low / medium / high / xhigh / max / auto" }
+{ command: "compact", description: "Compact context history to free tokens" }
+```
+
+### /effort handler
+- Validate level in Set(["low","medium","high","xhigh","max","auto"])
+- No active session → informational reply
+- Active session → sendPrompt("/effort ${level}") + ack
+
+### /compact handler
+- No active session → "No active session."
+- Active session → sendPrompt("/compact"), reset messagesSinceCompact=0
+
+### maybeSendAutoCompact (called before each sendPrompt in main text path)
+- CC_TG_AUTO_COMPACT_MESSAGES (default 40, 0=disabled)
+- When messagesSinceCompact >= threshold: send /compact, reset counter, log + notify
+
+### Cost warning (in flushPending, once per session)
+- CC_TG_COST_WARN_USD (default 5.0, 0=disabled)
+- Guarded by session.costWarnSent flag
+- After flush: if costStore.get(chatId).totalCostUsd >= threshold → warn, set flag
+
+---
 
 ## Risks
-- ClaudeProcess mock: need to correctly mock EventEmitter-based spawn result
-- enrichPromptWithUrls: async, needs careful https mock setup
-- resolveClaude is a private module function — test via ClaudeProcess constructor PATH side effects
+- Claude Code may not process /effort /compact in stream-json mode — runtime concern, not a code bug.
+- Cost store is keyed by chatId (not sessionKey) — pre-existing; not changed.

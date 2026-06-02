@@ -40,6 +40,8 @@ const BOT_COMMANDS: Array<{ command: string; description: string }> = [
   { command: "drivers", description: "List available agent drivers" },
   { command: "agents", description: "Show running meta-agents and their live status" },
   { command: "wiki", description: "Manage wiki pages — list/show/update/delete/sync" },
+  { command: "effort", description: "Set effort level: low / medium / high / xhigh / max / auto" },
+  { command: "compact", description: "Compact context history to free tokens" },
 ];
 
 export interface BotOptions {
@@ -69,6 +71,10 @@ interface Session {
   isRetry: boolean;
   /** Forum topic thread_id (undefined for DMs and non-topic groups) */
   threadId?: number;
+  /** Messages sent since last /compact — used for auto-compact threshold */
+  messagesSinceCompact: number;
+  /** True once the CC_TG_COST_WARN_USD threshold notification has been sent */
+  costWarnSent: boolean;
 }
 
 interface PendingRetry {
@@ -561,6 +567,18 @@ export class CcTgBot {
       return;
     }
 
+    // /effort <level> — forward effort level to active Claude session
+    if (text.startsWith("/effort")) {
+      await this.handleEffort(chatId, text, threadId);
+      return;
+    }
+
+    // /compact — compact context history in active Claude session
+    if (text === "/compact") {
+      await this.handleCompact(chatId, threadId);
+      return;
+    }
+
     // #tag / #org/repo routing — delegate to meta-agent instead of local Claude session
     if (this.redis) {
       const routing = parseRoutingTag(text);
@@ -631,6 +649,7 @@ export class CcTgBot {
       const enriched = await enrichPromptWithUrls(text);
       const prompt = buildPromptWithReplyContext(enriched, msg);
       session.currentPrompt = prompt;
+      this.maybeSendAutoCompact(session, chatId, threadId);
       session.claude.sendPrompt(stampPrompt(prompt));
       this.startTyping(chatId, session);
       this.writeChatMessage("user", "telegram", text, chatId);
@@ -926,6 +945,8 @@ export class CcTgBot {
       currentPrompt: "",
       isRetry: false,
       threadId,
+      messagesSinceCompact: 0,
+      costWarnSent: false,
     };
 
     claude.on("usage", (usage: UsageEvent) => {
@@ -992,6 +1013,7 @@ export class CcTgBot {
 
     this.stopTyping(session);
     this.costStore.incrementMessages(chatId);
+    session.messagesSinceCompact++;
 
     const text = extractText(msg);
     if (!text) return;
@@ -1112,6 +1134,22 @@ export class CcTgBot {
       this.uploadMentionedFiles(chatId, text, session);
     } catch (err) {
       console.error(`[tg:${chatId}] uploadMentionedFiles error:`, (err as Error).message);
+    }
+
+    // Cost threshold warning — fires once per session when cost first exceeds the limit
+    if (!session.costWarnSent) {
+      const warnThreshold = parseFloat(process.env.CC_TG_COST_WARN_USD ?? "5.0");
+      if (!isNaN(warnThreshold) && warnThreshold > 0) {
+        const cost = this.costStore.get(chatId);
+        if (cost.totalCostUsd >= warnThreshold) {
+          session.costWarnSent = true;
+          this.replyToChat(
+            chatId,
+            `⚠️ Session cost: $${cost.totalCostUsd.toFixed(2)} — consider /compact or /reset`,
+            threadId
+          ).catch(() => {});
+        }
+      }
     }
   }
 
@@ -1901,6 +1939,63 @@ export class CcTgBot {
       this.stopTyping(session);
       session.claude.kill();
       this.sessions.delete(key);
+    }
+  }
+
+  private async handleEffort(chatId: number, text: string, threadId?: number): Promise<void> {
+    const VALID_LEVELS = new Set(["low", "medium", "high", "xhigh", "max", "auto"]);
+    const parts = text.trim().split(/\s+/);
+    const level = parts[1]?.toLowerCase();
+    if (!level || !VALID_LEVELS.has(level)) {
+      await this.replyToChat(
+        chatId,
+        "Usage: /effort <level>\nValid levels: low, medium, high, xhigh, max, auto",
+        threadId
+      );
+      return;
+    }
+    const sessionKey = this.sessionKey(chatId, threadId);
+    const session = this.sessions.get(sessionKey);
+    if (!session || session.claude.exited) {
+      await this.replyToChat(
+        chatId,
+        `No active session. Start one, then use /effort ${level} to set the effort level.`,
+        threadId
+      );
+      return;
+    }
+    session.claude.sendPrompt(`/effort ${level}`);
+    await this.replyToChat(chatId, `⚡ Effort set to: ${level}`, threadId);
+  }
+
+  private async handleCompact(chatId: number, threadId?: number): Promise<void> {
+    const sessionKey = this.sessionKey(chatId, threadId);
+    const session = this.sessions.get(sessionKey);
+    if (!session || session.claude.exited) {
+      await this.replyToChat(chatId, "No active session.", threadId);
+      return;
+    }
+    session.claude.sendPrompt("/compact");
+    session.messagesSinceCompact = 0;
+    await this.replyToChat(chatId, "🗜️ Compacting context history...", threadId);
+  }
+
+  /**
+   * If CC_TG_AUTO_COMPACT_MESSAGES threshold is reached, send /compact to the active Claude
+   * session before the next user message. Resets the per-session counter on fire.
+   */
+  private maybeSendAutoCompact(session: Session, chatId: number, threadId?: number): void {
+    const threshold = parseInt(process.env.CC_TG_AUTO_COMPACT_MESSAGES ?? "40", 10);
+    if (isNaN(threshold) || threshold <= 0) return;
+    if (session.messagesSinceCompact >= threshold) {
+      console.log(`[auto-compact:${chatId}] firing after ${session.messagesSinceCompact} messages`);
+      session.messagesSinceCompact = 0;
+      session.claude.sendPrompt("/compact");
+      this.replyToChat(
+        chatId,
+        `🗜️ Auto-compacting context (${threshold} message limit reached)...`,
+        threadId
+      ).catch(() => {});
     }
   }
 
