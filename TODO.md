@@ -1,15 +1,9 @@
-# TODO: feat/effort-control
+# TODO: fix/router-numeric-hashtag
 
-- [ ] Create branch feat/effort-control
-- [ ] Add effort + compact to BOT_COMMANDS in bot.ts
-- [ ] Add messagesSinceCompact + costWarnSent to Session interface
-- [ ] Implement handleEffort() and handleCompact()
-- [ ] Wire /effort and /compact in handleTelegram()
-- [ ] Add maybeSendAutoCompact() and call it before sendPrompt
-- [ ] Increment messagesSinceCompact in handleClaudeMessage
-- [ ] Add cost warning in flushPending
-- [ ] Update README.md with new commands and env vars
-- [ ] Write tests for new features in bot.test.ts
-- [ ] Run build (npm run build) and tests (npm test)
+- [ ] Create branch fix/router-numeric-hashtag
+- [ ] Fix regex in src/router.ts: [a-zA-Z0-9] → [a-zA-Z] as first char
+- [ ] Update inline comment and JSDoc in src/router.ts
+- [ ] Add tests in src/router.test.ts: #57, #123abc, #2fast return null
+- [ ] Run build + tests
 - [ ] git diff --staged review
 - [ ] Commit, push, PR, merge, publish
