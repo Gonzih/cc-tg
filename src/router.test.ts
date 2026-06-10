@@ -113,9 +113,37 @@ describe("parseRoutingTag", () => {
   });
 
   it("returns null when tag starts with a dash (#-repo is invalid)", () => {
-    // Regex requires [a-zA-Z0-9] as first char after #
+    // Regex requires [a-zA-Z] as first char after #
     process.env.DEFAULT_GITHUB_ORG = "gonzih";
     expect(parseRoutingTag("#-repo fix it")).toBeNull();
+  });
+
+  it("returns null for purely numeric tag (#57)", () => {
+    process.env.DEFAULT_GITHUB_ORG = "gonzih";
+    expect(parseRoutingTag("see issue #57 for context")).toBeNull();
+  });
+
+  it("returns null for purely numeric tag at start (#123)", () => {
+    process.env.DEFAULT_GITHUB_ORG = "gonzih";
+    expect(parseRoutingTag("#123 do something")).toBeNull();
+  });
+
+  it("returns null for digit-leading mixed tag (#2fast)", () => {
+    process.env.DEFAULT_GITHUB_ORG = "gonzih";
+    expect(parseRoutingTag("#2fast deploy")).toBeNull();
+  });
+
+  it("returns null for digit-leading tag (#123abc)", () => {
+    process.env.DEFAULT_GITHUB_ORG = "gonzih";
+    expect(parseRoutingTag("#123abc run this")).toBeNull();
+  });
+
+  it("still routes alphabetic tag that appears alongside a numeric reference", () => {
+    process.env.DEFAULT_GITHUB_ORG = "gonzih";
+    // The #57 reference is in the text but #cc-agent comes after — should still route
+    const result = parseRoutingTag("see #57 and ask #cc-agent to fix it");
+    expect(result).not.toBeNull();
+    expect(result!.namespace).toBe("cc-agent");
   });
 
   it("handles repo name with dots and underscores (#org/my_repo.v2)", () => {

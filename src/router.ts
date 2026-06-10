@@ -7,6 +7,9 @@
  * Tag formats:
  *   #repo-name    → namespace=repo-name, repo=https://github.com/{DEFAULT_GITHUB_ORG}/repo-name (null if DEFAULT_GITHUB_ORG unset)
  *   #org/repo     → namespace=repo,      repo=https://github.com/org/repo
+ *
+ * The namespace (first segment after #) MUST start with a letter. Purely numeric
+ * or digit-leading tags such as #57 or #123 are rejected and treated as plain text.
  */
 
 import { execSync } from "child_process";
@@ -25,20 +28,28 @@ export interface RoutingTag {
 
 /**
  * Parse the first #tag or #org/repo token from a message.
- * Returns null when no routing tag is present, or when the short #repo format is used
- * without DEFAULT_GITHUB_ORG being set (operators must configure this explicitly).
+ * Returns null when no routing tag is present, when the short #repo format is used
+ * without DEFAULT_GITHUB_ORG being set, or when the tag starts with a digit.
+ *
+ * The namespace segment must begin with a letter. Tags like #57 or #123 that start
+ * with a digit are rejected so that numeric issue/PR references in pasted text are
+ * not mistaken for routing targets.
  *
  * Examples:
  *   "#cc-agent fix the bug"           → null if DEFAULT_GITHUB_ORG unset; { namespace: "cc-agent", repoUrl: "…/{org}/cc-agent", … } if set
  *   "#gonzih/of-stack deploy it"      → { namespace: "of-stack", repoUrl: "…/gonzih/of-stack", … }
  *   "#org/repo do something"          → { namespace: "repo",     repoUrl: "…/org/repo", … }
  *   "please help #of-stack with this" → null if DEFAULT_GITHUB_ORG unset
+ *   "see issue #57 for context"       → null (digit-leading tag rejected)
+ *   "#2fast deploy"                   → null (digit-leading tag rejected)
  */
 export function parseRoutingTag(text: string): RoutingTag | null {
   const defaultOrg = process.env.DEFAULT_GITHUB_ORG;
 
-  // Match #word or #org/repo — each segment: starts with alphanumeric, allows ._- inside
-  const match = text.match(/#([a-zA-Z0-9][a-zA-Z0-9._-]*)(?:\/([a-zA-Z0-9][a-zA-Z0-9._-]*))?/);
+  // Match #word or #org/repo — first segment must start with a letter (not a digit),
+  // subsequent characters allow alphanumeric, dots, underscores, and hyphens.
+  // This prevents numeric issue references like #57 from being treated as routing tags.
+  const match = text.match(/#([a-zA-Z][a-zA-Z0-9._-]*)(?:\/([a-zA-Z0-9][a-zA-Z0-9._-]*))?/);
   if (!match) return null;
 
   const fullMatch = match[0]; // e.g. "#gonzih/of-stack"
