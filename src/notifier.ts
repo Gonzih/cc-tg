@@ -72,6 +72,27 @@ export function isDiscordOnly(raw: string): boolean {
 }
 
 /**
+ * Returns true when the notification should be skipped by Telegram.
+ * Skips when:
+ *   - discord_only: true (legacy flag), OR
+ *   - routing is a non-empty array that does not include "telegram"
+ *
+ * Absent or empty routing means deliver everywhere (backward compatible).
+ */
+export function shouldSkipForTelegram(raw: string): boolean {
+  try {
+    const parsed = JSON.parse(raw) as { discord_only?: boolean; routing?: unknown };
+    if (parsed.discord_only === true) return true;
+    if (Array.isArray(parsed.routing) && parsed.routing.length > 0) {
+      return !(parsed.routing as string[]).includes("telegram");
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Parse a notification payload and return the display text.
  * Appends a [driver] or [driver:model] badge whenever the driver field is present.
  * Appends " cost: $X.XXX" if a numeric cost field is present.
@@ -297,7 +318,7 @@ export function startNotifier(
     }
 
     for (const raw of items) {
-      if (isDiscordOnly(raw)) continue;
+      if (shouldSkipForTelegram(raw)) continue;
       const text = parseNotification(raw);
       bot.sendMessage(targetId, text).catch((err: Error) => {
         log("warn", "notify list sendMessage failed:", err.message);
@@ -323,7 +344,7 @@ export function startNotifier(
     const incomingCh = chatIncomingChannel(namespace);
 
     if (channel === notifyCh) {
-      if (isDiscordOnly(message)) return;
+      if (shouldSkipForTelegram(message)) return;
       const targetId = chatId ?? getActiveChatId?.();
       if (targetId != null) {
         const text = parseNotification(message);
