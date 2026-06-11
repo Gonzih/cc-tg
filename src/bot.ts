@@ -1756,7 +1756,7 @@ export class CcTgBot {
     if (spawnTools.has(toolName)) {
       const driver = process.env.CC_AGENT_DEFAULT_DRIVER || "claude";
       const model = process.env.CC_AGENT_DEFAULT_MODEL || undefined;
-      args = { agent_driver: driver, ...(model ? { agent_model: model } : {}), ...args };
+      args = { agent_driver: driver, ...(model ? { agent_model: model } : {}), spawning_namespace: this.namespace, ...args };
     }
 
     return new Promise((resolve) => {
