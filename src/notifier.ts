@@ -18,19 +18,15 @@ import {
   chatOutgoingChannel,
   chatIncomingChannel,
   notifyChannel,
+  notifyListKey,
   metaAgentStatusKey,
   metaInputKey,
+  type NotificationPayload,
+  type ChatMessage,
 } from "@gonzih/cc-wire";
 import { splitLongMessage } from "./formatter.js";
 
-export interface ChatMessage {
-  id: string;
-  source: "telegram" | "ui" | "claude" | "cc-tg";
-  role: "user" | "assistant" | "tool";
-  content: string;
-  timestamp: string;
-  chatId: number;
-}
+export type { ChatMessage };
 
 function log(level: "info" | "warn" | "error", ...args: unknown[]): void {
   const fn = level === "error" ? console.error : level === "warn" ? console.warn : console.log;
@@ -64,7 +60,7 @@ function stripAnsi(text: string): string {
  */
 export function isDiscordOnly(raw: string): boolean {
   try {
-    const parsed = JSON.parse(raw) as { discord_only?: boolean };
+    const parsed = JSON.parse(raw) as NotificationPayload & { discord_only?: boolean };
     return parsed.discord_only === true;
   } catch {
     return false;
@@ -81,10 +77,10 @@ export function isDiscordOnly(raw: string): boolean {
  */
 export function shouldSkipForTelegram(raw: string): boolean {
   try {
-    const parsed = JSON.parse(raw) as { discord_only?: boolean; routing?: unknown };
+    const parsed = JSON.parse(raw) as NotificationPayload & { discord_only?: boolean };
     if (parsed.discord_only === true) return true;
     if (Array.isArray(parsed.routing) && parsed.routing.length > 0) {
-      return !(parsed.routing as string[]).includes("telegram");
+      return !parsed.routing.includes("telegram");
     }
     return false;
   } catch {
@@ -106,7 +102,7 @@ export function parseNotification(raw: string): string {
   let model: string | undefined;
   let cost: number | undefined;
   try {
-    const parsed = JSON.parse(raw) as { text?: string; driver?: string; model?: string; cost?: number };
+    const parsed = JSON.parse(raw) as Partial<NotificationPayload>;
     if (parsed.text) text = parsed.text;
     driver = parsed.driver;
     model = parsed.model;
@@ -285,9 +281,8 @@ export function startNotifier(
     buf.timer = setTimeout(() => flushMetaAgentBuffer(ns, targetChatId), META_AGENT_FLUSH_DELAY_MS);
   });
 
-  // Poll the notifyChannel(namespace) LIST every 5 seconds.
+  // Poll the notifyListKey(namespace) LIST every 5 seconds.
   // Jobs push to this list via RPUSH; pub/sub alone won't deliver those messages.
-  const notifyListKey = notifyChannel(namespace);
   const MAX_PER_CYCLE = 20;
 
   const pollNotifyList = async (): Promise<void> => {
@@ -297,7 +292,7 @@ export function startNotifier(
     const items: string[] = [];
     try {
       for (let i = 0; i < MAX_PER_CYCLE; i++) {
-        const item = await redis.rpop(notifyListKey);
+        const item = await redis.rpop(notifyListKey(namespace));
         if (item === null) break;
         items.push(item);
       }
@@ -311,7 +306,7 @@ export function startNotifier(
     let remaining = 0;
     if (items.length === MAX_PER_CYCLE) {
       try {
-        remaining = await redis.llen(notifyListKey);
+        remaining = await redis.llen(notifyListKey(namespace));
       } catch (err) {
         log("warn", "notify list llen failed:", (err as Error).message);
       }
