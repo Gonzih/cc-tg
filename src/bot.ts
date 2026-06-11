@@ -18,7 +18,6 @@ import { detectUsageLimit } from "./usage-limit.js";
 import { getCurrentToken, rotateToken, getTokenIndex, getTokenCount } from "./tokens.js";
 import { writeChatLog, type ChatMessage } from "./notifier.js";
 import { CronManager } from "./cron.js";
-import { parseRoutingTag, ensureMetaAgent, routeToMetaAgent } from "./router.js";
 import { VOICE_PENDING_KEY, VOICE_FAILED_KEY, TTL, metaAgentStatusKey, wikiKey, wikiUpdatedKey } from "@gonzih/cc-wire";
 
 const BOT_COMMANDS: Array<{ command: string; description: string }> = [
@@ -246,8 +245,6 @@ export class CcTgBot {
   private namespace: string;
   private lastActiveChatId?: number;
   private cron: CronManager;
-  /** In-memory cache of forum topic names: `${chatId}:${threadId}` → topic name */
-  private topicNameCache = new Map<string, string>();
   /** Pending /wiki update state: chatId → {repoSlug, pageName, threadId} — awaiting user's next message as content */
   private pendingWikiUpdates = new Map<number, { repoSlug: string; pageName: string; threadId?: number }>();
 
@@ -334,19 +331,6 @@ export class CcTgBot {
     }
   }
 
-  /**
-   * Parse FORUM_META_AGENT_ROUTING env var.
-   *   "auto" (default) → route all forum topics to meta-agents
-   *   "off"            → disable forum routing entirely
-   *   "topic-a,topic-b" → only route these named topics
-   */
-  private getForumRoutingConfig(): "auto" | "off" | Set<string> {
-    const raw = process.env.FORUM_META_AGENT_ROUTING;
-    if (!raw || raw === "auto") return "auto";
-    if (raw === "off") return "off";
-    return new Set(raw.split(",").map((s) => s.trim()).filter(Boolean));
-  }
-
   private isAllowed(userId: number): boolean {
     if (!this.opts.allowedUserIds?.length) return true;
     return this.opts.allowedUserIds.includes(userId);
@@ -363,27 +347,6 @@ export class CcTgBot {
     const threadName = rawMsg.forum_topic_created
       ? (rawMsg.forum_topic_created as Record<string, unknown>).name as string | undefined
       : undefined;
-
-    // Cache forum topic names from service messages so routing can look them up later
-    if (threadId !== undefined) {
-      if (threadName) {
-        this.topicNameCache.set(`${chatId}:${threadId}`, threadName);
-      }
-      // forum_topic_edited carries name only when the name was changed
-      const editedTopicName = (rawMsg.forum_topic_edited as Record<string, unknown> | undefined)?.name as string | undefined;
-      if (editedTopicName) {
-        this.topicNameCache.set(`${chatId}:${threadId}`, editedTopicName);
-      }
-      // Best-effort: first message in a topic often has reply_to_message pointing to the creation event
-      if (!this.topicNameCache.has(`${chatId}:${threadId}`)) {
-        const replyRaw = msg.reply_to_message as unknown as Record<string, unknown> | undefined;
-        const replyCreated = replyRaw?.forum_topic_created as Record<string, unknown> | undefined;
-        const replyName = replyCreated?.name as string | undefined;
-        if (replyName) {
-          this.topicNameCache.set(`${chatId}:${threadId}`, replyName);
-        }
-      }
-    }
 
     if (!this.isAllowed(userId)) {
       await this.replyToChat(chatId, "Not authorized.", threadId);
@@ -577,71 +540,6 @@ export class CcTgBot {
     if (text === "/compact") {
       await this.handleCompact(chatId, threadId);
       return;
-    }
-
-    // #tag / #org/repo routing — delegate to meta-agent instead of local Claude session
-    if (this.redis) {
-      const routing = parseRoutingTag(text);
-      if (routing) {
-        // Acknowledge routing immediately so user knows the message was delegated
-        await this.replyToChat(chatId, `→ #${routing.namespace}`, threadId);
-        this.writeChatMessage("user", "telegram", text, chatId);
-        // Register the originating chatId so responses come back to this chat
-        this.opts.registerRoutedChatId?.(routing.namespace, chatId);
-        try {
-          await ensureMetaAgent(
-            routing.namespace,
-            routing.repoUrl,
-            (toolName, args) => this.callCcAgentTool(toolName, args ?? {}),
-            this.redis
-          );
-          await routeToMetaAgent(routing.namespace, routing.strippedMessage, this.redis);
-        } catch (err) {
-          await this.replyToChat(
-            chatId,
-            `Failed to route to #${routing.namespace}: ${(err as Error).message}`,
-            threadId
-          );
-        }
-        return;
-      }
-    }
-
-    // Forum topic → meta-agent routing (runs after hashtag routing so explicit #tag wins)
-    if (this.redis && threadId !== undefined) {
-      const topicKey = `${chatId}:${threadId}`;
-      const topicName = this.topicNameCache.get(topicKey);
-      if (topicName) {
-        const namespace = normalizeTopicNamespace(topicName);
-        const routingConfig = this.getForumRoutingConfig();
-        const shouldRoute =
-          routingConfig === "auto" ||
-          (routingConfig instanceof Set && (routingConfig.has(topicName) || routingConfig.has(namespace)));
-        if (shouldRoute) {
-          const defaultOrg = process.env.DEFAULT_GITHUB_ORG ?? "gonzih";
-          const repoUrl = `https://github.com/${defaultOrg}/${namespace}`;
-          await this.replyToChat(chatId, `→ #${namespace} (meta-agent)`, threadId);
-          this.writeChatMessage("user", "telegram", text, chatId);
-          // Register the originating chatId so responses come back to this chat
-          this.opts.registerRoutedChatId?.(namespace, chatId);
-          try {
-            await ensureMetaAgent(
-              namespace,
-              repoUrl,
-              (toolName, args) => this.callCcAgentTool(toolName, args ?? {}),
-              this.redis
-            );
-            await routeToMetaAgent(namespace, text, this.redis);
-          } catch (err) {
-            await this.replyToChat(
-              chatId,
-              `Failed to route to #${namespace}: ${(err as Error).message}`,
-              threadId
-            );
-          }
-          return;
-        }
-      }
     }
 
     const session = this.getOrCreateSession(chatId, threadId, threadName);
@@ -2132,26 +2030,6 @@ export function listSkills(): string {
     }
   }
   return lines.join("\n");
-}
-
-/**
- * Normalize a Telegram forum topic name into a meta-agent namespace.
- * Rules: strip leading #, lowercase, spaces → hyphens, non-alphanumeric → hyphens,
- * collapse and trim hyphens.
- *
- * Examples:
- *   "CC Suite"  → "cc-suite"
- *   "#research" → "research"
- *   "of-stack"  → "of-stack"
- */
-export function normalizeTopicNamespace(name: string): string {
-  return name
-    .replace(/^#+/, "")              // strip leading # prefix
-    .toLowerCase()
-    .replace(/\s+/g, "-")           // spaces → hyphens
-    .replace(/[^a-z0-9._-]/g, "-")  // non-alphanumeric/non-safe → hyphens
-    .replace(/-+/g, "-")            // collapse consecutive hyphens
-    .replace(/^-|-$/g, "");         // trim leading/trailing hyphens
 }
 
 export function splitMessage(text: string, maxLen = 4096): string[] {
