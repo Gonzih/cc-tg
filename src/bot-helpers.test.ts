@@ -1,6 +1,5 @@
 /**
  * Unit tests for exported helper functions in bot.ts:
- *   - normalizeTopicNamespace (pure function, no mocks needed)
  *   - listSkills (fs-dependent)
  *   - enrichPromptWithUrls (https-dependent)
  *
@@ -93,62 +92,7 @@ vi.mock("child_process", async (importOriginal) => {
   return { ...actual, execSync: mocks.execSyncMock };
 });
 
-import { normalizeTopicNamespace, listSkills, enrichPromptWithUrls } from "./bot.js";
-
-// ---------------------------------------------------------------------------
-// normalizeTopicNamespace
-// ---------------------------------------------------------------------------
-
-describe("normalizeTopicNamespace", () => {
-  it("lowercases the name", () => {
-    expect(normalizeTopicNamespace("MyNamespace")).toBe("mynamespace");
-  });
-
-  it("strips leading # characters", () => {
-    expect(normalizeTopicNamespace("#research")).toBe("research");
-    expect(normalizeTopicNamespace("##double")).toBe("double");
-  });
-
-  it("replaces spaces with hyphens", () => {
-    expect(normalizeTopicNamespace("CC Suite")).toBe("cc-suite");
-    expect(normalizeTopicNamespace("my namespace here")).toBe("my-namespace-here");
-  });
-
-  it("replaces non-alphanumeric/non-safe chars with hyphens", () => {
-    // trailing "!" → "-" then trimmed by the final replace
-    expect(normalizeTopicNamespace("hello@world!")).toBe("hello-world");
-  });
-
-  it("collapses consecutive hyphens", () => {
-    expect(normalizeTopicNamespace("foo  bar")).toBe("foo-bar"); // two spaces → two hyphens → collapsed
-  });
-
-  it("trims leading and trailing hyphens", () => {
-    expect(normalizeTopicNamespace("@leading")).toBe("leading");
-    expect(normalizeTopicNamespace("trailing@")).toBe("trailing");
-  });
-
-  it("preserves dots, underscores, and existing hyphens", () => {
-    expect(normalizeTopicNamespace("of-stack")).toBe("of-stack");
-    expect(normalizeTopicNamespace("v1.2.3")).toBe("v1.2.3");
-  });
-
-  it("handles the doc example: 'CC Suite' → 'cc-suite'", () => {
-    expect(normalizeTopicNamespace("CC Suite")).toBe("cc-suite");
-  });
-
-  it("handles the doc example: '#research' → 'research'", () => {
-    expect(normalizeTopicNamespace("#research")).toBe("research");
-  });
-
-  it("handles empty string", () => {
-    expect(normalizeTopicNamespace("")).toBe("");
-  });
-
-  it("handles already-normalized name unchanged", () => {
-    expect(normalizeTopicNamespace("my-namespace")).toBe("my-namespace");
-  });
-});
+import { listSkills, enrichPromptWithUrls } from "./bot.js";
 
 // ---------------------------------------------------------------------------
 // listSkills

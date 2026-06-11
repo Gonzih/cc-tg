@@ -4,8 +4,6 @@
  * Covers scenarios NOT tested in bot.integration.test.ts / bot.test.ts:
  *  - Unauthorized user rejection (full handleTelegram flow)
  *  - Group chat filtering (allowlist, mention, reply-to-bot, command)
- *  - Hashtag meta-agent routing (acknowledgement, error recovery, no-redis fallthrough)
- *  - Forum topic routing (auto/off/named-set config, topicNameCache)
  *  - forwardNotification session guards (active, none, exited)
  *  - handleUserMessage error path (sendPrompt throws)
  *  - Claude process error event handling
@@ -50,10 +48,6 @@ const mocks = vi.hoisted(() => ({
   redisLpush: vi.fn().mockResolvedValue(1),
   redisLtrim: vi.fn().mockResolvedValue('OK'),
   redisPublish: vi.fn().mockResolvedValue(1),
-  // Router module functions
-  parseRoutingTagMock: vi.fn().mockReturnValue(null),
-  ensureMetaAgentMock: vi.fn().mockResolvedValue(undefined),
-  routeToMetaAgentMock: vi.fn().mockResolvedValue(undefined),
   // Voice module functions
   isVoiceAvailableMock: vi.fn().mockReturnValue(true),
   transcribeVoiceMock: vi.fn().mockResolvedValue('hello'),
@@ -116,13 +110,7 @@ vi.mock('./voice.js', () => ({
   transcribeVoice: mocks.transcribeVoiceMock,
 }));
 
-vi.mock('./router.js', () => ({
-  parseRoutingTag: (...args: unknown[]) => mocks.parseRoutingTagMock(...args),
-  ensureMetaAgent: (...args: unknown[]) => mocks.ensureMetaAgentMock(...args),
-  routeToMetaAgent: (...args: unknown[]) => mocks.routeToMetaAgentMock(...args),
-}));
-
-vi.mock('fs', async (importOriginal) => {
+vi.mock('fs',async (importOriginal) => {
   const actual = await importOriginal<typeof import('fs')>();
   return {
     ...actual,
@@ -186,7 +174,6 @@ describe('CcTgBot — authorization via handleTelegram', () => {
     mocks.claudeInstance = null;
     mocks.tgSendMessage.mockResolvedValue({ message_id: 1 });
     mocks.readFileSyncMock.mockReturnValue('{}');
-    mocks.parseRoutingTagMock.mockReturnValue(null);
   });
 
   afterEach(() => {
@@ -239,7 +226,6 @@ describe('CcTgBot — group chat filtering', () => {
     mocks.claudeInstance = null;
     mocks.tgSendMessage.mockResolvedValue({ message_id: 1 });
     mocks.readFileSyncMock.mockReturnValue('{}');
-    mocks.parseRoutingTagMock.mockReturnValue(null);
     bot = new CcTgBot({ telegramToken: 'tok' });
     // Set bot identity synchronously (normally resolved via async getMe())
     (bot as any).botUsername = 'testbot';
@@ -348,318 +334,7 @@ describe('CcTgBot — group chat filtering', () => {
 });
 
 // ===========================================================================
-// 3. Hashtag meta-agent routing
-// ===========================================================================
-describe('CcTgBot — hashtag meta-agent routing', () => {
-  let bot: CcTgBot;
-
-  beforeEach(() => {
-    vi.useFakeTimers();
-    vi.clearAllMocks();
-    mocks.claudeInstance = null;
-    mocks.tgSendMessage.mockResolvedValue({ message_id: 1 });
-    mocks.readFileSyncMock.mockReturnValue('{}');
-    mocks.parseRoutingTagMock.mockReturnValue(null);
-    mocks.ensureMetaAgentMock.mockResolvedValue(undefined);
-    mocks.routeToMetaAgentMock.mockResolvedValue(undefined);
-  });
-
-  afterEach(() => {
-    bot?.stop();
-    vi.useRealTimers();
-  });
-
-  it('sends "→ #namespace" acknowledgement immediately on routing tag match', async () => {
-    bot = new CcTgBot({ telegramToken: 'tok', redis: makeRedis() });
-    mocks.parseRoutingTagMock.mockReturnValue({
-      namespace: 'my-agent',
-      repoUrl: 'https://github.com/org/my-agent',
-      strippedMessage: 'fix the bug',
-    });
-
-    await (bot as any).handleTelegram(makeMsg({ text: '#my-agent fix the bug' }));
-
-    // 2-arg call (no threadId → no opts)
-    expect(mocks.tgSendMessage).toHaveBeenCalledWith(42, '→ #my-agent');
-  });
-
-  it('does NOT create a local Claude session when routing tag is matched', async () => {
-    bot = new CcTgBot({ telegramToken: 'tok', redis: makeRedis() });
-    mocks.parseRoutingTagMock.mockReturnValue({
-      namespace: 'my-agent',
-      repoUrl: 'https://github.com/org/my-agent',
-      strippedMessage: 'do thing',
-    });
-
-    await (bot as any).handleTelegram(makeMsg({ text: '#my-agent do thing' }));
-
-    expect(mocks.claudeInstance).toBeNull();
-    expect((bot as any).sessions.size).toBe(0);
-  });
-
-  it('calls ensureMetaAgent with correct namespace and repoUrl', async () => {
-    bot = new CcTgBot({ telegramToken: 'tok', redis: makeRedis() });
-    mocks.parseRoutingTagMock.mockReturnValue({
-      namespace: 'worker',
-      repoUrl: 'https://github.com/acme/worker',
-      strippedMessage: 'run task',
-    });
-
-    await (bot as any).handleTelegram(makeMsg({ text: '#acme/worker run task' }));
-
-    expect(mocks.ensureMetaAgentMock).toHaveBeenCalledWith(
-      'worker',
-      'https://github.com/acme/worker',
-      expect.any(Function),
-      expect.anything(),
-    );
-  });
-
-  it('calls routeToMetaAgent with strippedMessage after ensureMetaAgent resolves', async () => {
-    bot = new CcTgBot({ telegramToken: 'tok', redis: makeRedis() });
-    mocks.parseRoutingTagMock.mockReturnValue({
-      namespace: 'ns',
-      repoUrl: 'https://github.com/org/ns',
-      strippedMessage: 'the actual task',
-    });
-
-    await (bot as any).handleTelegram(makeMsg({ text: '#ns the actual task' }));
-
-    expect(mocks.routeToMetaAgentMock).toHaveBeenCalledWith(
-      'ns',
-      'the actual task',
-      expect.anything(),
-    );
-  });
-
-  it('sends error reply when ensureMetaAgent throws', async () => {
-    bot = new CcTgBot({ telegramToken: 'tok', redis: makeRedis() });
-    mocks.parseRoutingTagMock.mockReturnValue({
-      namespace: 'broken',
-      repoUrl: 'https://github.com/org/broken',
-      strippedMessage: 'do stuff',
-    });
-    mocks.ensureMetaAgentMock.mockRejectedValue(new Error('timeout waiting for workspace'));
-
-    await (bot as any).handleTelegram(makeMsg({ text: '#broken do stuff' }));
-
-    const allMessages = mocks.tgSendMessage.mock.calls.map(([, t]: [unknown, string]) => t);
-    expect(allMessages.some((t) => t.includes('Failed to route to #broken'))).toBe(true);
-    expect(allMessages.some((t) => t.includes('timeout waiting for workspace'))).toBe(true);
-  });
-
-  it('calls registerRoutedChatId callback when routing tag is found', async () => {
-    const registerRoutedChatId = vi.fn();
-    bot = new CcTgBot({ telegramToken: 'tok', redis: makeRedis(), registerRoutedChatId });
-    mocks.parseRoutingTagMock.mockReturnValue({
-      namespace: 'ns1',
-      repoUrl: 'https://github.com/org/ns1',
-      strippedMessage: 'work',
-    });
-
-    await (bot as any).handleTelegram(makeMsg({ text: '#ns1 work' }));
-
-    expect(registerRoutedChatId).toHaveBeenCalledWith('ns1', 42);
-  });
-
-  it('skips routing when redis is not configured and falls through to local Claude', async () => {
-    bot = new CcTgBot({ telegramToken: 'tok' }); // no redis
-    mocks.parseRoutingTagMock.mockReturnValue({
-      namespace: 'my-agent',
-      repoUrl: 'https://github.com/org/my-agent',
-      strippedMessage: 'work',
-    });
-
-    await (bot as any).handleTelegram(makeMsg({ text: '#my-agent work' }));
-
-    // No redis → routing skipped → local Claude session created
-    expect(mocks.claudeInstance).not.toBeNull();
-    expect(mocks.ensureMetaAgentMock).not.toHaveBeenCalled();
-  });
-
-  it('includes message_thread_id in acknowledgement for forum topic messages', async () => {
-    bot = new CcTgBot({ telegramToken: 'tok', redis: makeRedis() });
-    mocks.parseRoutingTagMock.mockReturnValue({
-      namespace: 'ns',
-      repoUrl: 'https://github.com/org/ns',
-      strippedMessage: 'work',
-    });
-
-    await (bot as any).handleTelegram(makeMsg({
-      text: '#ns work',
-      message_thread_id: 7,
-    }));
-
-    // 3-arg call with options object (threadId is passed to replyToChat)
-    expect(mocks.tgSendMessage).toHaveBeenCalledWith(
-      42,
-      '→ #ns',
-      expect.objectContaining({ message_thread_id: 7 }),
-    );
-  });
-});
-
-// ===========================================================================
-// 4. Forum topic routing
-// ===========================================================================
-describe('CcTgBot — forum topic routing via topicNameCache', () => {
-  let bot: CcTgBot;
-
-  beforeEach(() => {
-    vi.useFakeTimers();
-    vi.clearAllMocks();
-    mocks.claudeInstance = null;
-    mocks.tgSendMessage.mockResolvedValue({ message_id: 1 });
-    mocks.readFileSyncMock.mockReturnValue('{}');
-    mocks.parseRoutingTagMock.mockReturnValue(null); // no hashtag match
-    mocks.ensureMetaAgentMock.mockResolvedValue(undefined);
-    mocks.routeToMetaAgentMock.mockResolvedValue(undefined);
-    delete process.env.FORUM_META_AGENT_ROUTING;
-    delete process.env.DEFAULT_GITHUB_ORG;
-  });
-
-  afterEach(() => {
-    bot?.stop();
-    vi.useRealTimers();
-    delete process.env.FORUM_META_AGENT_ROUTING;
-    delete process.env.DEFAULT_GITHUB_ORG;
-  });
-
-  it('routes message to meta-agent in auto mode when topic name is cached', async () => {
-    process.env.DEFAULT_GITHUB_ORG = 'myorg';
-    bot = new CcTgBot({ telegramToken: 'tok', redis: makeRedis() });
-    // Pre-populate the cache (no service message needed)
-    (bot as any).topicNameCache.set('42:7', 'my-project');
-
-    // Use no chat.type to bypass group filtering; threadId triggers forum routing
-    await (bot as any).handleTelegram({
-      chat: { id: 42 },
-      from: { id: 100 },
-      text: 'please deploy',
-      message_thread_id: 7,
-    });
-
-    expect(mocks.tgSendMessage).toHaveBeenCalledWith(
-      42,
-      '→ #my-project (meta-agent)',
-      expect.objectContaining({ message_thread_id: 7 }),
-    );
-    expect(mocks.ensureMetaAgentMock).toHaveBeenCalled();
-    expect(mocks.claudeInstance).toBeNull();
-  });
-
-  it('does not route when FORUM_META_AGENT_ROUTING=off, falls through to Claude', async () => {
-    process.env.FORUM_META_AGENT_ROUTING = 'off';
-    bot = new CcTgBot({ telegramToken: 'tok', redis: makeRedis() });
-    (bot as any).topicNameCache.set('42:7', 'my-project');
-
-    await (bot as any).handleTelegram({
-      chat: { id: 42 },
-      from: { id: 100 },
-      text: 'please deploy',
-      message_thread_id: 7,
-    });
-
-    expect(mocks.ensureMetaAgentMock).not.toHaveBeenCalled();
-    expect(mocks.claudeInstance).not.toBeNull();
-  });
-
-  it('routes only named topics when FORUM_META_AGENT_ROUTING contains matching topic', async () => {
-    process.env.FORUM_META_AGENT_ROUTING = 'my-project,other-service';
-    process.env.DEFAULT_GITHUB_ORG = 'myorg';
-    bot = new CcTgBot({ telegramToken: 'tok', redis: makeRedis() });
-    (bot as any).topicNameCache.set('42:7', 'my-project'); // in the allowlist
-
-    await (bot as any).handleTelegram({
-      chat: { id: 42 },
-      from: { id: 100 },
-      text: 'do something',
-      message_thread_id: 7,
-    });
-
-    expect(mocks.ensureMetaAgentMock).toHaveBeenCalled();
-    expect(mocks.claudeInstance).toBeNull();
-  });
-
-  it('does not route when topic is NOT in the named allowlist, falls through to Claude', async () => {
-    process.env.FORUM_META_AGENT_ROUTING = 'other-topic';
-    bot = new CcTgBot({ telegramToken: 'tok', redis: makeRedis() });
-    (bot as any).topicNameCache.set('42:7', 'my-project'); // not in allowlist
-
-    await (bot as any).handleTelegram({
-      chat: { id: 42 },
-      from: { id: 100 },
-      text: 'do something',
-      message_thread_id: 7,
-    });
-
-    expect(mocks.ensureMetaAgentMock).not.toHaveBeenCalled();
-    expect(mocks.claudeInstance).not.toBeNull();
-  });
-
-  it('does not route when topic name is not in cache, falls through to Claude', async () => {
-    bot = new CcTgBot({ telegramToken: 'tok', redis: makeRedis() });
-    // No topicNameCache entry
-
-    await (bot as any).handleTelegram({
-      chat: { id: 42 },
-      from: { id: 100 },
-      text: 'regular message',
-      message_thread_id: 7,
-    });
-
-    expect(mocks.ensureMetaAgentMock).not.toHaveBeenCalled();
-    expect(mocks.claudeInstance).not.toBeNull();
-  });
-
-  it('caches topic name from forum_topic_created service message', async () => {
-    bot = new CcTgBot({ telegramToken: 'tok', redis: makeRedis() });
-
-    await (bot as any).handleTelegram({
-      chat: { id: 42, type: 'supergroup' },
-      from: { id: 100 },
-      message_thread_id: 9,
-      forum_topic_created: { name: 'new-topic' },
-    });
-
-    expect((bot as any).topicNameCache.get('42:9')).toBe('new-topic');
-  });
-
-  it('updates cached topic name from forum_topic_edited service message', async () => {
-    bot = new CcTgBot({ telegramToken: 'tok', redis: makeRedis() });
-    (bot as any).topicNameCache.set('42:9', 'old-name');
-
-    await (bot as any).handleTelegram({
-      chat: { id: 42, type: 'supergroup' },
-      from: { id: 100 },
-      message_thread_id: 9,
-      forum_topic_edited: { name: 'updated-name' },
-    });
-
-    expect((bot as any).topicNameCache.get('42:9')).toBe('updated-name');
-  });
-
-  it('sends error reply when forum ensureMetaAgent throws', async () => {
-    process.env.DEFAULT_GITHUB_ORG = 'myorg';
-    bot = new CcTgBot({ telegramToken: 'tok', redis: makeRedis() });
-    (bot as any).topicNameCache.set('42:7', 'my-project');
-    mocks.ensureMetaAgentMock.mockRejectedValue(new Error('startup failed'));
-
-    await (bot as any).handleTelegram({
-      chat: { id: 42 },
-      from: { id: 100 },
-      text: 'do work',
-      message_thread_id: 7,
-    });
-
-    const allMessages = mocks.tgSendMessage.mock.calls.map(([, t]: [unknown, string]) => t);
-    expect(allMessages.some((t) => t.includes('Failed to route to #my-project'))).toBe(true);
-    expect(allMessages.some((t) => t.includes('startup failed'))).toBe(true);
-  });
-});
-
-// ===========================================================================
-// 5. forwardNotification session guards
+// 3. forwardNotification session guards
 // ===========================================================================
 describe('CcTgBot — forwardNotification', () => {
   let bot: CcTgBot;
@@ -670,7 +345,6 @@ describe('CcTgBot — forwardNotification', () => {
     mocks.claudeInstance = null;
     mocks.tgSendMessage.mockResolvedValue({ message_id: 1 });
     mocks.readFileSyncMock.mockReturnValue('{}');
-    mocks.parseRoutingTagMock.mockReturnValue(null);
     bot = new CcTgBot({ telegramToken: 'tok' });
   });
 
@@ -729,7 +403,6 @@ describe('CcTgBot — handleUserMessage error path', () => {
     mocks.claudeInstance = null;
     mocks.tgSendMessage.mockResolvedValue({ message_id: 1 });
     mocks.readFileSyncMock.mockReturnValue('{}');
-    mocks.parseRoutingTagMock.mockReturnValue(null);
     bot = new CcTgBot({ telegramToken: 'tok' });
   });
 
@@ -778,7 +451,6 @@ describe('CcTgBot — Claude process error event', () => {
     mocks.claudeInstance = null;
     mocks.tgSendMessage.mockResolvedValue({ message_id: 1 });
     mocks.readFileSyncMock.mockReturnValue('{}');
-    mocks.parseRoutingTagMock.mockReturnValue(null);
     bot = new CcTgBot({ telegramToken: 'tok' });
   });
 
@@ -821,7 +493,6 @@ describe('CcTgBot — sendMessage HTML failure retry', () => {
     vi.clearAllMocks();
     mocks.claudeInstance = null;
     mocks.readFileSyncMock.mockReturnValue('{}');
-    mocks.parseRoutingTagMock.mockReturnValue(null);
     bot = new CcTgBot({ telegramToken: 'tok' });
   });
 
@@ -863,7 +534,6 @@ describe('CcTgBot — getLastActiveChatId', () => {
     mocks.claudeInstance = null;
     mocks.tgSendMessage.mockResolvedValue({ message_id: 1 });
     mocks.readFileSyncMock.mockReturnValue('{}');
-    mocks.parseRoutingTagMock.mockReturnValue(null);
     bot = new CcTgBot({ telegramToken: 'tok' });
   });
 
@@ -900,7 +570,6 @@ describe('CcTgBot — voice message Redis bookkeeping', () => {
     mocks.tgSendMessage.mockResolvedValue({ message_id: 1 });
     mocks.tgGetFileLink.mockResolvedValue('https://tg.example.com/voice.ogg');
     mocks.readFileSyncMock.mockReturnValue('{}');
-    mocks.parseRoutingTagMock.mockReturnValue(null);
     mocks.isVoiceAvailableMock.mockReturnValue(true);
     mocks.transcribeVoiceMock.mockResolvedValue('hello voice');
     mocks.redisRpush.mockResolvedValue(1);
@@ -1038,7 +707,6 @@ describe('CcTgBot — /voice_retry command', () => {
     mocks.tgSendMessage.mockResolvedValue({ message_id: 1 });
     mocks.tgGetFileLink.mockResolvedValue('https://tg.example.com/voice.ogg');
     mocks.readFileSyncMock.mockReturnValue('{}');
-    mocks.parseRoutingTagMock.mockReturnValue(null);
     mocks.isVoiceAvailableMock.mockReturnValue(true);
     mocks.transcribeVoiceMock.mockResolvedValue('ok transcript');
     mocks.redisLrange.mockResolvedValue([]);
@@ -1157,7 +825,6 @@ describe('CcTgBot — CostStore corrupt JSON recovery', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.claudeInstance = null;
-    mocks.parseRoutingTagMock.mockReturnValue(null);
   });
 
   it('constructs without throwing when costs.json contains invalid JSON', () => {

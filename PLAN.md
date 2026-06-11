@@ -1,41 +1,46 @@
-# PLAN.md — fix/router-numeric-hashtag
+# PLAN.md — feat/remove-hashtag-routing
 
 ## Task Restatement
-`parseRoutingTag()` in `src/router.ts` currently matches `#57`, `#123`, `#2fast` as valid
-routing tags because the regex first character class is `[a-zA-Z0-9]`. This causes Telegram
-messages containing issue/PR reference numbers to spawn ghost meta-agent namespaces.
-Fix: require the first character after `#` to be alphabetic (`[a-zA-Z]`).
+Remove all automatic hashtag-triggered meta-agent routing from cc-tg. This includes
+the `#tag` / `#org/repo` pattern that spawned external meta-agents, and the forum-topic
+based routing that used the same underlying functions. After removal, all Telegram
+messages go directly to the local Claude session. The `/agents` command and notifier
+wiring remain untouched.
 
 ---
 
-## Approaches Considered
+## Approach
+Single surgical removal pass — delete the router module and all call sites in bot.ts
+and the associated tests. No replacement logic needed.
 
-### A) Require alphabetic first character in regex (CHOSEN)
-Change `#([a-zA-Z0-9][a-zA-Z0-9._-]*)` → `#([a-zA-Z][a-zA-Z0-9._-]*)`.
-**Pro**: One-character change, surgical, matches the spec exactly.
-**Con**: None.
+**Files to change:**
+- `src/router.ts` — delete entirely (parseRoutingTag, RoutingTag, ensureMetaAgent, routeToMetaAgent, CallToolFn)
+- `src/router.test.ts` — delete entirely
+- `src/forum-routing.test.ts` — delete entirely (tests normalizeTopicNamespace + forum routing)
+- `src/bot.ts`:
+  - Remove import of parseRoutingTag, ensureMetaAgent, routeToMetaAgent from ./router.js
+  - Remove `topicNameCache` private field
+  - Remove topicNameCache population block (~lines 367-386)
+  - Remove hashtag routing block (~lines 582-608)
+  - Remove forum routing block (~lines 610-645)
+  - Remove `getForumRoutingConfig()` method
+  - Remove `normalizeTopicNamespace` exported function
+- `src/bot.error.test.ts`:
+  - Remove parseRoutingTagMock, ensureMetaAgentMock, routeToMetaAgentMock from mocks
+  - Remove `vi.mock('./router.js', ...)` block
+  - Remove describe section 3 "hashtag meta-agent routing" (lines ~352-500)
+  - Remove describe section 4 "forum topic routing via topicNameCache" (lines ~502-659)
+  - Clean up `mocks.parseRoutingTagMock.mockReturnValue(null)` from all remaining beforeEach blocks
 
-### B) Post-match validation (reject if namespace is all-digits)
-After matching, check `if (/^\d+$/.test(namespace)) return null`.
-**Con**: More code; still fails for `#2fast`-style mixed tags.
-
-### C) Require at least 2 characters
-Ensure namespace is `[a-zA-Z][a-zA-Z0-9._-]+` (one or more after the letter).
-**Con**: Would reject single-letter tags like `#a` which are valid real repo names.
-
----
-
-## Approach: A
-
----
-
-## Files to Touch
-- `src/router.ts` — fix the regex and update the inline comment + JSDoc
-- `src/router.test.ts` — add tests for `#57`, `#123abc`, `#2fast`, update existing comment
+**Keep untouched:**
+- `registerRoutedChatId` in BotOptions (still referenced in index.ts/notifier)
+- `metaAgentStatusKey` import and `/agents` command handler
+- `startNotifier` and notifier.ts
+- `src/index.ts`
 
 ---
 
 ## Risks
-- The `#org/repo` format also uses the same first character class for `part1` (the org).
-  Changing the constraint means `#57/repo` won't route either, which is correct behaviour.
-- No other callers of `parseRoutingTag` in the codebase need changes.
+- Some tests in bot.error.test.ts reference topicNameCache directly via `(bot as any).topicNameCache`
+  — those tests are in the forum routing section being deleted, so fine.
+- META_AGENT_TIMEOUT_MS env var used only in ensureMetaAgent — becomes dead env var, no action needed.
