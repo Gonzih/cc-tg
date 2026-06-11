@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { startNotifier, writeChatLog, parseNotification, isDiscordOnly, type ChatMessage } from "./notifier.js";
+import { startNotifier, writeChatLog, parseNotification, isDiscordOnly, shouldSkipForTelegram, type ChatMessage } from "./notifier.js";
 
 // ---- ioredis mock ----
 const mockSubscribe = vi.fn().mockImplementation((_channel: string, cb?: (err: Error | null) => void) => {
@@ -1205,6 +1205,196 @@ describe("notify list poller — discord_only filter", () => {
     expect(bot.sendMessage).toHaveBeenCalledTimes(2);
     expect(bot.sendMessage).toHaveBeenCalledWith(444, "send me");
     expect(bot.sendMessage).toHaveBeenCalledWith(444, "send me too");
+  });
+});
+
+describe("shouldSkipForTelegram", () => {
+  it("returns false for plain string", () => {
+    expect(shouldSkipForTelegram("plain text")).toBe(false);
+  });
+
+  it("returns false when routing is absent", () => {
+    expect(shouldSkipForTelegram(JSON.stringify({ text: "hello" }))).toBe(false);
+  });
+
+  it("returns false when routing is empty array", () => {
+    expect(shouldSkipForTelegram(JSON.stringify({ text: "hello", routing: [] }))).toBe(false);
+  });
+
+  it("returns false when routing includes telegram", () => {
+    expect(shouldSkipForTelegram(JSON.stringify({ text: "hello", routing: ["telegram"] }))).toBe(false);
+  });
+
+  it("returns false when routing includes telegram and discord", () => {
+    expect(shouldSkipForTelegram(JSON.stringify({ text: "hello", routing: ["discord", "telegram"] }))).toBe(false);
+  });
+
+  it("returns true when routing is discord only", () => {
+    expect(shouldSkipForTelegram(JSON.stringify({ text: "hello", routing: ["discord"] }))).toBe(true);
+  });
+
+  it("returns true when routing has other targets but not telegram", () => {
+    expect(shouldSkipForTelegram(JSON.stringify({ text: "hello", routing: ["slack", "email"] }))).toBe(true);
+  });
+
+  it("returns true when discord_only is true (legacy flag)", () => {
+    expect(shouldSkipForTelegram(JSON.stringify({ text: "hello", discord_only: true }))).toBe(true);
+  });
+
+  it("returns false when discord_only is false and no routing", () => {
+    expect(shouldSkipForTelegram(JSON.stringify({ text: "hello", discord_only: false }))).toBe(false);
+  });
+
+  it("returns false for invalid JSON", () => {
+    expect(shouldSkipForTelegram("{bad json")).toBe(false);
+  });
+
+  it("discord_only:true takes priority even when routing includes telegram", () => {
+    expect(shouldSkipForTelegram(JSON.stringify({ text: "hello", discord_only: true, routing: ["telegram"] }))).toBe(true);
+  });
+});
+
+describe("routing field — pub/sub handler", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGet.mockResolvedValue(null);
+    mockRpop.mockResolvedValue(null);
+    const sub = {
+      subscribe: mockSubscribe,
+      psubscribe: mockPsubscribe,
+      on: mockOn,
+      lpush: mockLpush,
+      rpush: mockRpush,
+      ltrim: mockLtrim,
+      publish: mockPublish,
+      get: mockGet,
+    };
+    mockDuplicate.mockReturnValue(sub);
+  });
+
+  function captureMessageHandler() {
+    let handler: ((channel: string, message: string) => void) | undefined;
+    mockOn.mockImplementation((event: string, h: unknown) => {
+      if (event === "message") handler = h as typeof handler;
+    });
+    return (channel: string, message: string) => {
+      if (!handler) throw new Error("message handler not registered");
+      handler(channel, message);
+    };
+  }
+
+  it('sends when routing is absent', () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+    const send = captureMessageHandler();
+    startNotifier(bot as never, 1, "ns", redis as never);
+    send("cca:notify:ns", JSON.stringify({ text: "hello" }));
+    expect(bot.sendMessage).toHaveBeenCalledWith(1, "hello");
+  });
+
+  it('sends when routing: ["telegram"]', () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+    const send = captureMessageHandler();
+    startNotifier(bot as never, 1, "ns", redis as never);
+    send("cca:notify:ns", JSON.stringify({ text: "hello", routing: ["telegram"] }));
+    expect(bot.sendMessage).toHaveBeenCalledWith(1, "hello");
+  });
+
+  it('skips when routing: ["discord"]', () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+    const send = captureMessageHandler();
+    startNotifier(bot as never, 1, "ns", redis as never);
+    send("cca:notify:ns", JSON.stringify({ text: "hello", routing: ["discord"] }));
+    expect(bot.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('sends when routing: ["discord", "telegram"]', () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+    const send = captureMessageHandler();
+    startNotifier(bot as never, 1, "ns", redis as never);
+    send("cca:notify:ns", JSON.stringify({ text: "hello", routing: ["discord", "telegram"] }));
+    expect(bot.sendMessage).toHaveBeenCalledWith(1, "hello");
+  });
+
+  it('sends when routing is empty array', () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+    const send = captureMessageHandler();
+    startNotifier(bot as never, 1, "ns", redis as never);
+    send("cca:notify:ns", JSON.stringify({ text: "hello", routing: [] }));
+    expect(bot.sendMessage).toHaveBeenCalledWith(1, "hello");
+  });
+});
+
+describe("routing field — list poller", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    mockGet.mockResolvedValue(null);
+    mockRpop.mockResolvedValue(null);
+    mockLlen.mockResolvedValue(0);
+    const sub = {
+      subscribe: mockSubscribe,
+      psubscribe: mockPsubscribe,
+      on: mockOn,
+      lpush: mockLpush,
+      ltrim: mockLtrim,
+      publish: mockPublish,
+      get: mockGet,
+    };
+    mockDuplicate.mockReturnValue(sub);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('sends when routing is absent', async () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+    mockRpop.mockResolvedValueOnce(JSON.stringify({ text: "hello" })).mockResolvedValue(null);
+    startNotifier(bot as never, 1, "ns", redis as never);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(bot.sendMessage).toHaveBeenCalledWith(1, "hello");
+  });
+
+  it('sends when routing: ["telegram"]', async () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+    mockRpop.mockResolvedValueOnce(JSON.stringify({ text: "hello", routing: ["telegram"] })).mockResolvedValue(null);
+    startNotifier(bot as never, 1, "ns", redis as never);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(bot.sendMessage).toHaveBeenCalledWith(1, "hello");
+  });
+
+  it('skips when routing: ["discord"]', async () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+    mockRpop.mockResolvedValueOnce(JSON.stringify({ text: "hello", routing: ["discord"] })).mockResolvedValue(null);
+    startNotifier(bot as never, 1, "ns", redis as never);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(bot.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('sends when routing: ["discord", "telegram"]', async () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+    mockRpop.mockResolvedValueOnce(JSON.stringify({ text: "hello", routing: ["discord", "telegram"] })).mockResolvedValue(null);
+    startNotifier(bot as never, 1, "ns", redis as never);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(bot.sendMessage).toHaveBeenCalledWith(1, "hello");
+  });
+
+  it('sends when routing is empty array', async () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+    mockRpop.mockResolvedValueOnce(JSON.stringify({ text: "hello", routing: [] })).mockResolvedValue(null);
+    startNotifier(bot as never, 1, "ns", redis as never);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(bot.sendMessage).toHaveBeenCalledWith(1, "hello");
   });
 });
 
