@@ -387,14 +387,17 @@ export function startNotifier(
         };
         writeChatLog(redis, namespace, inMsg);
 
-        // Check if a meta-agent is running for this namespace; if so, route there instead
+        // Check if a meta-agent is registered for this namespace; if so, route there instead.
+        // Route for both "running" (actively processing) and "idle" (registered, waiting for input).
+        // The cc-agent poller handles concurrency: if busy, the message stays queued until the
+        // current turn finishes. Routing is gated on status key existence, not "running" only.
         void (async () => {
           let routedToMetaAgent = false;
           try {
             const statusRaw = await redis.get(metaAgentStatusKey(namespace));
             if (statusRaw) {
               const status = JSON.parse(statusRaw) as { status?: string };
-              if (status.status === "running") {
+              if (status.status === "running" || status.status === "idle") {
                 const entry = JSON.stringify({
                   id: crypto.randomUUID(),
                   content,

@@ -308,7 +308,9 @@ describe("startNotifier", () => {
     expect(bot.sendMessage).toHaveBeenCalledWith(100, "📱 [from UI]: hello meta");
   });
 
-  it("falls back to handleUserMessage when meta-agent status is not running", async () => {
+  it("routes to meta-agent input queue when meta-agent status is idle (registered, waiting)", async () => {
+    // Idle meta-agents are registered and ready for messages — they SHOULD receive them.
+    // The cc-agent poller handles concurrency; cc-tg just needs to route to the queue.
     const bot = makeBot();
     const redis = makeRedis();
     const handleUserMessage = vi.fn();
@@ -324,13 +326,40 @@ describe("startNotifier", () => {
 
     startNotifier(bot as never, 200, "ns-idle", redis as never, handleUserMessage);
 
-    messageHandler!("cca:chat:incoming:ns-idle", "hello coord");
+    messageHandler!("cca:chat:incoming:ns-idle", "hello meta");
+
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(mockRpush).toHaveBeenCalledWith(
+      "cca:meta:ns-idle:input",
+      expect.stringContaining('"content":"hello meta"')
+    );
+    expect(handleUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("falls back to handleUserMessage when meta-agent status key does not exist", async () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+    const handleUserMessage = vi.fn();
+
+    mockGet.mockResolvedValue(null); // no status key — meta-agent not registered
+
+    let messageHandler: ((channel: string, message: string) => void) | undefined;
+    mockOn.mockImplementation((event: string, handler: unknown) => {
+      if (event === "message") {
+        messageHandler = handler as (channel: string, message: string) => void;
+      }
+    });
+
+    startNotifier(bot as never, 200, "ns-unregistered", redis as never, handleUserMessage);
+
+    messageHandler!("cca:chat:incoming:ns-unregistered", "hello coord");
 
     await new Promise((r) => setTimeout(r, 0));
 
     expect(handleUserMessage).toHaveBeenCalledWith(200, "hello coord");
     expect(mockRpush).not.toHaveBeenCalledWith(
-      "cca:meta:ns-idle:input",
+      "cca:meta:ns-unregistered:input",
       expect.anything()
     );
   });
