@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { startNotifier, writeChatLog, parseNotification, type ChatMessage } from "./notifier.js";
+import { startNotifier, writeChatLog, parseNotification, isDiscordOnly, type ChatMessage } from "./notifier.js";
 
 // ---- ioredis mock ----
 const mockSubscribe = vi.fn().mockImplementation((_channel: string, cb?: (err: Error | null) => void) => {
@@ -1028,6 +1028,40 @@ describe("parseNotification", () => {
     expect(bot.sendMessage).toHaveBeenCalledWith(456, "Job done");
   });
 
+  it("pub/sub handler skips discord_only:true notifications (nothing sent to Telegram)", () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+
+    let messageHandler: ((channel: string, message: string) => void) | undefined;
+    mockOn.mockImplementation((event: string, handler: unknown) => {
+      if (event === "message") {
+        messageHandler = handler as (channel: string, message: string) => void;
+      }
+    });
+
+    startNotifier(bot as never, 456, "myns", redis as never);
+
+    messageHandler!("cca:notify:myns", JSON.stringify({ text: "hello", discord_only: true }));
+    expect(bot.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("pub/sub handler sends discord_only:false notifications normally", () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+
+    let messageHandler: ((channel: string, message: string) => void) | undefined;
+    mockOn.mockImplementation((event: string, handler: unknown) => {
+      if (event === "message") {
+        messageHandler = handler as (channel: string, message: string) => void;
+      }
+    });
+
+    startNotifier(bot as never, 456, "myns", redis as never);
+
+    messageHandler!("cca:notify:myns", JSON.stringify({ text: "hello", discord_only: false }));
+    expect(bot.sendMessage).toHaveBeenCalledWith(456, "hello");
+  });
+
   it("pub/sub handler uses parseNotification — JSON badge appears in sent message", () => {
     // This is an integration check through the message handler
     const bot = makeBot();
@@ -1061,6 +1095,116 @@ describe("parseNotification", () => {
     messageHandler!("cca:notify:ns2", JSON.stringify({ text: "✅ done", driver: "claude", model: "claude-sonnet-4-6", cost: 1.23 }));
 
     expect(bot.sendMessage).toHaveBeenCalledWith(42, "✅ done\n[claude:sonnet-4-6] cost: $1.230");
+  });
+});
+
+describe("isDiscordOnly", () => {
+  it("returns false for plain string", () => {
+    expect(isDiscordOnly("plain text")).toBe(false);
+  });
+
+  it("returns false when discord_only is absent", () => {
+    expect(isDiscordOnly(JSON.stringify({ text: "hello" }))).toBe(false);
+  });
+
+  it("returns false when discord_only is false", () => {
+    expect(isDiscordOnly(JSON.stringify({ text: "hello", discord_only: false }))).toBe(false);
+  });
+
+  it("returns true when discord_only is true", () => {
+    expect(isDiscordOnly(JSON.stringify({ text: "hello", discord_only: true }))).toBe(true);
+  });
+
+  it("returns false for invalid JSON", () => {
+    expect(isDiscordOnly("{bad json")).toBe(false);
+  });
+});
+
+describe("notify list poller — discord_only filter", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    mockGet.mockResolvedValue(null);
+    mockRpop.mockResolvedValue(null);
+    mockLlen.mockResolvedValue(0);
+    const sub = {
+      subscribe: mockSubscribe,
+      psubscribe: mockPsubscribe,
+      on: mockOn,
+      lpush: mockLpush,
+      ltrim: mockLtrim,
+      publish: mockPublish,
+      get: mockGet,
+    };
+    mockDuplicate.mockReturnValue(sub);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("skips discord_only:true items in the list (nothing sent to Telegram)", async () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+
+    mockRpop
+      .mockResolvedValueOnce(JSON.stringify({ text: "discord only", discord_only: true }))
+      .mockResolvedValue(null);
+
+    startNotifier(bot as never, 111, "ns-discord", redis as never);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(bot.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it("sends items without discord_only flag normally", async () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+
+    mockRpop
+      .mockResolvedValueOnce(JSON.stringify({ text: "normal notification" }))
+      .mockResolvedValue(null);
+
+    startNotifier(bot as never, 222, "ns-normal", redis as never);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(bot.sendMessage).toHaveBeenCalledWith(222, "normal notification");
+  });
+
+  it("sends items with discord_only:false normally", async () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+
+    mockRpop
+      .mockResolvedValueOnce(JSON.stringify({ text: "not discord only", discord_only: false }))
+      .mockResolvedValue(null);
+
+    startNotifier(bot as never, 333, "ns-not-discord", redis as never);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(bot.sendMessage).toHaveBeenCalledWith(333, "not discord only");
+  });
+
+  it("skips discord_only items but still sends regular items in the same batch", async () => {
+    const bot = makeBot();
+    const redis = makeRedis();
+
+    mockRpop
+      .mockResolvedValueOnce(JSON.stringify({ text: "send me", discord_only: false }))
+      .mockResolvedValueOnce(JSON.stringify({ text: "skip me", discord_only: true }))
+      .mockResolvedValueOnce(JSON.stringify({ text: "send me too" }))
+      .mockResolvedValue(null);
+
+    startNotifier(bot as never, 444, "ns-mixed", redis as never);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(bot.sendMessage).toHaveBeenCalledTimes(2);
+    expect(bot.sendMessage).toHaveBeenCalledWith(444, "send me");
+    expect(bot.sendMessage).toHaveBeenCalledWith(444, "send me too");
   });
 });
 

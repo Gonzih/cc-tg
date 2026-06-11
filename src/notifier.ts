@@ -59,6 +59,19 @@ function stripAnsi(text: string): string {
 }
 
 /**
+ * Returns true when the notification payload has discord_only: true.
+ * These messages are intended for Discord only and must be silently skipped by Telegram.
+ */
+export function isDiscordOnly(raw: string): boolean {
+  try {
+    const parsed = JSON.parse(raw) as { discord_only?: boolean };
+    return parsed.discord_only === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Parse a notification payload and return the display text.
  * Appends a [driver] or [driver:model] badge whenever the driver field is present.
  * Appends " cost: $X.XXX" if a numeric cost field is present.
@@ -284,6 +297,7 @@ export function startNotifier(
     }
 
     for (const raw of items) {
+      if (isDiscordOnly(raw)) continue;
       const text = parseNotification(raw);
       bot.sendMessage(targetId, text).catch((err: Error) => {
         log("warn", "notify list sendMessage failed:", err.message);
@@ -309,6 +323,7 @@ export function startNotifier(
     const incomingCh = chatIncomingChannel(namespace);
 
     if (channel === notifyCh) {
+      if (isDiscordOnly(message)) return;
       const targetId = chatId ?? getActiveChatId?.();
       if (targetId != null) {
         const text = parseNotification(message);
