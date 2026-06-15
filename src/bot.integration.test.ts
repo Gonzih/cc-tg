@@ -186,7 +186,7 @@ describe('CcTgBot integration — message pipeline', () => {
   // 3. Long response split into multiple sendMessage calls
   // -------------------------------------------------------------------------
   it('response longer than 4096 chars is split into multiple messages', async () => {
-    await (bot as any).handleTelegram(makeMsg({ text: 'Write a lot' }));
+    await (bot as any).handleTelegram(makeMsg({ text: 'What is a long message?' }));
     // Generate text > 4096 chars, with word boundaries so it splits cleanly
     const longText = ('word '.repeat(900)).trim(); // ~4500 chars
     emitResult(longText);

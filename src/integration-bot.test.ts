@@ -210,7 +210,7 @@ describe('Bot → Claude → Telegram response pipeline', () => {
   // ── message splitting ──────────────────────────────────────────────────────
 
   it('splits long Claude responses into multiple Telegram messages', async () => {
-    await sendMsg(bot, { text: 'Write a lot' });
+    await sendMsg(bot, { text: 'What is a long message?' });
     // ~8000 chars with paragraph breaks — exceeds 4096 Telegram limit
     const longText = ('word '.repeat(60) + '\n\n').repeat(20).trim();
     emitClaudeResult(longText);
