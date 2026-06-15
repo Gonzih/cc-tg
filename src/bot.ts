@@ -41,6 +41,8 @@ const BOT_COMMANDS: Array<{ command: string; description: string }> = [
   { command: "wiki", description: "Manage wiki pages — list/show/update/delete/sync" },
   { command: "effort", description: "Set effort level: low / medium / high / xhigh / max / auto" },
   { command: "compact", description: "Compact context history to free tokens" },
+  { command: "loop_status", description: "Show current loop state if a loop is active" },
+  { command: "loop_stop", description: "Immediately flush and stop the active loop" },
 ];
 
 export interface BotOptions {
@@ -54,6 +56,17 @@ export interface BotOptions {
   /** Called when a message is routed to a non-default namespace so the notifier
    *  can forward the response back to the originating Telegram chat. */
   registerRoutedChatId?: (namespace: string, chatId: number) => void;
+}
+
+export interface LoopState {
+  goal: string;
+  iteration: number;
+  max_iterations: number;
+  gate_failures: Array<{
+    gate: string;
+    reason: string;
+    iteration: number;
+  }>;
 }
 
 interface Session {
@@ -74,6 +87,8 @@ interface Session {
   messagesSinceCompact: number;
   /** True once the CC_TG_COST_WARN_USD threshold notification has been sent */
   costWarnSent: boolean;
+  /** Active loop state — present only during goal-oriented loop iterations */
+  loopState?: LoopState;
 }
 
 interface PendingRetry {
@@ -139,6 +154,68 @@ function formatCostReport(cost: SessionCost): string {
     `  Output: ${formatTokens(cost.totalOutputTokens)} tokens ($${outputCost.toFixed(3)})`,
     `  Cache read: ${formatTokens(cost.totalCacheReadTokens)} tokens ($${cacheReadCost.toFixed(3)})`,
     `  Cache write: ${formatTokens(cost.totalCacheWriteTokens)} tokens ($${cacheWriteCost.toFixed(3)})`,
+  ].join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Loop state helpers
+// ---------------------------------------------------------------------------
+
+const GOAL_IMPERATIVE_RE = /^(implement|add|fix|create|build|update|deploy|publish|remove|delete|refactor|write|generate|make|run|execute|migrate|move|rename|bump|release|merge|push|commit|revert|apply|enable|disable|install|uninstall|configure|setup|set up|extend|expose|wire|connect|register|convert)\b/i;
+const GOAL_INTENT_RE = /\b(loop|verify|iterate|ensure|automate)\b/i;
+const GOAL_FILE_RE = /\.(ts|js|tsx|jsx|py|go|rs|md|json|yaml|yml|toml|sh|css|html)\b/;
+const GOAL_VCS_RE = /\b(pr|pull request|commit|branch|merge|npm publish|git push|git tag|changelog)\b/i;
+const QUESTION_PREFIX_RE = /^(what|how|why|when|where|who|which|can|could|is|are|do|does|did|will|would|should|tell me|explain|describe|show me|help me understand)\b/i;
+
+/** Classify a user message as a goal (produces artifact) or question (conversational). */
+export function classifyMessage(text: string): "goal" | "question" {
+  const trimmed = text.trim();
+  if (trimmed.length < 10) return "question";
+  if (trimmed.endsWith("?")) return "question";
+  if (QUESTION_PREFIX_RE.test(trimmed)) return "question";
+  if (trimmed.startsWith("/")) return "question";
+  if (GOAL_INTENT_RE.test(trimmed)) return "goal";
+  if (GOAL_IMPERATIVE_RE.test(trimmed)) return "goal";
+  if (GOAL_FILE_RE.test(trimmed)) return "goal";
+  if (GOAL_VCS_RE.test(trimmed)) return "goal";
+  return "question";
+}
+
+const COMPLETION_PATTERNS: Array<{ gate: string; re: RegExp }> = [
+  { gate: "pr_url", re: /https:\/\/github\.com\/[^\s]+\/pull\/\d+/ },
+  { gate: "npm_published", re: /\b(npm publish|successfully published|package published)\b.*?@[\d.]+/i },
+  { gate: "merge_confirmed", re: /\b(PR merged|pull request merged|squash merged|auto-merge|merged successfully)\b/i },
+  { gate: "released", re: /\b(released|tagged|git tag|pushed.*tag)\b.*?v?[\d]+\.[\d]+\.[\d]+/i },
+  { gate: "agent_score", re: /AGENT_SCORE:\s*[0-9]/ },
+];
+
+/** Scan response text for completion signals. */
+export function checkCompletionGate(responseText: string): { passed: boolean; gate: string; reason: string } {
+  for (const { gate, re } of COMPLETION_PATTERNS) {
+    if (re.test(responseText)) return { passed: true, gate, reason: "" };
+  }
+  return {
+    passed: false,
+    gate: "completion_signal",
+    reason: "No PR URL, npm publish confirmation, merge confirmation, release tag, or AGENT_SCORE found in response",
+  };
+}
+
+function formatLoopTrace(loopState: LoopState): string {
+  if (loopState.gate_failures.length === 0) return "";
+  const lines = ["Gate failure trace:"];
+  for (const f of loopState.gate_failures) {
+    lines.push(`  iteration ${f.iteration}: [${f.gate}] ${f.reason}`);
+  }
+  return lines.join("\n");
+}
+
+function buildLoopReprompt(loopState: LoopState, gate: { gate: string; reason: string }): string {
+  return [
+    `[loop-iteration-${loopState.iteration}/${loopState.max_iterations}]`,
+    `Goal: ${loopState.goal}`,
+    `Previous response did not satisfy the completion gate (${gate.gate}): ${gate.reason}`,
+    "Please continue working toward the goal. When complete, ensure the response includes one of: a GitHub PR URL, npm publish confirmation, merge confirmation, a release tag, or AGENT_SCORE line.",
   ].join("\n");
 }
 
@@ -542,11 +619,32 @@ export class CcTgBot {
       return;
     }
 
+    // /loop_status — show current loop state
+    if (text === "/loop_status") {
+      await this.handleLoopStatus(chatId, threadId);
+      return;
+    }
+
+    // /loop_stop — flush current response and clear loop state
+    if (text === "/loop_stop") {
+      await this.handleLoopStop(chatId, threadId);
+      return;
+    }
+
     const session = this.getOrCreateSession(chatId, threadId, threadName);
     try {
       const enriched = await enrichPromptWithUrls(text);
       const prompt = buildPromptWithReplyContext(enriched, msg);
       session.currentPrompt = prompt;
+      // Initialize loop state for goal-oriented messages
+      if (classifyMessage(text) === "goal") {
+        session.loopState = {
+          goal: text,
+          iteration: 0,
+          max_iterations: 3,
+          gate_failures: [],
+        };
+      }
       this.maybeSendAutoCompact(session, chatId, threadId);
       session.claude.sendPrompt(stampPrompt(prompt));
       this.startTyping(chatId, session);
@@ -976,6 +1074,43 @@ export class CcTgBot {
 
       this.pendingRetries.set(retryKey, { text: lastPrompt, attempt, timer });
       return;
+    }
+
+    // Loop gate: when in loop mode, verify completion before flushing to user
+    if (session.loopState) {
+      const loopState = session.loopState;
+      const gate = checkCompletionGate(text);
+
+      if (!gate.passed) {
+        // Record this failure, then decide: re-prompt or exhaust
+        loopState.gate_failures.push({ gate: gate.gate, reason: gate.reason, iteration: loopState.iteration });
+        loopState.iteration++;
+
+        if (loopState.iteration >= loopState.max_iterations) {
+          // Exhausted — surface the response with exhaustion notice and full trace
+          const trace = formatLoopTrace(loopState);
+          const exhaustionSuffix = [
+            `\n\n[loop exhausted after ${loopState.iteration} iteration${loopState.iteration !== 1 ? "s" : ""} — handing off]`,
+            trace ? `\n\n${trace}` : "",
+          ].join("");
+          session.pendingText += text + exhaustionSuffix;
+          session.loopState = undefined;
+          if (session.flushTimer) clearTimeout(session.flushTimer);
+          session.flushTimer = setTimeout(() => this.flushPending(chatId, session), FLUSH_DELAY_MS);
+          console.log(`[loop:${chatId}] exhausted after ${loopState.max_iterations} iterations`);
+        } else {
+          // Gate failed — inject re-prompt without flushing to user
+          const reprompt = buildLoopReprompt(loopState, gate);
+          console.log(`[loop:${chatId}] gate failed (${gate.gate}), iteration=${loopState.iteration}/${loopState.max_iterations} — re-prompting`);
+          session.claude.sendPrompt(reprompt);
+          this.startTyping(chatId, session);
+        }
+        return;
+      }
+
+      // Completion gate passed — clear loop state and fall through to normal flush
+      console.log(`[loop:${chatId}] gate passed (${gate.gate}) after ${loopState.iteration} iteration${loopState.iteration !== 1 ? "s" : ""}`);
+      session.loopState = undefined;
     }
 
     // Accumulate text and debounce — Claude streams chunks rapidly
@@ -1894,6 +2029,53 @@ export class CcTgBot {
         `🗜️ Auto-compacting context (${threshold} message limit reached)...`,
         threadId
       ).catch(() => {});
+    }
+  }
+
+  private async handleLoopStatus(chatId: number, threadId?: number): Promise<void> {
+    const sessionKey = this.sessionKey(chatId, threadId);
+    const session = this.sessions.get(sessionKey);
+    if (!session || session.claude.exited) {
+      await this.replyToChat(chatId, "No active session.", threadId);
+      return;
+    }
+    const ls = session.loopState;
+    if (!ls) {
+      await this.replyToChat(chatId, "No active loop.", threadId);
+      return;
+    }
+    const lines = [
+      `Loop active — iteration ${ls.iteration}/${ls.max_iterations}`,
+      `Goal: ${ls.goal}`,
+    ];
+    if (ls.gate_failures.length > 0) {
+      lines.push("Gate failures:");
+      for (const f of ls.gate_failures) {
+        lines.push(`  [${f.gate}] iteration ${f.iteration}: ${f.reason}`);
+      }
+    }
+    await this.replyToChat(chatId, lines.join("\n"), threadId);
+  }
+
+  private async handleLoopStop(chatId: number, threadId?: number): Promise<void> {
+    const sessionKey = this.sessionKey(chatId, threadId);
+    const session = this.sessions.get(sessionKey);
+    if (!session || session.claude.exited) {
+      await this.replyToChat(chatId, "No active session.", threadId);
+      return;
+    }
+    const wasActive = !!session.loopState;
+    session.loopState = undefined;
+    if (wasActive) {
+      // Flush whatever we have buffered so far
+      if (session.flushTimer) {
+        clearTimeout(session.flushTimer);
+        session.flushTimer = null;
+        this.flushPending(chatId, session);
+      }
+      await this.replyToChat(chatId, "Loop stopped.", threadId);
+    } else {
+      await this.replyToChat(chatId, "No active loop.", threadId);
     }
   }
 
